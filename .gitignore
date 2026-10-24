@@ -1,0 +1,11 @@
+/work/
+/.vscode/
+/.idea/
+.DS_Store
+Thumbs.db
+.env
+.env.*
+*.pem
+*.key
+__pycache__/
+*.pyc

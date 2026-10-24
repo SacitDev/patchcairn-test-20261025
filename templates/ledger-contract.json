@@ -1,0 +1,415 @@
+{
+  "schema_version": "1.0",
+  "contract_version": "1.0",
+  "ledger_schema_version": "1.0",
+  "description": "Shared PatchCairn ledger facts. Backend ownership and filesystem invariants are enforced independently.",
+  "required_fields": {
+    "root": [
+      "schema_version",
+      "toolkit_id",
+      "run",
+      "coverage",
+      "components",
+      "findings",
+      "sources",
+      "evidence",
+      "actions",
+      "approvals",
+      "diagnosis"
+    ],
+    "run": [
+      "id",
+      "mode",
+      "platform",
+      "phase",
+      "status",
+      "created_utc",
+      "updated_utc",
+      "purpose",
+      "pending_restart"
+    ],
+    "coverage": [
+      "id",
+      "scope",
+      "state",
+      "limits"
+    ],
+    "component": [
+      "id",
+      "name",
+      "kind",
+      "installed_version",
+      "reviewed_target",
+      "available_release",
+      "update_state",
+      "security_state",
+      "compatibility_state",
+      "owner_scope",
+      "evidence_ids",
+      "finding_ids",
+      "next_step",
+      "agent_id"
+    ],
+    "finding": [
+      "id",
+      "component_id",
+      "kind",
+      "state",
+      "claim",
+      "conditions",
+      "evidence_ids",
+      "source_ids"
+    ],
+    "source": [
+      "id",
+      "url",
+      "title",
+      "retrieved_utc",
+      "authority",
+      "provenance_verified",
+      "checks"
+    ],
+    "evidence": [
+      "id",
+      "relative_path",
+      "sha256",
+      "kind",
+      "observed_utc",
+      "scope",
+      "limits"
+    ],
+    "action": [
+      "id",
+      "kind",
+      "state",
+      "component_ids",
+      "evidence_ids",
+      "approval_id",
+      "started_utc",
+      "finished_utc",
+      "outcome",
+      "automatic_retry"
+    ],
+    "approval": [
+      "id",
+      "scope",
+      "decision",
+      "recorded_utc",
+      "authorization_quote",
+      "action_ids",
+      "plan_sha256"
+    ],
+    "diagnosis": [
+      "status",
+      "hypotheses",
+      "original_cause",
+      "uncertainty",
+      "least_disruptive_fix",
+      "repair_approved"
+    ],
+    "hypothesis": [
+      "id",
+      "claim",
+      "state",
+      "evidence_ids",
+      "alternatives"
+    ],
+    "alternative": [
+      "claim",
+      "state",
+      "evidence_ids"
+    ]
+  },
+  "enums": {
+    "run.mode": [
+      "fixture",
+      "real"
+    ],
+    "run.platform": [
+      "windows",
+      "linux",
+      "macos",
+      "unknown"
+    ],
+    "run.phase": [
+      "assessment",
+      "diagnosis",
+      "planning",
+      "approval",
+      "execution",
+      "verification",
+      "closed"
+    ],
+    "run.status": [
+      "draft",
+      "active",
+      "held",
+      "partial",
+      "failed",
+      "completed"
+    ],
+    "coverage.state": [
+      "not_checked",
+      "observed",
+      "partial",
+      "verified",
+      "excluded"
+    ],
+    "component.update_state": [
+      "unknown",
+      "observed",
+      "update_available",
+      "held",
+      "staged",
+      "installed_unverified",
+      "verified",
+      "retired"
+    ],
+    "component.security_state": [
+      "not_assessed",
+      "no_applicable_finding_established",
+      "conditional",
+      "outstanding",
+      "partial",
+      "verified_scoped",
+      "vendor_hold"
+    ],
+    "component.compatibility_state": [
+      "not_tested",
+      "conditional",
+      "held",
+      "passed_scoped",
+      "failed"
+    ],
+    "component.owner_scope": [
+      "system",
+      "machine",
+      "user",
+      "vendor_bundle",
+      "project",
+      "portable",
+      "unknown"
+    ],
+    "finding.state": [
+      "open",
+      "conditional",
+      "held",
+      "resolved_scoped",
+      "not_applicable",
+      "unknown"
+    ],
+    "source.authority": [
+      "official_vendor",
+      "official_os",
+      "package_registry",
+      "installed_metadata",
+      "secondary",
+      "owner_report"
+    ],
+    "action.kind": [
+      "observe",
+      "diagnose",
+      "prepare",
+      "update",
+      "repair",
+      "verify",
+      "cleanup",
+      "retire"
+    ],
+    "action.state": [
+      "planned",
+      "awaiting_approval",
+      "approved",
+      "running",
+      "partial",
+      "failed",
+      "completed",
+      "cancelled"
+    ],
+    "approval.decision": [
+      "pending",
+      "approved",
+      "rejected"
+    ],
+    "diagnosis.status": [
+      "not_started",
+      "investigating",
+      "mechanism_supported",
+      "cause_supported",
+      "uncertain"
+    ],
+    "hypothesis.state": [
+      "proposed",
+      "supported",
+      "disproved",
+      "unknown"
+    ],
+    "alternative.state": [
+      "proposed",
+      "supported",
+      "disproved",
+      "unknown"
+    ]
+  },
+  "nullable_fields": {
+    "component": [
+      "installed_version",
+      "reviewed_target",
+      "available_release",
+      "agent_id",
+      "architecture",
+      "manager",
+      "channel",
+      "default_resolution",
+      "owner_component_id"
+    ],
+    "finding": [
+      "component_id"
+    ],
+    "source": [
+      "url",
+      "retrieved_utc"
+    ],
+    "action": [
+      "approval_id",
+      "started_utc",
+      "finished_utc",
+      "outcome"
+    ],
+    "approval": [
+      "plan_sha256"
+    ],
+    "diagnosis": [
+      "original_cause",
+      "least_disruptive_fix"
+    ]
+  },
+  "array_fields": {
+    "root": [
+      "coverage",
+      "components",
+      "findings",
+      "sources",
+      "evidence",
+      "actions",
+      "approvals"
+    ],
+    "component": [
+      "evidence_ids",
+      "finding_ids"
+    ],
+    "finding": [
+      "conditions",
+      "evidence_ids",
+      "source_ids"
+    ],
+    "source": [
+      "checks"
+    ],
+    "action": [
+      "component_ids",
+      "evidence_ids"
+    ],
+    "approval": [
+      "action_ids"
+    ],
+    "diagnosis": [
+      "hypotheses"
+    ],
+    "hypothesis": [
+      "evidence_ids",
+      "alternatives"
+    ],
+    "alternative": [
+      "evidence_ids"
+    ]
+  },
+  "boolean_fields": {
+    "run": [
+      "pending_restart"
+    ],
+    "source": [
+      "provenance_verified"
+    ],
+    "action": [
+      "automatic_retry"
+    ],
+    "diagnosis": [
+      "repair_approved"
+    ]
+  },
+  "utc_fields": {
+    "run": [
+      "created_utc",
+      "updated_utc"
+    ],
+    "source": [
+      "retrieved_utc"
+    ],
+    "evidence": [
+      "observed_utc"
+    ],
+    "action": [
+      "started_utc",
+      "finished_utc"
+    ],
+    "approval": [
+      "recorded_utc"
+    ]
+  },
+  "patterns": {
+    "run_id": "run-[a-f0-9]{32}",
+    "plan_id": "plan-[a-f0-9]{32}",
+    "approval_id": "approval-[a-f0-9]{32}",
+    "sha256": "[a-f0-9]{64}",
+    "utc_timestamp": "[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{1,7})?Z",
+    "record_id": "[A-Za-z0-9][A-Za-z0-9_.-]{0,127}"
+  },
+  "backend_ids": {
+    "windows": "windows-powershell-v2",
+    "posix": "posix-python-v2"
+  },
+  "marker_invariants": [
+    "Creation backend, mode and platform are bound in the run marker.",
+    "Reject a foreign or missing backend before an operation writes or mutates run state.",
+    "No automatic migration of older development markers.",
+    "A fixture cannot be promoted; a different platform/backend needs a fresh run."
+  ],
+  "summary_contract": {
+    "component_records": "All component records, including explicit retired history",
+    "update_states": "Counts by independent component.update_state",
+    "security_states": "Counts by independent component.security_state; not inferred from versions",
+    "compatibility_states": "Counts by independent component.compatibility_state",
+    "completed_action_records": "Completed action records only",
+    "completed_action_groups": "Unique nonempty group_id, otherwise action id, among completed actions",
+    "open_finding_records": "Finding states open,conditional,held,unknown",
+    "security_clearance_percentage": "Not defined or permitted"
+  },
+  "validation_invariants": [
+    "Case-sensitive enums and complete required fields.",
+    "Unique IDs per collection and resolvable references.",
+    "UTC timestamps are bounded strings using Z; engines validate calendar values with a full-string match.",
+    "False or missing evidence is not converted into verified security.",
+    "Completed run has closed phase, no nonterminal actions and no pending restart.",
+    "Web source authorities require safe credential-free HTTPS URLs; metadata/owner references may have null URLs.",
+    "Mutation approval binds exact action ids, scope and plan hash; no executor reads commands from ledger data.",
+    "Additional filesystem/approval/ownership invariants may be stricter per backend."
+  ],
+  "identity_comparison": "ordinal_case_sensitive",
+  "group_id_policy": "Optional null or empty string falls back to action id. Otherwise a bounded string with no leading/trailing whitespace, compared ordinal case-sensitively. Whitespace-only values are invalid.",
+  "source_url_policy": "Web authorities use absolute HTTPS without user information, query or fragment. Null URL is reserved for installed_metadata and owner_report.",
+  "optional_fields": {
+    "action": [
+      "group_id",
+      "resolves_action_ids"
+    ],
+    "component": [
+      "architecture",
+      "manager",
+      "channel",
+      "default_resolution",
+      "owner_component_id"
+    ]
+  },
+  "recovery_resolution_policy": "Failed/partial action records remain immutable. A new completed verify action with nonempty evidence_ids may explicitly resolve exact failed/partial action IDs via a unique resolves_action_ids array; all other unfinished actions still prevent completion or cleanup."
+}

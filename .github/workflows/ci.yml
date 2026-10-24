@@ -1,0 +1,105 @@
+name: fixture-safety
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  portable-fixtures:
+    name: Portable fixtures (${{ matrix.os }}, Python ${{ matrix.python }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+        python: ['3.12', '3.15']
+        include:
+          - os: windows-latest
+            timeout: 90
+          - os: ubuntu-latest
+            timeout: 15
+          - os: macos-latest
+            timeout: 15
+    runs-on: ${{ matrix.os }}
+    # Windows Python helpers reuse an owned serial worker; native checks stay per operation.
+    timeout-minutes: ${{ matrix.timeout }}
+    env:
+      TZ: UTC
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1, reviewed 2026-10-23
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0, reviewed 2026-10-23
+        with:
+          python-version: ${{ matrix.python }}
+          check-latest: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0, reviewed 2026-10-23
+        with:
+          node-version: '24'
+          check-latest: false
+      - name: All standard-library fictional unit and integration tests
+        # Site tests also exercise the local visual script with Node's offline VM.
+        run: python -I -S -B -m unittest discover -s tests -p "test_*.py" -v --failfast
+      - name: Offline report visibility and injection fixtures
+        run: node tests/test_report_ui.cjs
+
+  windows-fixtures:
+    name: Windows PowerShell fixtures
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      TZ: UTC
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Assessment-record PowerShell 7 fixture suite
+        shell: pwsh
+        run: |
+          $env:TZ='UTC'
+          $ErrorActionPreference='Stop'
+          $PSVersionTable | ConvertTo-Json
+          & ./tests/Invoke-FixtureTests.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Selected-file and diagnostic PowerShell 7 fixtures
+        shell: pwsh
+        run: |
+          $env:TZ='UTC'
+          $ErrorActionPreference='Stop'
+          & ./tests/Test-WindowsScoped.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Private namespace PowerShell 7 fixtures
+        shell: pwsh
+        run: |
+          $env:TZ='UTC'
+          $ErrorActionPreference='Stop'
+          & ./tests/Test-PrivateWorkspace.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Assessment-record Windows PowerShell 5.1 fixture suite
+        shell: pwsh
+        run: |
+          $env:TZ='UTC'
+          $ErrorActionPreference='Stop'
+          $legacy = Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/powershell.exe'
+          & $legacy -NoProfile -NonInteractive -Command '$env:TZ="UTC"; $ErrorActionPreference="Stop"; $PSVersionTable | ConvertTo-Json; & ./tests/Invoke-FixtureTests.ps1'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Selected-file and diagnostic Windows PowerShell 5.1 fixtures
+        shell: pwsh
+        run: |
+          $env:TZ='UTC'
+          $ErrorActionPreference='Stop'
+          $legacy = Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/powershell.exe'
+          & $legacy -NoProfile -NonInteractive -File ./tests/Test-WindowsScoped.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Private namespace Windows PowerShell 5.1 fixtures
+        shell: pwsh
+        run: |
+          $env:TZ='UTC'
+          $ErrorActionPreference='Stop'
+          $legacy = Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/powershell.exe'
+          & $legacy -NoProfile -NonInteractive -File ./tests/Test-PrivateWorkspace.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

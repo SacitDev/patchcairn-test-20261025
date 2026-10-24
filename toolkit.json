@@ -1,0 +1,26 @@
+{
+  "schema_version": "1.0",
+  "toolkit_id": "a107f3a6-4a76-41ad-bcff-6125e8500bff",
+  "name": "PatchCairn",
+  "version": "1.0.0",
+  "created_utc": "2026-10-23T19:09:00.2974412Z",
+  "updated_utc": "2026-10-24T04:17:38Z",
+  "purpose": "Four coordinated chat and CLI workflows for security updates, storage cleanup, diagnosis and repair, and backup and recovery, with exact approvals, private evidence and checked platform adapters.",
+  "author": "Michael",
+  "entrypoint": "scripts/patchcairn_workflow.py",
+  "command_namespace": "PatchCairn:",
+  "jobs": [
+    "security_updates",
+    "storage_cleanup",
+    "diagnosis_repair",
+    "backup_recovery"
+  ],
+  "operating_interfaces": [
+    "assistant_chat",
+    "terminal"
+  ],
+  "public_site": "documentation_only",
+  "branding": {
+    "report_logo": "assets/patchcairn-logo.png"
+  }
+}

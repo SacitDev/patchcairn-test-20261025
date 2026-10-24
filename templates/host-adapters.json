@@ -1,0 +1,140 @@
+{
+  "schema_version": 1,
+  "kind": "patchcairn-host-adapter-descriptors",
+  "advisory_only": true,
+  "execution_authority": false,
+  "installation_inventory": false,
+  "capability_policy": "detect-in-each-actual-session",
+  "canonical_rules": "AGENTS.md",
+  "canonical_router": ".agents/skills/pc-maintenance/SKILL.md",
+  "job_skills": {
+    "security_updates": ".agents/skills/pc-security-updates/SKILL.md",
+    "storage_cleanup": ".agents/skills/pc-storage-cleanup/SKILL.md",
+    "diagnosis_repair": ".agents/skills/pc-diagnose-repair/SKILL.md",
+    "backup_recovery": ".agents/skills/pc-backup-recovery/SKILL.md"
+  },
+  "conversation": {
+    "namespace": "PatchCairn: ",
+    "commands": ["start", "help", "status", "options", "cost", "settings", "pause", "resume", "stop", "resolve"],
+    "preserve_host_slash_commands": true,
+    "first_message_attribution": "PatchCairn — Developed by Michael",
+    "initial_menu_source": "current-workflow-engine",
+    "controls": ["guided", "automatic"],
+    "timing": ["now", "scheduled"],
+    "control_and_timing_independent": true,
+    "settings_are_approval": false,
+    "host_resume_is_workflow_resume": false
+  },
+  "common_required_checks": [
+    "public-instructions-readable",
+    "backend-platform-and-version",
+    "owned-work-storage",
+    "selected-scope-authority",
+    "local-command-and-filesystem-tools",
+    "official-source-research",
+    "independent-reviewers-before-change",
+    "native-operation-support",
+    "current-host-computer-use-skill-if-needed",
+    "scheduler-capability-and-specific-authority-if-needed"
+  ],
+  "common_fallback": "explain-missing-capability-and-owner-step; keep-unsupported-operation-held",
+  "native_ui": "host-tool-and-current-skill-required; never-inferred-from-cli",
+  "scheduling": "proposal-until-supported-scheduler-and-exact-owner-authority",
+  "setup": {
+    "owner_controlled": true,
+    "auto_install": false,
+    "read_auth_or_private_config": false,
+    "copy_private_host_state": false,
+    "change_global_settings": false,
+    "guide": "docs/ASSISTANT_COMPATIBILITY.md"
+  },
+  "startup_probe_policy": {
+    "scope": "synthetic-first-response-only",
+    "maximum_prompts_per_cli": 2,
+    "preferred_prompts_per_cli": 1,
+    "required_controls": ["all-model-tools-disabled", "one-turn", "no-session-persistence", "output-token-or-estimated-spending-cap"],
+    "default_model_override": false,
+    "customizations": "disable-with-supported-controls",
+    "context": "minimal-current-public-menu-and-needed-public-skills-only",
+    "references": "fictional",
+    "missing_control": "skip",
+    "login_or_quota_failure": "stop-without-workaround-or-retry-loop",
+    "maintenance_workflow_test": false,
+    "system_security_certification": false,
+    "receipts": "private-owned-work-only; sanitize-before-reporting"
+  },
+  "hosts": [
+    {
+      "id": "codex-desktop",
+      "setup": "open-owner-chosen-source-folder-as-project",
+      "rules": "AGENTS.md",
+      "skill_discovery": ".agents/skills; verify-in-session",
+      "fallback": "explicitly-read-canonical-router-and-selected-job",
+      "local_host_access": "verify-current-execution-environment",
+      "probe_controls": "host-specific; no-portable-cli-recipe-assumed",
+      "documentation": ["https://learn.chatgpt.com/docs/agent-configuration/agents-md", "https://learn.chatgpt.com/docs/build-skills"]
+    },
+    {
+      "id": "codex-cli",
+      "setup": "start-installed-cli-at-owner-chosen-source-root",
+      "rules": "AGENTS.md",
+      "skill_discovery": ".agents/skills; verify-in-session",
+      "fallback": "explicitly-read-canonical-router-and-selected-job",
+      "probe_controls": {
+        "no_session_persistence": "--ephemeral for documented exec versions",
+        "tool_disable": "not-inferred-from-read-only-sandbox",
+        "one_turn_and_cap": "must-verify-installed-help-before-probe",
+        "missing_required_control": "skip"
+      },
+      "documentation": ["https://learn.chatgpt.com/docs/developer-commands?surface=cli", "https://learn.chatgpt.com/docs/build-skills"]
+    },
+    {
+      "id": "claude-code",
+      "setup": "start-installed-cli-at-owner-chosen-source-root",
+      "rules": "CLAUDE.md imports @AGENTS.md",
+      "skill_discovery": "documented .claude/skills locations; canonical .agents files explicitly read by adapter",
+      "fallback": "explicitly-read-canonical-router-and-selected-job; no-copy-or-global-config-required",
+      "probe_controls": {
+        "noninteractive": "--print",
+        "built_in_tools_disabled": "--tools with an empty list",
+        "external_tools_disabled": "strict empty MCP configuration and deny mcp__*; verify policy behavior",
+        "no_session_persistence": "--no-session-persistence",
+        "one_turn": "--max-turns 1; verify installed version accepts documented flag",
+        "output_token_cap": "process-local CLAUDE_CODE_MAX_OUTPUT_TOKENS; verify documented model behavior",
+        "estimated_spending_cap": "--max-budget-usd; may overshoot a single request",
+        "customizations": "--safe-mode; managed policy may still apply",
+        "permission_bypass": false
+      },
+      "documentation": ["https://code.claude.com/docs/en/memory", "https://code.claude.com/docs/en/skills", "https://code.claude.com/docs/en/cli-reference", "https://code.claude.com/docs/en/env-vars"]
+    },
+    {
+      "id": "opencode",
+      "setup": "owner-installs-if-needed; detect-major-version-before-configuration",
+      "rules": "AGENTS.md; confirm-version-specific-precedence",
+      "skill_discovery": "version-specific .agents compatibility; verify-in-session",
+      "fallback": "explicitly-read-canonical-router-and-selected-job",
+      "permissions": "V1 permission maps and V2 ordered permissions differ; do-not-cross-apply",
+      "probe_controls": "all-required-controls-must-be-established-for-installed-version; otherwise-skip",
+      "documentation": ["https://docs.opencode.ai/docs/rules/", "https://docs.opencode.ai/docs/skills/", "https://opencode.ai/v2/docs/skills", "https://docs.opencode.ai/docs/permissions/", "https://opencode.ai/v2/docs/permissions"]
+    },
+    {
+      "id": "grok-build-cli",
+      "setup": "verify-product-in-installed-grok-help; owner-controlled-sign-in",
+      "rules": "explicitly-load-public-AGENTS-and-selected-skill-unless-discovery-verified",
+      "skill_discovery": "not-assumed",
+      "fallback": "public-context-chat-guidance; hold-unavailable-operations",
+      "probe_controls": "verify-tool-disable-turn-persistence-and-cap-controls-in-installed-help; otherwise-skip",
+      "ambiguous_build_term": "never-execute-generic-build-or-install",
+      "documentation": ["https://docs.x.ai/build/overview"]
+    },
+    {
+      "id": "other-host",
+      "setup": "owner-supplies-public-instructions-through-supported-interface",
+      "rules": "explicit-public-AGENTS-and-selected-skill",
+      "skill_discovery": "detect-or-explicit-load",
+      "fallback": "explain-and-plan; transfer-to-supported-local-host-for-unavailable-operations",
+      "probe_controls": "all-required-controls-must-be-established; otherwise-skip",
+      "universal_native_gui_or_scheduling": false
+    }
+  ]
+}
