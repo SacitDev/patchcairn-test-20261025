@@ -24,7 +24,9 @@ import stat
 import struct
 import sys
 import tempfile
+import threading
 import time
+import types
 import unittest
 from unittest import mock
 import xml.etree.ElementTree as ET
@@ -84,6 +86,11 @@ RUNTIMES = {"linux": {"executable": LINUX_PY, "base_prefix": "/usr", "stdlib": "
                       "platstdlib": "/opt/homebrew/lib/python3.14"},
             "windows": {"executable": WIN_PY, "base_prefix": "C:\\Python314", "stdlib": "C:\\Python314\\Lib",
                         "platstdlib": "C:\\Python314\\Lib"}}
+# /proc/self/mountinfo with one local file system, and a WSL one with Windows drive C: as 9p (the newer form) and
+# D: as drvfs (WSL 1).
+LOCAL_MOUNTS = "22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n"
+WSL_MOUNTS = LOCAL_MOUNTS + ("90 22 0:52 / /mnt/c rw,noatime - 9p drvfs rw,dirsync,aname=drvfs;path=C:\\\n"
+                             "91 22 0:53 / /mnt/d\\040drive rw,noatime - drvfs D:\\134 rw\n")
 # Every route and kind PatchCairn renders, with its platform.
 ALL = [("windows", "windows_task", "once"), ("windows", "windows_task", "weekly"), ("macos", "launchd", "once"),
        ("macos", "launchd", "weekly"), ("linux", "systemd_user", "once"), ("linux", "systemd_user", "weekly"),
@@ -276,11 +283,12 @@ class FakeHost:
     """
 
     def __init__(self, files, *, tasks=None, loaded=(), enabled=(), present=(), crontab=None, codes=None, tamper=False,
-                 change_on=None, xml_encoding="cp437", swap=None):
+                 change_on=None, xml_encoding="cp437", swap=None, after=None, errors=b""):
         self.files, self.calls, self.reads = files, [], 0
         self.tasks, self.loaded, self.enabled, self.present = dict(tasks or {}), set(loaded), set(enabled), set(present)
         self.crontab, self.codes, self.tamper = crontab, copy.deepcopy(codes or {}), tamper
         self.change_on, self.xml_encoding, self.swap = dict(change_on or {}), xml_encoding, swap
+        self.after, self.errors = dict(after or {}), errors  # after: the action happens, then this exit code (a timeout)
 
     def argv(self):
         return [call[0] for call in self.calls]
@@ -293,9 +301,10 @@ class FakeHost:
         if isinstance(forced, list):
             forced = forced.pop(0) if forced else None
         if forced is not None:
-            return forced, b"", b""
+            return forced, b"", self.errors
         handler = getattr(self, "_" + program.split(".")[0], None)
-        return handler(argv, verb, stdin) if handler else (127, b"", b"not a program this fake knows")
+        result = handler(argv, verb, stdin) if handler else (127, b"", b"not a program this fake knows")
+        return (self.after[(program, verb)], *result[1:]) if (program, verb) in self.after else result
 
     def _schtasks(self, argv, verb, stdin):
         name = argv[argv.index("/tn") + 1]
@@ -496,6 +505,13 @@ class ScheduleRenderTests(unittest.TestCase):
                 self.assertEqual(self.remove(value, host, files), {"status": "removed", "problem": None})
                 self.assertNotIn(path, files.data)
                 self.assertEqual(host.argv()[-3:], [commands["query"], commands["bootout"], commands["query"]])
+        # A plist deleted by hand while its job is loaded: ownership can no longer be proven, and the message says so.
+        gone = FakeHost(FakeFiles(dirs={profile("macos")}), loaded={plist["Label"]})
+        outcome = self.remove(weekly, gone, gone.files)
+        self.assertEqual(outcome["status"], "registered")
+        self.assertIn("its file is gone", outcome["problem"] or "")
+        self.assertIn("then remove the schedule again", outcome["problem"] or "")
+        self.assertNotIn("bootout", [argv[1] for argv in gone.argv()])
         # The plist proves ownership, so it stays while launchctl still lists the job after bootout.
         lingering = FakeHost(FakeFiles({entry["path"]: entry["data"]}, dirs={profile("macos")}), loaded={plist["Label"]},
                              codes={("launchctl", "print"): [None, 0]})
@@ -541,6 +557,9 @@ class ScheduleRenderTests(unittest.TestCase):
             self.assertIn(line, timer)
         self.assertIn("Type=oneshot", service)
         self.assertIn("TimeoutStartSec=6h", service)
+        self.assertEqual(art["setup"], ["This schedule runs only while you are signed in to this computer, and on WSL only "
+                                        "while WSL is running; a run missed then does its work only if you sign in within "
+                                        "the catch-up window."])
         self.assertIn(f'ExecStart=/usr/bin/python3 -I -S -B "{LINUX_ROOT}/scripts/patchcairn_workflow.py" --scheduled-run '
                       f'{weekly["schedule_id"]}', service)
         self.assertEqual(art["triggers"], [])
@@ -570,16 +589,32 @@ class ScheduleRenderTests(unittest.TestCase):
         self.assertEqual(host.argv(), [commands["query"], commands["disable"], commands["clean"], commands["daemon_reload"],
                                        commands["query"]])
         self.assertEqual(files.removed, [timer_path, service_path])  # the timer first: the service proves ownership
+        stopped = FakeHost(FakeFiles({entry["path"]: entry["data"] for entry in art["files"]}), enabled={timer_path.rsplit("/", 1)[1]})
+        outcome = self.remove(weekly, stopped, stopped.files, facts=dict(FACTS["linux"], systemd_running=False))
+        self.assertEqual((outcome["status"], stopped.calls), ("registered", []))  # no half-done disable
+        self.assertIn("systemd is not running", outcome["problem"] or "")
+        gone = FakeHost(FakeFiles())  # both unit files already gone: nothing is left for systemd to load
+        self.assertEqual(self.remove(weekly, gone, gone.files, facts=dict(FACTS["linux"], systemd_running=False)),
+                         {"status": "removed", "problem": None})
+        self.assertEqual(gone.calls, [])
+        bus = b"Failed to connect to bus: No medium found\n"
+        for act in (self.register, self.remove):  # systemctl's own words reach the person
+            silent = FakeHost(FakeFiles(), codes={("systemctl", "is-enabled"): 1}, errors=bus)
+            with self.subTest(act=act.__name__):
+                self.assertIn('could not answer (exit code 1; it said: "Failed to connect to bus: No medium found")',
+                              act(weekly, silent, silent.files)["problem"] or "")
 
-        failing = FakeHost(FakeFiles(), codes={("systemctl", "enable"): 1})
+        failing = FakeHost(FakeFiles(), codes={("systemctl", "enable"): 1}, errors=b"Failed to enable unit: Unit is masked.")
         outcome = self.register(weekly, failing, failing.files)
         self.assertEqual(outcome["status"], "rendered")
+        self.assertIn('it said: "Failed to enable unit: Unit is masked."', outcome["problem"] or "")
         # the failed enable is undone before the files go, then systemd forgets them
         self.assertEqual(failing.argv()[2:], [commands["enable"], commands["disable"], commands["daemon_reload"]])
         self.assertEqual(failing.files.data, {})
 
         for folder in (timer_path + ".d", profile("posix", ".config", "systemd", "user", "patchcairn-.timer.d"),
-                       profile("posix", ".config", "systemd", "user.control", f"patchcairn-{short}.service.d")):
+                       profile("posix", ".config", "systemd", "user.control", f"patchcairn-{short}.service.d"),
+                       profile("posix", ".local", "share", "systemd", "user", f"patchcairn-{short}.timer.d")):
             dropin = FakeHost(FakeFiles(dirs={folder}))
             with self.subTest(dropin=folder):
                 outcome = self.register(weekly, dropin, dropin.files)
@@ -646,12 +681,35 @@ class ScheduleRenderTests(unittest.TestCase):
                                                          change_on={2: lambda text: text + "0 5 * * * x\n"})),
                 ("damaged block", FakeHost(FakeFiles(dirs={work_folder(value)}), crontab=other + f"# BEGIN PatchCairn schedule {short}\n")),
                 ("CRON_TZ moves the times", FakeHost(FakeFiles(dirs={work_folder(value)}), crontab="CRON_TZ=Asia/Tokyo\n" + other)),
-                ("no folder for the saved copy", FakeHost(FakeFiles(), crontab=table))):
+                ("no folder for the saved copy", FakeHost(FakeFiles(), crontab=table)),
+                ("crontab cannot reach its spool", FakeHost(FakeFiles(dirs={work_folder(value)}), crontab=table,
+                                                            codes={("crontab", "-l"): 1},
+                                                            errors=b"crontab: cannot open spool \x1b[1mdirectory\xe2\x80\x94\nsecond line"))):
             with self.subTest(case=case):
                 outcome = self.register(value, host, host.files)
                 self.assertEqual(outcome["status"], "rendered")
                 self.assertTrue(outcome["problem"])
                 self.assertNotIn(write, host.argv())
+                if host.errors:  # crontab's own first error line, printable ASCII only
+                    self.assertIn('it said: "crontab: cannot open spool [1mdirectory"', outcome["problem"] or "")
+        refused_write = FakeHost(FakeFiles(dirs={work_folder(value)}), crontab="", codes={("crontab", "-"): 1},
+                                 errors=b"crontab: /tmp/crontab.x: Operation not permitted")
+        self.assertIn('it said: "crontab: /tmp/crontab.x: Operation not permitted"',
+                      self.register(value, refused_write, refused_write.files)["problem"] or "")
+        # A write that failed (a timeout, for example) after crontab wrote the table: it reads back as written, so it counts.
+        late = FakeHost(FakeFiles(dirs={work_folder(value)}), crontab="", after={("crontab", "-"): -9})
+        self.assertEqual(self.register(value, late, late.files), {"status": "registered", "problem": None})
+        self.assertEqual(late.crontab, art["block"])
+        self.assertEqual(self.remove(value, late, late.files), {"status": "removed", "problem": None})  # still -9
+        self.assertEqual(late.crontab, "")
+        lost = FakeHost(FakeFiles(dirs={work_folder(value)}), crontab="", codes={("crontab", "-"): 1, ("crontab", "-l"): [None, None, 1, 1]})
+        self.assertEqual(self.register(value, lost, lost.files)["status"], "registered")  # a failed write that cannot be read back
+        self.assertEqual(art["setup"], ["cron starts this schedule only if this computer is on and awake at that time: a run "
+                                        "whose time passes while it is off or asleep is skipped, not made up later. On WSL, "
+                                        "WSL must be running too."])
+        bare = self.render(value, facts=dict(FACTS["linux"], systemd_running=False))["setup"]  # WSL without systemd
+        self.assertEqual(bare[:1], art["setup"])
+        self.assertIn("cron does not start by itself: start it again each time WSL starts", " ".join(bare[1:]))
         self.refused("schedule-path", schedule_hosts.render, make("linux", "cron", root=profile("posix", "100%")), FACTS["linux"])
         self.refused("not-supported", schedule_hosts.render, make("linux", "cron", root="/opt/" + "p" * 960), FACTS["linux"],
                      offset_of=europe)  # a line over 999 bytes
@@ -695,6 +753,11 @@ class ScheduleRenderTests(unittest.TestCase):
         self.assertEqual([call[1:] for call in host.calls], [(None, None)] * 3)  # stdin closed, no extra environment
         self.assertEqual(self.remove(win, host, files), {"status": "removed", "problem": None})
         self.assertEqual(host.argv()[3:], [commands["query"], commands["delete"], commands["query"]])
+        for code in (0x80070003, 0x80070002 - 2 ** 32, 0x80070003 - 2 ** 32):  # no \PatchCairn folder, and the signed forms
+            with self.subTest(absent=code):
+                absent = FakeHost(FakeFiles(), codes={("schtasks.exe", "/query"): code})
+                self.assertEqual(self.remove(win, absent, absent.files), {"status": "removed", "problem": None})
+                self.assertEqual(absent.argv(), [commands["query"]])
 
         # schtasks writes its query output in an encoding Microsoft does not document, and the runner's console may
         # differ from the engine's: every candidate reading is tried, so a mismatched console code page still matches.
@@ -995,6 +1058,23 @@ class ScheduleRenderTests(unittest.TestCase):
                          [["30", "23", "*", "*", "1"], ["30", "0", "*", "*", "2"]])
 
         # A one-time local run in the hour after a daylight-saving change could fire an hour early, or never.
+        # A weekly time in the hour that repeats when the clocks go back (2026-10-25, 01:00-02:00 UTC here) fires an hour
+        # early there; only a second candidate, an hour late, can do that week's run, inside a window over 60 minutes.
+        repeat = {"created_utc": "2026-10-20T00:00:00Z", "recurrence": {"kind": "weekly", "weekday": "sunday", "time_utc": "01:30",
+                                                                        "first_utc": "2026-10-25T01:30:00Z"},
+                  "local": {"weekday": "sunday", "time": "02:30", "offset_minutes": 60}}
+        winter, yearly = dict(repeat, expires_utc="2027-02-01T00:00:00Z"), dict(repeat, expires_utc="2027-10-20T00:00:00Z")
+        for platform, route in (("linux", "cron"), ("macos", "launchd"), ("windows", "windows_task"), ("macos", "codex_app")):
+            with self.subTest(route=route):
+                for window in (120, 1440):  # one candidate: no window helps, so the message offers none
+                    error = self.refused("not-supported", schedule_hosts.render, make(platform, route, catch_up_minutes=window,
+                                                                                      **winter), FACTS[platform], offset_of=europe)
+                    self.assertTrue(str(error).endswith("choose another time"), str(error))
+                error = self.refused("not-supported", schedule_hosts.render, make(platform, route, catch_up_minutes=60, **yearly),
+                                     FACTS[platform], offset_of=europe)
+                self.assertIn("choose another time, or a catch-up window over 60 minutes", str(error))
+                self.assertEqual(len(self.render(make(platform, route, **yearly))["triggers"]), 2)
+        self.render(make("linux", "systemd_user", **winter))  # exact UTC: the repeated hour does not matter
         changeover = {"created_utc": "2027-03-20T00:00:00Z", "recurrence": {"kind": "once", "at_utc": "2027-03-28T01:30:00Z"},
                       "local": {"at": "2027-03-28T03:30", "offset_minutes": 120}, "expires_utc": "2027-03-28T03:30:00Z"}
         for route in ("launchd", "claude_desktop"):
@@ -1108,6 +1188,43 @@ class ScheduleRenderTests(unittest.TestCase):
         self.assertIn("removed it again", outcome["problem"] or "")
         self.assertEqual(swapped.tasks, {})
         self.assertEqual(swapped.argv()[-2:], [self.render(win)["commands"]["delete"], self.render(win)["commands"]["query"]])
+        # A create or a load that ends with a non-zero code (a timeout, for one) is looked up before "nothing was registered".
+        late = FakeHost(FakeFiles(dirs={work_folder(win)}), after={("schtasks.exe", "/create"): -9})
+        outcome = self.register(win, late, late.files)
+        self.assertEqual((outcome["status"], late.tasks), ("rendered", {}))  # it was registered after all, and removed again
+        self.assertIn("may be registered", outcome["problem"] or "")
+        failed = FakeHost(FakeFiles(dirs={work_folder(win)}), codes={("schtasks.exe", "/create"): 1})
+        outcome = self.register(win, failed, failed.files)
+        self.assertEqual(outcome["status"], "rendered")
+        self.assertIn("nothing was registered", outcome["problem"] or "")
+        self.assertEqual(failed.argv()[-1], self.render(win)["commands"]["query"])  # looked up after the failed create
+        unclear = FakeHost(FakeFiles(dirs={work_folder(win)}), codes={("schtasks.exe", "/create"): 1,
+                                                                      ("schtasks.exe", "/query"): [None, 5, 5]})
+        self.assertEqual(self.register(win, unclear, unclear.files)["status"], "registered")  # cannot tell: never "rendered"
+        # Another program made a task with this name just before /create, which then failed: it is not PatchCairn's.
+        rival = FakeHost(FakeFiles(dirs={work_folder(win)}), codes={("schtasks.exe", "/create"): 0x800700B7})
+        theirs = self.render(win)["files"][0]["data"].decode("utf-16").replace(WIN_PY, "C:\\Tools\\other.exe")
+
+        def racing(argv, stdin=None, env=None):
+            if "/create" in argv:
+                rival.tasks[argv[argv.index("/tn") + 1]] = theirs
+            return rival(argv, stdin=stdin, env=env)
+        outcome = self.register(win, racing, rival.files)
+        self.assertEqual((outcome["status"], list(rival.tasks.values())), ("rendered", [theirs]))
+        self.assertIn("no task of PatchCairn's with this name, so nothing was registered", outcome["problem"] or "")
+        self.assertNotIn("/delete", [argv[1] for argv in rival.argv()])
+        agent = make("macos", "launchd")
+        loaded = FakeHost(FakeFiles(dirs={profile("macos")}), after={("launchctl", "bootstrap"): 5})
+        outcome = self.register(agent, loaded, loaded.files)
+        self.assertEqual((outcome["status"], loaded.loaded, loaded.files.data), ("rendered", set(), {}))
+        self.assertIn("may be loaded", outcome["problem"] or "")
+        kept = FakeHost(FakeFiles(dirs={profile("macos")}), after={("launchctl", "bootstrap"): 5},
+                        codes={("launchctl", "bootout"): 3})
+        self.assertEqual(self.register(agent, kept, kept.files)["status"], "registered")
+        self.assertIn(self.render(agent)["files"][0]["path"], kept.files.data)  # the file proving it is PatchCairn's stays
+        unsure = FakeHost(FakeFiles(dirs={profile("macos")}), codes={("launchctl", "bootstrap"): 5, ("launchctl", "print"): [None, 5, 5]})
+        self.assertEqual(self.register(agent, unsure, unsure.files)["status"], "registered")  # cannot tell: the file stays
+        self.assertIn(self.render(agent)["files"][0]["path"], unsure.files.data)
 
         mac = make("macos", "launchd")
         path = self.render(mac)["files"][0]["path"]
@@ -1176,6 +1293,43 @@ class ScheduleRenderTests(unittest.TestCase):
             self.assertEqual(schedule_hosts.local_candidates(value, offset_of), schedule_hosts.local_candidates(value, europe))
         for zone_file in (io.BytesIO(b"not a zone file"), Unreadable()):
             self.refused("schedule-time", schedule_probe.system_offset, "linux", zone_file=zone_file)
+        whole, outcomes = tzif(b"CET-1CEST,M3.5.0,M10.5.0/3"), []
+
+        def offsets(files):  # each zone file's refusal code; run in a thread, so a parser that loops fails, never hangs
+            for size, zone_file in files:
+                try:
+                    schedule_probe.system_offset("linux", zone_file=zone_file)
+                    outcomes.append((size, "accepted"))
+                except Refusal as error:
+                    outcomes.append((size, error.code))
+                except Exception as error:
+                    outcomes.append((size, type(error).__name__))
+
+        def finished(files):
+            worker = threading.Thread(target=offsets, args=(files,), daemon=True)
+            worker.start()
+            worker.join(10)
+            return not worker.is_alive()
+        # A damaged /etc/localtime is refused, whatever the parser raises; Python 3.12's zoneinfo loops on a cut last line.
+        cut = [(size, io.BytesIO(whole[:size])) for size in range(len(whole))]
+        self.assertTrue(finished(cut), f"reading a zone file cut to {len(outcomes)} of {len(whole)} bytes did not finish")
+        self.assertEqual(outcomes, [(size, "schedule-time") for size in range(len(whole))])
+
+        def byte_loop(fobj):  # how Python 3.12's zoneinfo reads that last line, here on every Python
+            while fobj.read(1) != b"\n":
+                pass
+        outcomes.clear()
+        with mock.patch.object(schedule_probe, "zoneinfo", types.SimpleNamespace(ZoneInfo=types.SimpleNamespace(from_file=byte_loop))):
+            self.assertTrue(finished([(20, io.BytesIO(b"TZif2" + bytes(15)))]), "a parser reading past the end did not stop")
+        self.assertEqual(outcomes, [(20, "schedule-time")])
+        sizes = []
+
+        class Recorded(io.BytesIO):
+            def read(self, size=-1):
+                sizes.append(size)
+                return super().read(size)
+        schedule_probe.system_offset("linux", zone_file=Recorded(whole))
+        self.assertEqual(sizes, [1 << 16])  # one bounded read of the zone file
         # The computer's zone must give the owner's recorded offset at the first run.
         error = self.refused("schedule-time", schedule_hosts.local_candidates, value, fixed(0))
         self.assertIn("make the schedule again", str(error))
@@ -1190,22 +1344,46 @@ class ScheduleRenderTests(unittest.TestCase):
             self.assertLessEqual(abs(offset), 14 * 3600)
             with mock.patch.dict(os.environ, {"TZ": "EST5EDT"}):
                 self.assertEqual(schedule_probe.system_offset()(now), offset)
+            # The old source, time.localtime().tm_gmtoff, would follow this; the computer's zone does not.
+            odd = time.struct_time((2026, 1, 1, 0, 0, 0, 3, 1, 0, "PCT", 19020))  # UTC+05:17, which no zone uses
+            with mock.patch.object(time, "localtime", return_value=odd):
+                self.assertEqual(time.localtime(now).tm_gmtoff, 19020)
+                self.assertEqual(schedule_probe.system_offset()(now), offset)
+            if hasattr(time, "tzset"):  # POSIX: a TZ that really takes effect in this process
+                try:
+                    with mock.patch.dict(os.environ, {"TZ": "PCT-5:17"}):
+                        time.tzset()
+                        self.assertEqual(time.localtime(now).tm_gmtoff, 19020)
+                        self.assertEqual(schedule_probe.system_offset()(now), offset)
+                finally:
+                    time.tzset()
+            if os.name == "nt":  # Windows: the system zone's active bias, read-only from the registry
+                import winreg
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\TimeZoneInformation") as key:
+                    bias = winreg.QueryValueEx(key, "ActiveTimeBias")[0]
+                self.assertEqual(offset, -(bias - 2 ** 32 if bias >= 2 ** 31 else bias) * 60)
         else:
             self.refused("schedule-time", schedule_probe.system_offset)
 
     def check_writable(self, value, tree, listings, *, changes=None, more=None, realpath=None, account=None, probe=None,
-                       runtime=None, acl=()):
+                       runtime=None, acl=(), links=None, mountinfo=LOCAL_MOUNTS):
         """check_writable over a fake tree; ``changes`` and ``more`` replace entries and folder listings. ``acl`` holds
-        the paths that carry a POSIX access-control list, or an OSError that listing extended attributes raises."""
+        the paths that carry a POSIX access-control list, or an OSError that listing extended attributes raises;
+        ``links`` maps each link to the text it holds (readlink)."""
         stat_of, list_dir, seen = fake_tree({**tree, **(changes or {})}, {**listings, **(more or {})})
 
         def list_xattr(path):
             if isinstance(acl, OSError):
                 raise acl
             return ["user.note", "system.posix_acl_access"] if path in acl else ["user.note"]
+
+        def readlink(path):
+            if path in (links or {}):
+                return links[path]
+            raise OSError(errno.EINVAL, "Invalid argument", path)
         schedule_probe.check_writable(value, stat_of=stat_of, list_dir=list_dir, realpath=realpath or (lambda path: path),
-                                      account=account, writable_by_others=probe, list_xattr=list_xattr,
-                                      runtime=runtime or RUNTIMES[value["platform"]])
+                                      account=account, writable_by_others=probe, list_xattr=list_xattr, readlink=readlink,
+                                      runtime=runtime or RUNTIMES[value["platform"]], mountinfo=mountinfo)
         return seen
 
     def accepted(self, *args, **kwargs):
@@ -1230,6 +1408,15 @@ class ScheduleRenderTests(unittest.TestCase):
                      std + "/os.py", std + "/lib-dynload"):
             self.assertIn(path, seen)  # venv parent, folders above, modules, pyvenv.cfg, cache and the standard library
         shared = {"/srv": Info(0, 0o40755), "/srv/shared": Info(0, 0o40777)}
+        # The home folder is a link to a link: /home/example -> /srv/links/home -> /srv/real/home, with /srv/links shared.
+        hops = {"/srv": Info(0, 0o40755), "/srv/links": Info(0, 0o40777), "/srv/links/home": Info(1000, 0o40755, 1000),
+                "/srv/real": Info(0, 0o40755), "/srv/real/home": Info(1000, 0o40755, 1000)}
+        hop_links = {home: "/srv/links/home", "/srv/links/home": "/srv/real/home"}
+        # /usr/bin is really /srv/bin, so python3's "../alt/python3" is /srv/alt/python3 (shared), not /usr/alt/python3.
+        dotted = {"/srv": Info(0, 0o40755), "/srv/bin": Info(0, 0o40755), "/srv/alt": Info(0, 0o40777),
+                  "/srv/alt/python3": Info(0, 0o100755), "/usr/alt": Info(0, 0o40755), "/usr/alt/python3": Info(0, 0o100755),
+                  "/usr/bin/python3.14": Info(0, 0o100755)}
+        dot_links = {LINUX_PY: "../alt/python3", "/srv/alt/python3": "/usr/bin/python3.14", "/usr/alt/python3": "/usr/bin/python3.14"}
         refused = {
             "venv parent writable by a group": {"changes": {"/usr": Info(0, 0o40775, 50)}},
             "venv parent sticky but writable by all": {"changes": {"/usr": Info(0, 0o41777)}},
@@ -1259,23 +1446,75 @@ class ScheduleRenderTests(unittest.TestCase):
                                                         "acl": PermissionError(errno.EACCES, "Permission denied", LINUX_ROOT)},
             "a module that cannot be read": {"more": {scripts: ["patchcairn_workflow.py", "workflow_core.py", "gone.py"]}},
             "no scripts folder": {"drop": scripts},
+            "folder above with the sticky bit (anyone can create a name that has gone)": {"changes": {"/home": Info(0, 0o41777)}},
+            "a link on the way lives in a shared folder": {
+                "changes": {"/etc": Info(0, 0o40755), "/etc/alternatives": Info(0, 0o40777),
+                            "/etc/alternatives/python3": Info(0, 0o100755), "/usr/bin/python3.14": Info(0, 0o100755)},
+                "readlink": {LINUX_PY: "/etc/alternatives/python3", "/etc/alternatives/python3": "/usr/bin/python3.14"},
+                "links": {LINUX_PY: "/usr/bin/python3.14", "/etc/alternatives/python3": "/usr/bin/python3.14"}},
+            "a broken pyvenv.cfg link (anyone may create its target)": {"readlink": {"/usr/bin/pyvenv.cfg": "/tmp/gone.cfg"}},
+            "a folder link above PatchCairn leads through a shared folder": {"changes": hops, "readlink": hop_links},
+            "a link leads under a folder link into a shared folder": {
+                "changes": {**shared, "/srv/shared/py": Info(0, 0o40755), "/opt": Info(0, 0o40755), "/opt/py": Info(0, 0o40755),
+                            "/opt/py/bin": Info(0, 0o40755), "/opt/py/bin/python3": Info(0, 0o100755)},
+                "readlink": {LINUX_PY: "/opt/py/bin/python3", "/opt/py": "/srv/shared/py"}},
+            "a relative link counts from its real folder, here a shared one": {"changes": dotted, "readlink": dot_links,
+                                                                               "links": {"/usr/bin": "/srv/bin"}},
+            "PatchCairn on a WSL Windows drive (9p)": {"mounts": LOCAL_MOUNTS + f"95 22 0:60 / {home} rw - 9p drvfs rw\n"},
+            "PatchCairn on a WSL Windows drive (drvfs, escaped name)": {
+                "mounts": LOCAL_MOUNTS + "96 22 0:61 / " + LINUX_ROOT.replace(" ", "\\040") + " rw - drvfs C:\\134 rw\n"},
+            "PatchCairn on a WSL Windows drive (virtiofs)": {"mounts": LOCAL_MOUNTS + f"97 22 0:62 / {home} rw - virtiofs C: rw\n"},
+            "PatchCairn on a network share (cifs)": {"mounts": LOCAL_MOUNTS + f"98 22 0:63 / {home} rw - cifs //srv/home rw\n"},
+            "a later mount over a parent folder hides a local one below it": {
+                "mounts": LOCAL_MOUNTS + f"30 22 8:2 / {home} rw - ext4 /dev/sdb rw\n31 22 0:70 / /home rw - 9p drvfs rw\n"},
+            "the last of the mounts stacked on one folder": {
+                "mounts": LOCAL_MOUNTS + f"40 22 8:2 / {home} rw - ext4 /dev/sdb rw\n41 40 0:71 / {home} rw - 9p drvfs rw\n"},
+            "a private-looking group that is not the user's primary group": {
+                "changes": {LINUX_ROOT: Info(1000, 0o40775, 1001)}, "account": (1000, "example", 1000, lambda gid: ("example", {"example"}))},
         }
         for case, spec in refused.items():
             with self.subTest(case=case):
                 use = {key: names for key, names in listings.items() if key != spec.get("drop")}
                 links = spec.get("links", {})
                 error = self.refused("schedule-path", self.check_writable, value, tree, use, changes=spec.get("changes"),
-                                     more=spec.get("more"), account=account, runtime=spec.get("runtime"), acl=spec.get("acl", ()),
-                                     realpath=lambda path, links=links: links.get(path, path))
+                                     more=spec.get("more"), account=spec.get("account", account), runtime=spec.get("runtime"),
+                                     acl=spec.get("acl", ()), realpath=lambda path, links=links: links.get(path, path),
+                                     links=spec.get("readlink"), mountinfo=spec.get("mounts", LOCAL_MOUNTS))
                 self.assertNotRegex(str(error), r"(?i)move\b[^.]*python")
+                if "mounts" in spec:
+                    self.assertIn("is on a Windows drive or a shared folder", str(error))
+        self.accepted(value, tree, listings, account=account, mountinfo=WSL_MOUNTS)  # Windows drives elsewhere do not matter
+        # A local file system mounted inside a shared one covers what is below it.
+        self.accepted(value, tree, listings, account=account,
+                      mountinfo=LOCAL_MOUNTS + f"31 22 0:70 / /home rw - 9p drvfs rw\n30 31 8:2 / {home} rw - ext4 /dev/sdb rw\n")
+        for case, (changes, readlink, realpath, shared_folder) in {
+                "folder link above": (hops, hop_links, {}, "/srv/links"),
+                "relative link": (dotted, dot_links, {"/usr/bin": "/srv/bin"}, "/srv/alt")}.items():
+            with self.subTest(case=case):  # the shared folder is named; once it is not shared, the same links pass
+                error = self.refused("schedule-path", self.check_writable, value, tree, listings, account=account, changes=changes,
+                                     links=readlink, realpath=lambda path, realpath=realpath: realpath.get(path, path))
+                self.assertIn(f"can change {shared_folder},", str(error))
+                self.accepted(value, tree, listings, account=account, changes={**changes, shared_folder: Info(0, 0o40755)},
+                              links=readlink, realpath=lambda path, realpath=realpath: realpath.get(path, path))
+        error = self.refused("schedule-path", self.check_writable, value, tree, listings, account=account,
+                             changes={"/home": Info(1001, 0o40755)})
+        self.assertIn("/home belongs to another account", str(error))  # not "other accounts can change", and no chmod
+        self.assertNotIn("chmod", str(error))
+        asked = []
+
+        def counted(gid):
+            asked.append(gid)
+            return ("example", {"example"}) if gid == 1000 else ("staff", {"x"})
+        self.accepted(value, tree, listings, account=(1000, "example", 1000, counted),
+                      changes={path: Info(1000, 0o40775, 1000) for path in (LINUX_ROOT, scripts, home)})
+        self.assertEqual(asked, [1000])  # one group lookup per group in a check, however many paths share it
         error = self.refused("schedule-path", self.check_writable, value, tree, listings, account=account,
                              runtime=dict(RUNTIMES["linux"], executable="/usr/local/bin/python3"))
         self.assertIn("Make the schedule with the Python it will run", str(error))
         error = self.refused("schedule-path", self.check_writable, value, tree, listings, account=account,
                              changes={module: Info(1000, 0o100666, 1000)})
         self.assertIn(f"chmod go-w '{module}'", str(error))
-        allowed = {"folder above with the sticky bit": ({"/home": Info(0, 0o41777)}, ()),
-                   "the user's private group": ({LINUX_ROOT: Info(1000, 0o40775, 1000), scripts: Info(1000, 0o40775, 1000)}, ()),
+        allowed = {"the user's private group": ({LINUX_ROOT: Info(1000, 0o40775, 1000), scripts: Info(1000, 0o40775, 1000)}, ()),
                    "private group on a file system without access-control lists": (
                        {LINUX_ROOT: Info(1000, 0o40775, 1000)}, OSError(errno.EOPNOTSUPP, "Operation not supported", LINUX_ROOT))}
         for case, (changes, acl) in allowed.items():
@@ -1294,6 +1533,19 @@ class ScheduleRenderTests(unittest.TestCase):
             with self.subTest(members=members):
                 self.refused("schedule-path", self.check_writable, value, tree, listings, changes={LINUX_ROOT: Info(1000, 0o40775, 1000)},
                              account=(1000, "example", 1000, lambda gid, members=members: members))
+        # The real account reader, with pwd and grp replaced: another account whose primary group is the user's group
+        # makes that group shared.
+        users = [types.SimpleNamespace(pw_name="example", pw_uid=1000, pw_gid=1000, pw_dir=home)]
+        fake_pwd = types.SimpleNamespace(getpwuid=lambda uid: next(user for user in users if user.pw_uid == uid),
+                                         getpwall=lambda: list(users))
+        fake_grp = types.SimpleNamespace(getgrgid=lambda gid: {1000: types.SimpleNamespace(gr_name="example", gr_mem=[])}[gid])
+        private = {LINUX_ROOT: Info(1000, 0o40775, 1000)}
+        with mock.patch.dict(sys.modules, {"pwd": fake_pwd, "grp": fake_grp}), mock.patch.object(os, "getuid", create=True,
+                                                                                                return_value=1000):
+            self.accepted(value, tree, listings, changes=private)
+            users.append(types.SimpleNamespace(pw_name="other", pw_uid=1001, pw_gid=1000, pw_dir="/srv/other"))
+            self.refused("schedule-path", self.check_writable, value, tree, listings, changes=private)
+            self.refused("schedule-path", self.check_writable, value, tree, listings, changes={LINUX_ROOT: Info(1000, 0o40775, 1002)})
 
         mac, mhome, mscripts, mstd = make("macos", "launchd"), profile("macos"), MAC_ROOT + "/scripts", "/opt/homebrew/lib/python3.14"
         mtree = {"/": Info(0, 0o40755), "/opt": Info(0, 0o40755), "/opt/homebrew": Info(501, 0o40775, 80),
@@ -1329,8 +1581,15 @@ class ScheduleRenderTests(unittest.TestCase):
         for target, answer in ((WIN_ROOT, True), ("C:\\", True), (wscripts + "\\patchcairn_workflow.py", True), (WIN_ROOT, None),
                                (base + "\\python314.dll", True), (base + "\\Lib\\os.py", True)):
             with self.subTest(target=target, answer=answer):
-                self.refused("schedule-path", self.check_writable, win, wtree, wlist,
-                             probe=lambda path, ancestor, target=target, answer=answer: answer if path == target else False)
+                error = self.refused("schedule-path", self.check_writable, win, wtree, wlist,
+                                     probe=lambda path, ancestor, target=target, answer=answer: answer if path == target else False)
+                # True means others can change it; None (the lookup failed) only means it could not be confirmed safe.
+                self.assertIn("Other accounts on this computer can change" if answer else "could not confirm", str(error))
+
+        def failing(path, ancestor):
+            raise OSError(errno.EACCES, "Access is denied", path)
+        error = self.refused("schedule-path", self.check_writable, win, wtree, wlist, probe=failing)
+        self.assertIn("could not confirm", str(error))
         # A venv's python.exe only redirects to the base Python, whose folder must be safe too.
         venv = make("windows", "windows_task", interpreter=profile("windows", "Projects", ".venv", "Scripts", "python.exe"))
         runtime = dict(RUNTIMES["windows"], executable=venv["interpreter"])
@@ -1342,6 +1601,67 @@ class ScheduleRenderTests(unittest.TestCase):
         error = self.refused("schedule-path", self.check_writable, win, wtree, wlist, probe=lambda path, ancestor: False,
                              runtime=dict(RUNTIMES["windows"], executable="C:\\Other\\python.exe"))
         self.assertIn("Make the schedule with the Python it will run", str(error))
+        # C:\Python314 is a junction (as Scoop's "current" is): readlink puts \\?\ or \??\ before the drive or UNC\ part,
+        # and the access check is asked only about plain drive or share paths, the folder the link leads to included.
+        for form, target, real in (("\\\\?\\", "\\\\?\\C:\\Tools\\py314", "C:\\Tools\\py314"),
+                                   ("\\??\\", "\\??\\C:\\Tools\\py314", "C:\\Tools\\py314"),
+                                   ("relative", "Tools\\py314", "C:\\Tools\\py314"),
+                                   ("UNC", "\\\\?\\UNC\\srv\\tools\\py314", "\\\\srv\\tools\\py314")):
+            with self.subTest(form=form):
+                asked.clear()
+                self.accepted(win, wtree, wlist, links={base: target}, probe=lambda path, ancestor: asked.append((path, ancestor)) or False)
+                self.assertIn((real, False), asked)
+                self.assertIn((real.rsplit("\\", 1)[0] + ("\\" if form == "UNC" else ""), True), asked)  # where the target lives
+                self.assertEqual([path for path, _ in asked if path[1:3] != ":\\" and not path.startswith("\\\\srv\\tools")], [])
+                error = self.refused("schedule-path", self.check_writable, win, wtree, wlist, links={base: target},
+                                     probe=lambda path, ancestor, real=real: path == real)
+                self.assertIn(f"Other accounts on this computer can change {real},", str(error))
+        asked.clear()
+        error = self.refused("schedule-path", self.check_writable, win, wtree, wlist,
+                             links={base: "\\\\?\\Volume{00000000-0000-0000-0000-000000000000}\\py314"},
+                             probe=lambda path, ancestor: asked.append((path, ancestor)) or False)
+        self.assertIn("not on a drive letter or a network share", str(error))
+        self.assertEqual([path for path, _ in asked if path[1:3] != ":\\"], [])  # never asked about a device path
+
+    @unittest.skipUnless(os.name == "nt", "only on windows: NTFS junctions")
+    def test_windows_junctions_are_followed_to_plain_paths(self):
+        # Real junctions, as a Scoop Python has: the Python is reached through link -> side\hop -> real, and PatchCairn
+        # through pclink -> pcreal. The access check (a fake here) must see every folder the links lead through, the one
+        # holding the middle junction included, and only plain drive paths.
+        import _winapi
+        fixtures = ROOT / "work" / "test-fixtures"
+        fixtures.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="schedule-", dir=fixtures) as folder:
+            folder = os.path.realpath(folder)
+            real, side, hop, link, pcreal, pclink = (os.path.join(folder, *name.split("/"))
+                                                     for name in ("real", "side", "side/hop", "link", "pcreal", "pclink"))
+            for path in (real + "\\Lib\\os.py", real + "\\python.exe", pcreal + "\\pc\\scripts\\patchcairn_workflow.py"):
+                Path(path).parent.mkdir(parents=True, exist_ok=True)
+                Path(path).touch()
+            os.mkdir(side)
+            junctions = [(real, hop), (hop, link), (pcreal, pclink)]  # (target, junction)
+            try:
+                for target, junction in junctions:
+                    _winapi.CreateJunction(target, junction)
+                interpreter = link + "\\python.exe"
+                value = make("windows", "windows_task", interpreter=interpreter, root=pclink + "\\pc")
+                runtime = {"executable": interpreter, "base_prefix": link, "stdlib": link + "\\Lib", "platstdlib": link + "\\Lib"}
+                asked = []
+                try:
+                    schedule_probe.check_writable(value, runtime=runtime, writable_by_others=lambda path, ancestor: asked.append(path) or False)
+                except Refusal as error:
+                    self.fail(f"refused: {error}")
+                self.assertEqual([path for path in asked if path[1:3] != ":\\"], [])  # readlink's \\?\ never reaches the check
+                self.assertEqual({real, hop, side, pcreal, pcreal + "\\pc"} - set(asked), set())
+                for writable in (side, real, pcreal):  # each would let another account change what the schedule runs
+                    with self.subTest(writable=writable):
+                        error = self.refused("schedule-path", schedule_probe.check_writable, value, runtime=runtime,
+                                             writable_by_others=lambda path, ancestor, writable=writable: path == writable)
+                        self.assertIn(f"can change {writable},", str(error))
+            finally:
+                for _target, junction in reversed(junctions):
+                    if os.path.lexists(junction):
+                        os.rmdir(junction)  # removes the junction only, never what it leads to
 
     def test_protected_or_long_paths_are_refused(self):
         home = profile("macos")
@@ -1369,11 +1689,25 @@ class ScheduleRenderTests(unittest.TestCase):
         for value in (make("macos", "launchd"), make("macos", "launchd", root=profile("macos", "Documents-old", "PatchCairn")),
                       make("macos", "codex_app", root=profile("macos", "Documents", "PatchCairn"))):
             self.assertIsNone(schedule_probe.check_placement(value, home, realpath=lambda candidate: candidate))
+        for route in schedule_hosts.PROMPT_ROUTES:  # a drive that may ignore ownership is refused on every macOS route
+            error = self.refused("schedule-path", schedule_probe.check_placement, make("macos", route, root="/Volumes/USB/PatchCairn"),
+                                 home, realpath=lambda candidate: candidate)
+            self.assertIn("this Mac's own disk", str(error))
+        alias = "/Volumes/Macintosh HD" + profile("macos", "PatchCairn")  # the Mac's own disk, through its link to /
+        try:
+            schedule_probe.check_placement(make("macos", "launchd", root=alias), home,
+                                           realpath=lambda candidate: candidate.replace("/Volumes/Macintosh HD", "", 1))
+        except Refusal as error:
+            self.fail(f"refused: {error}")
         limit = schedule_probe.WINDOWS_ROOT_LIMIT
-        self.assertEqual(limit, 218)
-        self.assertIsNone(schedule_probe.check_placement(make("windows", "windows_task", root="C:\\" + "p" * (limit - 3)), None))
+        self.assertEqual(limit, 199)  # <root>\work\schedules\<id16>\task.xml stays within private_workspace's 240 units
+        longest = make("windows", "windows_task", root="C:\\" + "p" * (limit - 3))
+        self.assertIsNone(schedule_probe.check_placement(longest, None))
+        self.assertEqual(len(self.render(longest)["files"][0]["path"]), 240)  # task.xml at private_workspace's bound (D-050)
         self.refused("schedule-path", schedule_probe.check_placement, make("windows", "windows_task", root="C:\\" + "p" * (limit - 2)),
                      None)
+        wide = "C:\\" + "p" * (limit - 4) + chr(0x1F600)  # at the limit in code points, but the last one is two UTF-16 units
+        self.refused("schedule-path", schedule_probe.check_placement, make("windows", "windows_task", root=wide), None)
 
     def test_host_facts_of_this_computer(self):
         native = schedule_probe.native_platform()
@@ -1387,7 +1721,8 @@ class ScheduleRenderTests(unittest.TestCase):
         self.refused("schedule-path", schedule_probe.host_facts, gone)  # a schedule is not made with a missing Python
         self.refused("schedule-facts", schedule_probe.host_facts, here, purpose="delete")
         for value, purpose in ((here, "register"), (gone, "remove")):  # removal skips the checks for making a schedule
-            with self.subTest(purpose=purpose), mock.patch.object(schedule_probe, "check_writable") as checked:
+            with self.subTest(purpose=purpose), mock.patch.object(schedule_probe, "check_writable") as checked, \
+                    mock.patch.object(schedule_probe, "check_placement"):  # a clone in ~/Documents on a developer Mac
                 try:
                     facts = schedule_probe.host_facts(value, writable_by_others=lambda path, ancestor: False, purpose=purpose)
                 except Refusal as error:  # a session with administrator rights, as on hosted CI runners
@@ -1396,9 +1731,9 @@ class ScheduleRenderTests(unittest.TestCase):
                     continue
                 self.assertEqual(checked.call_count, 1 if purpose == "register" else 0)
                 if native != "windows" and facts["uid"] == 0:
-                    self.refused("schedule-facts", schedule_hosts.check_facts, facts, native)
+                    self.refused("schedule-facts", schedule_probe.check_facts, facts, native)
                 else:
-                    self.assertIs(schedule_hosts.check_facts(facts, native), facts)
+                    self.assertIs(schedule_probe.check_facts(facts, native), facts)
 
     def test_schedule_record_validation(self):
         for value in (make("linux", "systemd_user"), make("windows", "windows_task", "once"), make("macos", "launchd", **SUNDAY)):
@@ -1443,10 +1778,10 @@ class ScheduleRenderTests(unittest.TestCase):
                       dict(FACTS["windows"], code_pages=[]), dict(FACTS["windows"], code_pages=437),
                       {key: item for key, item in FACTS["windows"].items() if key != "code_pages"}):
             with self.subTest(facts=facts):
-                self.refused("schedule-facts", schedule_hosts.check_facts, facts, "windows")
-        self.assertTrue(schedule_hosts.check_facts(dict(FACTS["windows"], system_dir="D:\\WINNT\\SYSTEM32"), "windows"))
+                self.refused("schedule-facts", schedule_probe.check_facts, facts, "windows")
+        self.assertTrue(schedule_probe.check_facts(dict(FACTS["windows"], system_dir="D:\\WINNT\\SYSTEM32"), "windows"))
         for change in ({"systemd_running": "yes"}, {"cron_running": None}, {"systemctl": "/usr/local/bin/systemctl"}):
-            self.refused("schedule-facts", schedule_hosts.check_facts, dict(FACTS["linux"], **change), "linux")
+            self.refused("schedule-facts", schedule_probe.check_facts, dict(FACTS["linux"], **change), "linux")
 
     def test_render_fields_and_unbound_fields_cover_the_record(self):
         class Watched(dict):

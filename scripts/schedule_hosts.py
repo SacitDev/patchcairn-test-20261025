@@ -11,13 +11,11 @@ Inputs from the engine (decision D-033):
   its four allowed executables itself (GetSystemDirectoryW and the fixed POSIX paths, never the facts or the argv),
   runs the list argv with shell=False and a 60-second timeout (a timeout is a non-zero code), closes stdin unless
   bytes are given, merges ``env`` over the process environment and returns raw bytes, decoded here per tool.
-- ``files``: the engine's L4 file object with read, exists, write_new, remove and ensure_dir. It writes the home-folder
-  plist and unit files through schedule_probe.LocalFiles, and task.xml and the saved crontab under the schedule's
-  private folder work/schedules/<id16> (which the engine creates) through private_workspace's writer.
-- ``approved_sha256``: the rendering SHA-256 that the engine bound to the owner's approval. It covers the record's
-  state and registration, so it changes when either changes; it does not make an approval single-use. The engine
-  marks each approval used when register() returns, refuses a second use, and changes the registration field only
-  with the result of register() or remove().
+- ``files`` (read, exists, write_new, remove, ensure_dir): schedule_probe.LocalFiles for the home-folder plist and unit
+  files, private_workspace's writer for task.xml and saved crontabs in work/schedules/<id16> (made by the engine).
+- ``approved_sha256``: the rendering SHA-256 the engine bound to the owner's approval. It covers the record's state and
+  registration, so it changes when either does; it is not single-use by itself: the engine marks each approval used
+  when register() returns and changes the registration field only with register()'s or remove()'s result.
 Nothing here starts a process, raises privileges, or replaces or deletes a task PatchCairn did not create.
 """
 from __future__ import annotations
@@ -63,10 +61,6 @@ _DISPLAY = {"windows_task": "Windows Task Scheduler", "launchd": "launchd", "sys
             "cron": "cron", "codex_app": "Codex app automation", "claude_desktop": "Claude Code desktop scheduling",
             "windows": "Windows", "macos": "macOS", "linux": "Linux"}
 
-_SID = re.compile(r"S-1-(?:5-21|12-1)(?:-[0-9]{1,10}){4}\Z")
-_SYSTEM_DIR = re.compile(r"[A-Za-z]:\\[^\\]+\\system32\Z", re.IGNORECASE)
-_FACT_KEYS = {"windows": {"platform", "system_dir", "user_sid", "code_pages"}, "macos": {"platform", "uid", "home"},
-              "linux": {"platform", "uid", "home", "systemctl", "systemd_running", "cron_running"}}
 _TASK_NS = "http://schemas.microsoft.com/windows/2004/02/mit/task"
 _TASK_SETTINGS = (("MultipleInstancesPolicy", "IgnoreNew"), ("DisallowStartIfOnBatteries", "false"),
                   ("StopIfGoingOnBatteries", "false"), ("StartWhenAvailable", "true"), ("WakeToRun", "false"),
@@ -74,8 +68,7 @@ _TASK_SETTINGS = (("MultipleInstancesPolicy", "IgnoreNew"), ("DisallowStartIfOnB
 _LAUNCHCTL, _CRONTAB = "/bin/launchctl", "/usr/bin/crontab"
 # "Absent" is identified by an exit code, never by translated text:
 # - schtasks /hresult makes the exit code an HRESULT; ERROR_FILE_NOT_FOUND (no task) and ERROR_PATH_NOT_FOUND (no
-#   \PatchCairn folder), unsigned or signed (https://learn.microsoft.com/en-us/windows-server/administration/
-#   windows-commands/schtasks-query);
+#   \PatchCairn folder), unsigned or signed (https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/schtasks-query);
 # - launchctl print exits 113, "Could not find specified service" (launchctl error 113; unverified on a device);
 # - systemctl is-enabled exits 4 or prints not-found for an unknown unit; older systemd says so on stderr in C locale.
 _NOT_FOUND = frozenset({0x80070002, 0x80070003, 0x80070002 - 2 ** 32, 0x80070003 - 2 ** 32})
@@ -156,29 +149,6 @@ def check_record(record):
     return record
 
 
-def check_facts(facts, platform):
-    """Return the computer facts (schedule_probe.host_facts) when they are complete and valid for ``platform``."""
-    if not isinstance(facts, dict) or facts.get("platform") != platform or set(facts) != _FACT_KEYS.get(platform):
-        raise Refusal("schedule-facts", "The computer facts do not describe this schedule's platform")
-    if platform == "windows":
-        schedule_probe.check_path(facts["system_dir"], platform, "Windows system folder")
-        if not _SYSTEM_DIR.match(facts["system_dir"]):
-            raise Refusal("schedule-facts", "The Windows system folder must be <drive>:\\<Windows folder>\\System32")
-        if not isinstance(facts["user_sid"], str) or not _SID.match(facts["user_sid"]):
-            raise Refusal("schedule-facts", "Windows did not report a user account PatchCairn can schedule for")
-        pages = facts["code_pages"]
-        if not isinstance(pages, list) or not pages or any(type(page) is not int or not 0 < page < 65536 for page in pages):
-            raise Refusal("schedule-facts", "Windows did not report its code pages")
-        return facts
-    if type(facts["uid"]) is not int or not 0 < facts["uid"] < 2 ** 32 - 1:
-        raise Refusal("schedule-facts", "PatchCairn schedules only for an ordinary user account, never for root")
-    schedule_probe.check_path(facts["home"], platform, "home folder")
-    if platform == "linux" and (facts["systemctl"] not in (None, *schedule_probe.SYSTEMCTLS) or type(facts["systemd_running"]) is not bool
-                                or type(facts["cron_running"]) is not bool):
-        raise Refusal("schedule-facts", "The Linux facts need systemctl (or None) and whether systemd and cron run")
-    return facts
-
-
 def fire_argv(record):
     """The one command every route runs for ``record`` (a checked record)."""
     separator = "\\" if record["platform"] == "windows" else "/"
@@ -191,12 +161,14 @@ def local_candidates(record, offset_of):
     "minute", "first_local"} (the first local occurrence, YYYY-MM-DDTHH:MM:SS); one without daylight saving, usually
     two with it, and more than two refuse the route. ``offset_of(timestamp)`` gives the computer's UTC offset in
     seconds (schedule_probe.system_offset) and must give the owner's recorded offset at the first occurrence.
+    A weekly time in the hour that repeats when the clocks go back fires at its first pass, an hour early (cron(8):
+    "running the same job twice is avoided"); only the other candidate, an hour late, can then do that week's run.
     """
     check_record(record)
     if not callable(offset_of):
         raise Refusal("schedule-time", "This computer's time zone was not supplied, so local times cannot be rendered")
     moment, expires = _first_occurrence(record["recurrence"]), _utc(record["expires_utc"], "expires_utc")
-    expected = record["local"]["offset_minutes"] * 60
+    expected, repeated = record["local"]["offset_minutes"] * 60, False
     found = {}
     while moment <= expires:
         offset = offset_of(moment.timestamp())
@@ -210,10 +182,15 @@ def local_candidates(record, offset_of):
         found.setdefault((local.weekday(), local.hour, local.minute), local.strftime("%Y-%m-%dT%H:%M:%S"))
         if record["recurrence"]["kind"] == "once":
             break
+        repeated = repeated or offset_of(moment.timestamp() - 3600) > offset  # this local time occurred an hour earlier
         moment += timedelta(days=7)
     if len(found) > 2:
         raise Refusal("not-supported", "Not supported: across this schedule's dates the local time zone changes more than "
                                        "once; use a route that keeps UTC or a shorter schedule")
+    if repeated and not (len(found) == 2 and record["catch_up_minutes"] > 60):
+        remedy = "choose another time, or a catch-up window over 60 minutes" if len(found) == 2 else "choose another time"
+        raise Refusal("not-supported", "Not supported: one week this time falls in the hour that repeats when the clocks go "
+                                       f"back, and that week's run would be missed; {remedy}")
     return [{"weekday": WEEKDAYS[day], "hour": hour, "minute": minute, "first_local": first}
             for (day, hour, minute), first in found.items()]
 
@@ -224,7 +201,7 @@ def render(record, facts, *, offset_of=None):
     saved_copy, block (cron), prompt, schedule, setup (lines for the person), record_state and sha256 (approved)."""
     check_record(record)
     route, once = record["route"], record["recurrence"]["kind"] == "once"
-    art = _targets(record, check_facts(facts, record["platform"]))
+    art = _targets(record, schedule_probe.check_facts(facts, record["platform"]))
     if route == "systemd_user" and not facts["systemd_running"]:
         raise Refusal("not-supported", "Not supported here: systemd is not running (for example WSL without systemd); "
                                        "use the cron route")
@@ -246,7 +223,15 @@ def render(record, facts, *, offset_of=None):
     elif route == "systemd_user":
         for entry, data in zip(art["files"], _units(record)):
             entry["data"] = data
-    elif route == "cron":
+        # pam_systemd ends the user's manager at the last log-out; WSL keeps no timer alive (learn.microsoft.com/windows/wsl/systemd)
+        art["setup"] = ["This schedule runs only while you are signed in to this computer, and on WSL only while WSL is "
+                        "running; a run missed then does its work only if you sign in within the catch-up window."]
+    elif route == "cron":  # cron(8) starts a job only at its minute; WSL without systemd starts no services (wsl-config)
+        art["setup"] = ["cron starts this schedule only if this computer is on and awake at that time: a run whose time "
+                        "passes while it is off or asleep is skipped, not made up later. On WSL, WSL must be running too."]
+        art["setup"] += [] if facts["systemd_running"] else [
+            "On WSL without systemd, cron does not start by itself: start it again each time WSL starts (for example "
+            "with a [boot] command in /etc/wsl.conf), or the runs are missed."]
         art["block"] = _cron_block(record, art["triggers"])
         if any(len(line.encode("utf-8")) > 999 for line in art["block"].split("\n")):
             raise Refusal("not-supported", "Not supported: the cron line would be longer than 999 bytes, which some cron "
@@ -303,7 +288,7 @@ def remove(record, facts, runner, *, files):
     check_record(record)
     if record["route"] in PROMPT_ROUTES:
         raise Refusal("not-supported", "The person removes this route in the app; PatchCairn does not remove it")
-    targets = _targets(record, check_facts(facts, record["platform"]))
+    targets = _targets(record, schedule_probe.check_facts(facts, record["platform"]))
     return _attempt(_FLOWS[record["route"]][1], "registered", targets, runner, files, facts)
 
 
@@ -334,7 +319,7 @@ def _first_occurrence(recurrence):
 
 
 def _check_local(local, kind, first):
-    """The owner's wall-clock intent and UTC offset at creation must give the recorded UTC time."""
+    """The owner's wall-clock intent and UTC offset at the first occurrence must give the recorded UTC time."""
     keys = {"at", "offset_minutes"} if kind == "once" else {"weekday", "time", "offset_minutes"}
     offset = local.get("offset_minutes") if isinstance(local, dict) else None
     if not isinstance(local, dict) or set(local) != keys or type(offset) is not int or not -720 <= offset <= 840 or offset % 15:
@@ -719,8 +704,12 @@ def _register_task(art, runner, files, facts):
                     "If it is an older PatchCairn task, remove it first.")
     _put_work_file(files, task["path"], task["data"])
     code = _run(runner, commands["create"], art)[0]
-    if code:
-        raise _Held(f"schtasks could not create the task (exit code {code}); nothing was registered")
+    if code:  # a timeout is a non-zero code too, so look before saying nothing was registered
+        state, found = _task_lookup(art, runner, facts)
+        if state == "absent" or (state == "exists" and not _runs_ours(art, found)):
+            raise _Held(f"schtasks could not create the task (exit code {code}); Task Scheduler shows no task of "
+                        "PatchCairn's with this name, so nothing was registered")
+        raise _Unverified(f"schtasks ended with exit code {code}, but a task with this name may be registered")
     state, found = _task_lookup(art, runner, facts)
     if state != "exists" or expected not in found:
         # The name was absent and /create (never /f) succeeded, so the task there is the one this call made.
@@ -761,6 +750,9 @@ def _register_launchd(art, runner, files, facts):
             files.write_new(plist["path"], plist["data"], plist["mode"])
             written.append(plist["path"])
         code = _run(runner, commands["bootstrap"], art)[0]
+        if code and _job_lookup(art, runner)[0] != "absent":  # loaded anyway (or cannot tell): keep the file that proves it
+            written = []
+            raise _Unverified(f"launchctl ended with exit code {code}, but a job with this label may be loaded")
         if code:
             raise _Held(f"launchctl could not load the job (exit code {code}); nothing was registered. If a Python item "
                         "(python3 or Python) is switched off in System Settings > General > Login Items & Extensions, "
@@ -774,7 +766,7 @@ def _register_launchd(art, runner, files, facts):
 
 
 def _unit_lookup(art, runner):
-    """("enabled" | "exists" | "absent" | "unknown", code) for the timer."""
+    """("enabled" | "exists" | "absent", code) for the timer, or ("unknown", the code and systemctl's own words)."""
     code, output, errors = _run(runner, art["commands"]["query"], art)
     word, error = _ascii(output), _ascii(errors)
     if code == 0:
@@ -784,13 +776,15 @@ def _unit_lookup(art, runner):
     if code == 4 or word == "not-found" or (error.startswith("Failed to get unit file state for ")
                                            and error.endswith("No such file or directory")):
         return "absent", code
-    return "unknown", code
+    return "unknown", f"{code}{_said(errors)}"  # shown in the hold, for example "Failed to connect to bus"
 
 
 def _register_systemd(art, runner, files, facts):
     commands, units, folder = art["commands"], art["files"], _folder(art["files"][0]["path"])
     names = [unit["path"].rsplit("/", 1)[1] for unit in units] + ["patchcairn-.service", "patchcairn-.timer"]  # + prefix
-    if any(files.exists(f"{base}/{name}.d") for base in (folder, folder + ".control") for name in names):
+    # Not checked: type-wide service.d/timer.d and /run/user/<uid>/systemd (many keep their own; only this account writes)
+    bases = (folder, folder + ".control", units[0]["base"] + "/.local/share/systemd/user")
+    if any(files.exists(f"{base}/{name}.d") for base in bases for name in names):
         raise _Held("A drop-in folder changes a systemd unit with this name; PatchCairn does not register over it")
     existing = [files.read(unit["path"]) for unit in units]
     state, code = _unit_lookup(art, runner)
@@ -814,9 +808,9 @@ def _register_systemd(art, runner, files, facts):
                 files.write_new(unit["path"], unit["data"], unit["mode"])
                 written.append(unit["path"])
         for step in ("daemon_reload", "enable"):
-            code = _run(runner, commands[step], art)[0]
+            code, _, errors = _run(runner, commands[step], art)
             if code:
-                raise _Held(f"systemctl {commands[step][2]} failed (exit code {code}); nothing was registered")
+                raise _Held(f"systemctl {commands[step][2]} failed (exit code {code}{_said(errors)}); nothing was registered")
         enabled = True
     finally:
         if not enabled and written:  # undo a partial enable before the files go, then let systemd forget them
@@ -836,7 +830,14 @@ def _crontab(art, runner):
         return output.decode("utf-8", "surrogateescape")
     if not output and errors.startswith(b"no crontab for "):
         return ""
-    raise _Held(f"crontab could not read the table (exit code {code}); nothing was changed")
+    raise _Held(f"crontab could not read the table (exit code {code}{_said(errors)}); nothing was changed")
+
+
+def _said(errors):
+    """The tool's own first error line, as plain printable ASCII of at most 200 characters (or nothing)."""
+    line = next(iter(errors.decode("ascii", "replace").splitlines()), "")
+    line = "".join(char for char in line if char.isascii() and char.isprintable()).strip()[:200]
+    return f'; it said: "{line}"' if line else ""
 
 
 def _cron_span(table, short):
@@ -856,19 +857,19 @@ def _cron_span(table, short):
 
 
 def _cron_replace(art, runner, files, old, new, status, final, saved):
-    """Save the old table, check it is unchanged, write the new one and read it back (``final`` on a bad read-back)."""
+    """Save the old table, check it is unchanged, write the new one and read it back (``final`` on a bad read-back). A
+    failed write is read back too, since a timeout can stop crontab after it wrote: reading back as written counts."""
     _put_work_file(files, saved, old.encode("utf-8", "surrogateescape"))
     if _crontab(art, runner) != old:
         raise _Held("The crontab changed while PatchCairn prepared the edit; nothing was written")
-    code = _run(runner, art["commands"]["write"], art, stdin=new.encode("utf-8", "surrogateescape"))[0]
-    if code:
-        raise _Held(f"crontab could not write the table (exit code {code}); the previous table is saved in {saved}")
+    code, _, errors = _run(runner, art["commands"]["write"], art, stdin=new.encode("utf-8", "surrogateescape"))
+    failed = _Held(f"crontab could not write the table (exit code {code}{_said(errors)}); the previous table is saved in {saved}")
     try:
         back = _crontab(art, runner)
-    except _Held as error:
+    except _Held as error:  # written or not, it cannot tell
         raise final(f"{error}; the previous table is saved in {saved}") from error
     if back != new:
-        raise final(f"The crontab does not read back as written; the previous table is saved in {saved}")
+        raise failed if code else final(f"The crontab does not read back as written; the previous table is saved in {saved}")
     return _outcome(status)
 
 
@@ -890,17 +891,21 @@ def _register_cron(art, runner, files, facts):
     return outcome
 
 
+def _runs_ours(art, views):
+    """Whether a view of the task runs exactly this schedule's command."""
+    ours = [(f"{{{_TASK_NS}}}Exec", art["command"][0], _arguments(art["command"]))]
+    return any([action[:3] for action in view["actions"][1:]] == ours for view in views)
+
+
 def _remove_task(art, runner, files, facts):
-    commands, argv = art["commands"], art["command"]
     state, found = _task_lookup(art, runner, facts)
     if state == "absent":
         return _outcome("removed")
     if state == "unknown":
         raise _Held(f"schtasks could not say whether the task exists (exit code {found}); nothing was removed")
-    ours = [(f"{{{_TASK_NS}}}Exec", argv[0], _arguments(argv))]
-    if not any([action[:3] for action in view["actions"][1:]] == ours for view in found):
+    if not _runs_ours(art, found):
         raise _Held("The task with this name does not run this schedule's command; PatchCairn never deletes it")
-    code = _run(runner, commands["delete"], art)[0]
+    code = _run(runner, art["commands"]["delete"], art)[0]
     if code:
         raise _Held(f"schtasks could not delete the task (exit code {code})")
     if _task_lookup(art, runner, facts)[0] != "absent":
@@ -923,6 +928,10 @@ def _remove_launchd(art, runner, files, facts):
     state, code = _job_lookup(art, runner)
     if state == "unknown":
         raise _Held(f"launchctl could not say whether the job is loaded (exit code {code}); nothing was removed")
+    if state == "exists" and existing is None:
+        raise _Held("launchctl lists a job with this label, but its file is gone, so PatchCairn cannot prove the job is its "
+                    "own and does not remove it. The job ends at your next log-out, because its file is gone; then remove "
+                    "the schedule again.")
     if (state == "exists" or existing is not None) and not (existing is not None and _plist_runs(existing, art)):
         raise _Held("The launchd job or file with this label does not run this schedule's command; PatchCairn never "
                     "removes it")
@@ -940,6 +949,11 @@ def _remove_launchd(art, runner, files, facts):
 def _remove_systemd(art, runner, files, facts):
     commands, units, short = art["commands"], art["files"], art["schedule_id"][:16]
     service, timer = (files.read(unit["path"]) for unit in units)
+    if not facts["systemd_running"]:  # systemctl would edit the files directly and then fail half-way
+        if service is None and timer is None:
+            return _outcome("removed")  # nothing is left for systemd to load when it runs again
+        raise _Held("systemd is not running here (for example WSL without systemd); turn it back on, then remove the "
+                    "schedule again. Nothing was removed.")
     state, code = _unit_lookup(art, runner)
     if state == "unknown":
         raise _Held(f"systemctl --user could not answer (exit code {code}); nothing was removed")

@@ -17,7 +17,10 @@ from __future__ import annotations
 import contextlib
 from datetime import datetime, timezone
 import errno
+import io
+import ntpath
 import os
+import posixpath
 import re
 import shlex
 import stat
@@ -28,10 +31,24 @@ import zoneinfo
 from pc_records import Refusal
 
 SYSTEMCTLS = ("/usr/bin/systemctl", "/bin/systemctl")
-# The PatchCairn folder's longest rendered path is <root>\work\schedules\<id16>\task.xml (41 more characters);
-# MAX_PATH is 260 including the terminating NUL unless long paths are enabled, which they are not by default
-# (https://learn.microsoft.com/en-us/windows/win32/fileio/maximum-file-path-limitation).
-WINDOWS_ROOT_LIMIT = 259 - 41
+# Without long paths (off by default) a path holds at most 259 UTF-16 units, and a folder an API creates at most
+# 247 (MAX_PATH minus 12; https://learn.microsoft.com/en-us/windows/win32/fileio/maximum-file-path-limitation).
+# private_workspace, which writes task.xml, takes at most 240 (D-050). The longest rendered file is
+# <root>\work\schedules\<id16>\task.xml (41 more units) and the folder the engine creates is
+# <root>\work\schedules\<id16> (32 more), so the root may hold min(259 - 41, 247 - 32, 240 - 41) units.
+WINDOWS_ROOT_LIMIT = min(259 - 41, 247 - 32, 240 - 41)
+_SID = re.compile(r"S-1-(?:5-21|12-1)(?:-[0-9]{1,10}){4}\Z")
+_SYSTEM_DIR = re.compile(r"[A-Za-z]:\\[^\\]+\\system32\Z", re.IGNORECASE)
+_FACT_KEYS = {"windows": {"platform", "system_dir", "user_sid", "code_pages"}, "macos": {"platform", "uid", "home"},
+              "linux": {"platform", "uid", "home", "systemctl", "systemd_running", "cron_running"}}
+# File systems whose owners and permission bits cannot show who else can write. WSL's Windows drives copy the
+# Windows user's own access, and chmod changes nothing (https://learn.microsoft.com/en-us/windows/wsl/file-permissions);
+# mount.drvfs mounts them as drvfs, plan9, virtio-plan9 or virtiofs (https://wsl.dev/technical-documentation/drvfs/),
+# and 9p is the kernel's name for plan9. cifs and smb3 shares (mount.cifs(8): uid=, file_mode=) and VirtualBox
+# shared folders (vboxsf) show owners and bits taken from mount options.
+_SHARED_TYPES = frozenset({"9p", "drvfs", "plan9", "virtio-plan9", "virtiofs", "cifs", "smb3", "vboxsf"})
+# A Windows path the access check can answer for: a drive letter, or a network share.
+_WINDOWS_PLAIN = re.compile(r"[A-Za-z]:\\|\\\\(?![?.]\\)[^\\]+\\[^\\]+(?:\\|\Z)")
 # Folders whose contents macOS shows only to apps the person allowed (https://support.apple.com/guide/security/secddd1d86a6),
 # and the cloud-storage folder beside them; a launchd job runs python with nobody's consent, so it could not read there.
 MACOS_PROTECTED = ("Desktop", "Documents", "Downloads", "Library/Mobile Documents", "Library/CloudStorage")
@@ -64,6 +81,29 @@ def check_path(value, platform, what, *, python=False):
     if python and not _PYTHON["windows" if windows else "posix"].match(parts[-1]):
         raise Refusal("schedule-path", f"The {what} must be a python executable given by its absolute path")
     return value
+
+
+def check_facts(facts, platform):
+    """Return the computer facts (host_facts) when they are complete and valid for ``platform``."""
+    if not isinstance(facts, dict) or facts.get("platform") != platform or set(facts) != _FACT_KEYS.get(platform):
+        raise Refusal("schedule-facts", "The computer facts do not describe this schedule's platform")
+    if platform == "windows":
+        check_path(facts["system_dir"], platform, "Windows system folder")
+        if not _SYSTEM_DIR.match(facts["system_dir"]):
+            raise Refusal("schedule-facts", "The Windows system folder must be <drive>:\\<Windows folder>\\System32")
+        if not isinstance(facts["user_sid"], str) or not _SID.match(facts["user_sid"]):
+            raise Refusal("schedule-facts", "Windows did not report a user account PatchCairn can schedule for")
+        pages = facts["code_pages"]
+        if not isinstance(pages, list) or not pages or any(type(page) is not int or not 0 < page < 65536 for page in pages):
+            raise Refusal("schedule-facts", "Windows did not report its code pages")
+        return facts
+    if type(facts["uid"]) is not int or not 0 < facts["uid"] < 2 ** 32 - 1:
+        raise Refusal("schedule-facts", "PatchCairn schedules only for an ordinary user account, never for root")
+    check_path(facts["home"], platform, "home folder")
+    if platform == "linux" and (facts["systemctl"] not in (None, *SYSTEMCTLS) or type(facts["systemd_running"]) is not bool
+                                or type(facts["cron_running"]) is not bool):
+        raise Refusal("schedule-facts", "The Linux facts need systemctl (or None) and whether systemd and cron run")
+    return facts
 
 
 def native_platform():
@@ -101,11 +141,24 @@ def system_offset(platform=None, *, zone_file=None, convert=None):
         return offset_of
     try:
         with zone_file or open("/etc/localtime", "rb") as handle:
-            zone = zoneinfo.ZoneInfo.from_file(handle)
-    except (OSError, ValueError) as error:
+            data = handle.read(1 << 16)  # a TZif file holds a few KB; 3.12's byte loop is slow on far more
+        zone = zoneinfo.ZoneInfo.from_file(_ZoneData(data))
+    except Exception as error:  # OSError, or ValueError, struct.error, AssertionError and others from a damaged file
         raise Refusal("schedule-time", "This computer's time zone could not be read from /etc/localtime; set the time zone "
                                        "in the system settings, then make the schedule again") from error
     return lambda timestamp: int(datetime.fromtimestamp(timestamp, zone).utcoffset().total_seconds())
+
+
+class _ZoneData(io.BytesIO):
+    """TZif bytes whose reads past the end raise. zoneinfo in Python 3.12 (Ubuntu 24.04's default) reads the last
+    line of a version 2 or later file one byte at a time until a newline, so a file cut anywhere in that line,
+    even just after its opening newline, would never finish."""
+
+    def read(self, size=-1):
+        data = super().read(size)
+        if size is not None and size > 0 and not data:
+            raise EOFError("the time zone file ends early")
+        return data
 
 
 def host_facts(record, *, writable_by_others=None, purpose="register"):
@@ -143,51 +196,70 @@ def host_facts(record, *, writable_by_others=None, purpose="register"):
 
 
 def check_placement(record, home, *, realpath=os.path.realpath):
-    """Refuse a PatchCairn folder that is too long for Windows, or a launchd schedule in a folder macOS protects."""
-    if record["platform"] == "windows" and len(record["root"]) > WINDOWS_ROOT_LIMIT:
+    """Refuse a PatchCairn folder too long for Windows, a macOS schedule on another drive (any route), or a launchd
+    schedule in a folder macOS protects."""
+    if record["platform"] == "windows" and len(record["root"].encode("utf-16-le")) // 2 > WINDOWS_ROOT_LIMIT:
         raise Refusal("schedule-path", f"The PatchCairn folder path is longer than {WINDOWS_ROOT_LIMIT} characters, so files "
                                        "under it would pass the Windows path limit. Move PatchCairn to a shorter path, "
                                        "then make the schedule again.")
-    if record["platform"] != "macos" or record["route"] != "launchd":
+    if record["platform"] != "macos":
         return
 
     def folded(path):  # one spelling: decomposed Unicode, case-folded, and without the data-volume firmlink prefix
         path = unicodedata.normalize("NFD", path).casefold()
         return path[len("/system/volumes/data"):] if path.startswith("/system/volumes/data/") else path
-    protected = [folded(home + "/" + name) for name in MACOS_PROTECTED] + ["/volumes"]
-    for path in {record["interpreter"], record["root"], realpath(record["interpreter"]), realpath(record["root"])}:
-        if any(folded(path) == folder or folded(path).startswith(folder + "/") for folder in protected):
-            raise Refusal("schedule-path", "macOS protects Desktop, Documents, Downloads, iCloud Drive, cloud-storage folders "
-                                           "and other drives, so a schedule started by launchd could not read PatchCairn "
-                                           "there. Move the PatchCairn folder elsewhere in your home folder, use a Python "
+    resolved = {folded(realpath(record["interpreter"])), folded(realpath(record["root"]))}
+    paths = resolved | {folded(record["interpreter"]), folded(record["root"])}
+    # Resolved forms only: /Volumes/Macintosh HD is a link to this Mac's own disk.
+    if any(path == "/volumes" or path.startswith("/volumes/") for path in resolved):
+        # A drive with "Ignore ownership" shows every file as the viewer's own, so ownership proves nothing there.
+        raise Refusal("schedule-path", "PatchCairn and its Python must be on this Mac's own disk: on another drive macOS may "
+                                       "ignore who owns the files, so PatchCairn cannot tell who can change them. Move "
+                                       "the PatchCairn folder into your home folder, use a Python on this Mac's own disk, "
+                                       "then make the schedule again.")
+    if record["route"] != "launchd":
+        return
+    protected = [folded(home + "/" + name) for name in MACOS_PROTECTED]
+    for path in paths:
+        if any(path == folder or path.startswith(folder + "/") for folder in protected):
+            raise Refusal("schedule-path", "macOS protects Desktop, Documents, Downloads, iCloud Drive and cloud-storage "
+                                           "folders, so a schedule started by launchd could not read PatchCairn there. "
+                                           "Move the PatchCairn folder elsewhere in your home folder, use a Python "
                                            "that is not in those folders either, then make the schedule again.")
 
 
 def check_writable(record, *, writable_by_others=None, stat_of=os.stat, list_dir=os.listdir, realpath=os.path.realpath,
-                   account=None, runtime=None, list_xattr=None):
+                   account=None, runtime=None, list_xattr=None, readlink=os.readlink, mountinfo=None):
     """Refuse when someone other than this user or root could change what the schedule runs.
 
     The recorded interpreter must be the Python this check runs under (``runtime``: its executable, base prefix and
     standard-library folders, from sys and sysconfig unless a test passes them). Objects checked: the interpreter
     after resolving links; its folder and the recorded path's folder, and the parents of both (where Python reads
-    pyvenv.cfg), with any pyvenv.cfg there; the base prefix (the real Python a venv runs) with its top-level files
-    (every top-level entry on Windows, DLLs included); the stdlib and platstdlib folders with their top-level entries;
-    the PatchCairn folder; its scripts folder, every entry in it, and scripts/__pycache__ with its entries (Python
-    reads cached code even with -B); and each of these again after resolving links. Then every folder above those
-    objects up to the filesystem root (on Windows: the volume root).
-    POSIX: an object's owner is this user or root, with no group or other write bit; a group bit is allowed for the
-    macOS admin group (D-045) and for this user's own private group on Linux (its name is the user's, it is the
-    user's primary group, nobody else belongs to it, and the path carries no POSIX access-control list, whose named
-    entries the group bits would hide). A folder above may also be writable when its sticky bit is set, except the
-    pyvenv.cfg parents, where anyone with write access could add the file.
-    Windows: ``writable_by_others(path, ancestor)`` must answer False for every object (ancestor False) and every
+    pyvenv.cfg), with any pyvenv.cfg there (a broken link counts); the base prefix (the real Python a venv runs) with
+    its top-level files (every top-level entry on Windows, DLLs included); the stdlib and platstdlib folders with
+    their top-level entries; the PatchCairn folder; its scripts folder, every entry in it, and scripts/__pycache__
+    with its entries (Python reads cached code even with -B); the resolved target of each; and every path a link
+    leads through, at any of these or at any folder above them, again for the paths those links lead through (a
+    relative target counts from the link's real folder, as the system resolves it). Then every folder above those
+    objects up to the filesystem root (on Windows: the drive or share root).
+    POSIX: every object and folder above belongs to this user or root and has no group or other write bit, sticky or
+    not (a sticky folder still lets anyone create a name that has gone, such as a PatchCairn folder in /tmp after a
+    reboot). A group bit is allowed for the macOS admin group (D-045) and for this user's own private group on Linux
+    (its name is the user's, it is the user's primary group, nobody else belongs to it, and the path carries no POSIX
+    access-control list, whose named entries the group bits would hide). On Linux an object on a mount whose bits do
+    not show who else can write (_SHARED_TYPES: WSL's Windows drives, cifs and smb3 shares, VirtualBox folders) is
+    refused; the mount comes from /proc/self/mountinfo (``mountinfo`` in tests).
+    Windows: a link target's \\\\?\\ or \\??\\ prefix is dropped, and a path not on a drive letter or a network share
+    (for example \\\\?\\Volume{...}) is refused without asking.
+    ``writable_by_others(path, ancestor)`` must answer False for every object (ancestor False) and every
     folder above and pyvenv.cfg parent (ancestor True). It answers True when the effective DACL grants another SID
     than the owner (this user), SYSTEM (S-1-5-18), Administrators (S-1-5-32-544) or TrustedInstaller any of
     FILE_WRITE_DATA, FILE_APPEND_DATA, WRITE_DAC, WRITE_OWNER, DELETE, GENERIC_WRITE or GENERIC_ALL; inherited entries
     count, inherit-only entries do not apply to the object itself, and a NULL DACL grants everything. It also answers
-    True when another account owns the object or the lookup fails. For ancestor True only FILE_ADD_FILE,
-    FILE_DELETE_CHILD, DELETE, WRITE_DAC and WRITE_OWNER count (the add-subfolder right that standard users hold on
-    C:\\ does not). Without it the check fails closed. macOS access-control lists are not read.
+    True when an account other than this user, SYSTEM, Administrators or TrustedInstaller owns the object, and it may
+    answer None or raise when the lookup fails. For ancestor True only FILE_ADD_FILE, FILE_DELETE_CHILD, DELETE,
+    WRITE_DAC, WRITE_OWNER, GENERIC_WRITE and GENERIC_ALL count (the add-subfolder right that standard users hold on
+    C:\\ does not). Without it the check fails closed. macOS, NFSv4 and SMB access-control lists are not read.
     """
     windows = record["platform"] == "windows"
     if windows and writable_by_others is None:
@@ -211,27 +283,78 @@ def check_writable(record, *, writable_by_others=None, stat_of=os.stat, list_dir
         python += [folder, *_children(list_dir, folder, separator)]
     objects = [interpreter, *folders, record["root"], scripts,
                *(scripts + separator + name for name in _entries(list_dir, scripts, required=True)), *python,
-               *(path for path in optional if _present(stat_of, path))]
-    objects = list(dict.fromkeys(objects + [realpath(path) for path in objects]))  # a link's target is checked too
+               *(path for path in optional if _present(stat_of, readlink, path))]
+    objects = list(dict.fromkeys(objects + [realpath(path) for path in objects]))
+    objects += [step for step in _links_on_the_way([record["interpreter"], *objects, *venv_parents], readlink, realpath,
+                                                   separator) if step not in objects]
     strict = set(objects) | set(venv_parents)
     above = [folder for path in objects + venv_parents for folder in _ancestors(path, separator) if folder not in strict]
     checks = [(path, False) for path in objects] + [(path, True) for path in dict.fromkeys(venv_parents + above)]
     if windows:
         for path, ancestor in checks:
-            if writable_by_others(path, ancestor) is not False:
-                raise Refusal("schedule-path", _unsafe_message(path, None))
+            if not _WINDOWS_PLAIN.match(path):  # for example \\?\Volume{...}: the check could answer for the wrong object
+                raise Refusal("schedule-path", _unsafe_message(path, "unchecked"))
+            try:
+                answer = writable_by_others(path, ancestor)
+            except Exception as error:  # a lookup that fails cannot confirm the path is safe
+                raise Refusal("schedule-path", _unsafe_message(path, "unconfirmed")) from error
+            if answer is not False:
+                raise Refusal("schedule-path", _unsafe_message(path, "write" if answer is True else "unconfirmed"))
         return
+    if record["platform"] == "linux":
+        _refuse_shared_mounts(objects, mountinfo)
     uid, name, primary, members_of = account or _account()
-    account_facts = (record["platform"], primary, name, members_of, list_xattr or getattr(os, "listxattr", None))
-    for path, ancestor in checks:
+    groups = {}  # members_of once per group in this check
+
+    def members(gid):
+        if gid not in groups:
+            groups[gid] = members_of(gid)
+        return groups[gid]
+    account_facts = (record["platform"], primary, name, members, list_xattr or getattr(os, "listxattr", None))
+    for path, _ancestor in checks:
         try:
             info = stat_of(path)
         except OSError as error:
             raise Refusal("schedule-path", f"{path} could not be checked, so nothing was scheduled") from error
-        mode, sticky = info.st_mode, ancestor and path not in venv_parents and info.st_mode & stat.S_ISVTX
-        if info.st_uid not in (uid, 0) or (not sticky and (mode & 0o002 or (
-                mode & 0o020 and not _group_ok(path, info.st_gid, *account_facts)))):
-            raise Refusal("schedule-path", _unsafe_message(path, info.st_uid == uid))
+        if info.st_uid not in (uid, 0):
+            raise Refusal("schedule-path", _unsafe_message(path, "owner"))
+        if info.st_mode & 0o002 or (info.st_mode & 0o020 and not _group_ok(path, info.st_gid, *account_facts)):
+            raise Refusal("schedule-path", _unsafe_message(path, "write", owned=info.st_uid == uid))
+
+
+def _refuse_shared_mounts(paths, mountinfo):
+    """Refuse a path on a mount of a _SHARED_TYPES file system, from /proc/self/mountinfo (proc(5): mount id, parent
+    id, ..., field 5 the mount point; the first field after " - " the type). The mount that covers a path is found as
+    the kernel finds it: from the top, the mount on each next folder of the path whose parent is the mount reached so
+    far, so a later mount over a parent folder hides the mounts below it, and the last of mounts stacked on one folder
+    wins."""
+    if mountinfo is None:
+        try:
+            with open("/proc/self/mountinfo", encoding="utf-8", errors="surrogateescape") as handle:
+                mountinfo = handle.read()
+        except OSError as error:
+            raise Refusal("schedule-path", "PatchCairn could not read /proc/self/mountinfo, so it cannot tell which drive "
+                                           "the Python and PatchCairn files are on") from error
+    mounts, on = {}, {}
+    for line in mountinfo.splitlines():
+        left, dash, right = line.partition(" - ")
+        fields = left.split()
+        if dash and len(fields) >= 5 and right.split():
+            point = re.sub(r"\\([0-7]{3})", lambda match: chr(int(match[1], 8)), fields[4])
+            mounts[fields[0]] = (fields[1], point.rstrip("/") or "/", right.split()[0])
+    for ident, (parent, point, _kind) in mounts.items():
+        on[(parent if parent in mounts and parent != ident else None, point)] = ident  # None: a top mount
+    for path in paths:
+        names, current = [name for name in path.split("/") if name], None
+        for prefix in ["/"] + ["/" + "/".join(names[:end]) for end in range(1, len(names) + 1)]:
+            for _ in range(len(mounts)):  # mounts stacked on one folder; bounded, in case the list is damaged
+                if (current, prefix) not in on:
+                    break
+                current = on[(current, prefix)]
+        if current is not None and mounts[current][2] in _SHARED_TYPES:
+            raise Refusal("schedule-path", f"{path} is on a Windows drive or a shared folder, where Linux cannot check who "
+                                           "can change files. Copy PatchCairn into your Linux home folder (for example "
+                                           "~/PatchCairn), use a Python installed inside Linux, then make the schedule again.")
 
 
 def _group_ok(path, gid, platform, primary, name, members_of, list_xattr):
@@ -252,20 +375,75 @@ def _group_ok(path, gid, platform, primary, name, members_of, list_xattr):
         raise Refusal("schedule-path", f"{path} could not be checked, so nothing was scheduled") from error
 
 
-def _unsafe_message(path, owned):
+def _unsafe_message(path, reason, *, owned=False):
+    """The refusal: "owner" (another account owns the path), "write" (others can write it), "unconfirmed" or
+    "unchecked" (a Windows path on no drive letter or share)."""
+    shown = path if path.isprintable() else repr(path)
+    if reason == "unchecked":
+        return (f"PatchCairn cannot check who can change {shown}, because it is not on a drive letter or a network share, "
+                "so it made no schedule. Use a PatchCairn folder and a Python on a drive with a letter, such as C:, then "
+                "make the schedule again.")
+    if reason == "unconfirmed":
+        return (f"PatchCairn could not confirm that only you and the system can change {shown}, so it made no schedule. "
+                "Try again; if it happens again, use a PatchCairn folder and a Python in your own folders.")
     remedy = f" You can remove that access with: chmod go-w {shlex.quote(path)}." if owned and path.isprintable() else ""
-    path = path if path.isprintable() else repr(path)
-    return (f"Other accounts on this computer can change {path}, and a schedule would run their changes as you.{remedy} "
-            "Use a PatchCairn folder and a Python that only you or the administrator can change (for example a Python "
-            "installed in your home folder), or ask this computer's administrator to remove that access; then make the "
-            "schedule again.")
+    first = f"{shown} belongs to another account" if reason == "owner" else f"Other accounts on this computer can change {shown}"
+    return (f"{first}, and a schedule would run their changes as you.{remedy} Use a PatchCairn folder and a Python that "
+            "belong to you or to the system (for example a Python installed in your home folder), or ask this computer's "
+            "administrator to fix that; then make the schedule again.")
+
+
+def _links_on_the_way(paths, readlink, realpath, separator):
+    """Every path a link leads through, at ``paths`` or at any folder above them, and again at the paths those links
+    lead through and their folders, until nothing new appears."""
+    found, seen, waiting = [], set(), list(paths)
+    while waiting:
+        path = waiting.pop()
+        if path in seen:
+            continue
+        seen.add(path)
+        if len(seen) > 100_000:  # only a damaged or hostile tree gets here: refuse rather than stop looking
+            raise Refusal("schedule-path", "There are too many links on the way to the Python and PatchCairn files to "
+                                           "check them, so nothing was scheduled")
+        steps = _chain(path, readlink, realpath, separator)
+        found += steps
+        waiting += [*_ancestors(path, separator), *steps]
+    return list(dict.fromkeys(found))
+
+
+def _chain(path, readlink, realpath, separator):
+    """Every path a link at ``path`` leads through, in order (at most 40 steps); [] when it is not a link. A relative
+    target counts from the real folder of the link, as the system resolves it."""
+    join = ntpath if separator == "\\" else posixpath
+    found = []
+    while len(found) < 40:
+        try:
+            target = readlink(path)
+        except (OSError, ValueError):
+            break
+        path = join.normpath(join.join(realpath(_parent(path, separator)), _plain(target) if join is ntpath else target))
+        if path in found:
+            break
+        found.append(path)
+    return found
+
+
+def _plain(target):
+    """A Windows link target without the \\\\?\\ or \\??\\ prefix that readlink returns before a drive letter or UNC\\
+    (https://docs.python.org/3/library/os.html#os.readlink); any other prefixed form stays, and is refused later."""
+    for prefix in ("\\\\?\\", "\\??\\"):
+        rest = target[len(prefix):] if target.startswith(prefix) else ""
+        if rest[:4].upper() == "UNC\\":
+            return "\\\\" + rest[4:]
+        if re.match(r"[A-Za-z]:\\", rest):
+            return rest
+    return target
 
 
 def _parent(path, separator):
-    head = path.rsplit(separator, 1)[0]
-    if separator == "/":
-        return head or "/"
-    return head + "\\" if len(head) == 2 and head[1] == ":" else head
+    if separator == "\\":
+        return ntpath.dirname(path)  # a drive root or a share root is its own parent
+    return path.rsplit("/", 1)[0] or "/"
 
 
 def _ancestors(path, separator):
@@ -308,11 +486,16 @@ def _entries(list_dir, folder, *, required=False):
         raise Refusal("schedule-path", f"{folder} could not be listed, so nothing was scheduled") from error
 
 
-def _present(stat_of, path):
+def _present(stat_of, readlink, path):
+    """Whether something is at ``path``: a broken link counts, so its check refuses it (anyone may create its target)."""
     try:
         stat_of(path)
     except FileNotFoundError:
-        return False
+        try:
+            readlink(path)
+        except (OSError, ValueError):
+            return False
+        return True
     except OSError:
         return True  # it exists but cannot be read: the check of that path refuses it
     return True
