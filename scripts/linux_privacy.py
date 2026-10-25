@@ -1,4 +1,5 @@
-"""Read-only admission of reviewed native Linux private-storage filesystems.
+"""Read-only admission of reviewed native Linux private-storage filesystems, and the drive facts of a backup
+destination (file system kind, whether its disk is proven fixed, which physical disk holds it).
 
 This is an extra gate, not permission repair or an OS sandbox. Callers must
 still require actual effective-user ownership and 0700/0600 permissions, pin
@@ -17,6 +18,19 @@ import pc_records
 
 # Linux UAPI linux/magic.h. No foreign/network/emulated filesystem is admitted.
 _NATIVE_TYPES = frozenset({0xEF53, 0x58465342, 0x9123683E, 0x01021994, 0x858458F6})
+# Backup destinations only (filesystem_kind): MSDOS_SUPER_MAGIC is FAT12/16/32 under vfat and msdos, EXFAT_SUPER_MAGIC
+# the kernel's exFAT driver. Neither keeps permissions, so neither is private storage.
+_FAT_TYPES = frozenset({0x4D44})
+_EXFAT_TYPES = frozenset({0x2011BAB0})
+# TMPFS_MAGIC and RAMFS_MAGIC: memory, emptied at unmount or restart, so never a backup destination (D-069).
+_MEMORY_TYPES = frozenset({0x01021994, 0x858458F6})
+_ST_RDONLY = 1  # statfs f_flags (Linux 2.6.36+): mounted read-only
+# Paths of virtual-machine disks in sysfs (virtio, Hyper-V VMBus and its MSFT1000 ACPI node, Xen's /sys/devices/vbd-*),
+# which may be files on one physical drive.
+_VIRTUAL_DISK_MARKERS = ("virtio", "vmbus", "msft1000", "/vbd-")
+# Disks reached over a network or a hot-plug bus (iSCSI sessions, FireWire sbp2), never fixed; Ceph RBD is below.
+_NETWORK_DISK = re.compile(r"/session\d|/fw\d")
+_TEXT_LIMIT = 1 << 20
 
 
 class LinuxPrivacyHold(pc_records.Refusal):
@@ -158,14 +172,146 @@ def assert_native_private_filesystem(path):
             or (raw != "/" and any(part in {"", ".", ".."} for part in raw.split("/")[1:]))
             or len(raw.split("/")) > 66 or any(0xD800 <= ord(char) <= 0xDFFF for char in raw)):
         _hold("linux-private-path-invalid")
-    result = _StatFS()
     with _ordinary_descriptor(raw) as descriptor:
-        ctypes.set_errno(0)
-        try:
-            status = query(descriptor, ctypes.byref(result))
-        except (OSError, TypeError, ctypes.ArgumentError):
-            _hold("linux-private-filesystem-unavailable")
-        if status != 0:
-            _hold("linux-private-filesystem-unavailable")
+        result = _statfs(query, descriptor)
     if result.f_type not in _NATIVE_TYPES:
         _hold("linux-private-foreign-filesystem")
+
+
+def _statfs(query, descriptor):
+    result = _StatFS()
+    ctypes.set_errno(0)
+    try:
+        status = query(descriptor, ctypes.byref(result))
+    except (OSError, TypeError, ctypes.ArgumentError):
+        _hold("linux-private-filesystem-unavailable")
+    if status != 0:
+        _hold("linux-private-filesystem-unavailable")
+    return result
+
+
+def filesystem_kind(descriptor):
+    """The kind of file system an open descriptor is on, for backup destination admission: "native" (a disk type
+    assert_native_private_filesystem admits), "fat", "exfat" or "other" (tmpfs and ramfs, which live in memory, a
+    read-only mount, network, FUSE, 9p/DrvFS, unknown). Holds as assert_native_private_filesystem does when the ABI,
+    libc or query is unavailable; reads no content."""
+    library, query = _native_query()  # Retain the native library for the call lifetime.
+    if type(descriptor) is not int or descriptor < 0:
+        _hold("linux-private-path-invalid")
+    result = _statfs(query, descriptor)
+    kind = result.f_type
+    if kind in _MEMORY_TYPES or result.f_flags & _ST_RDONLY:
+        return "other"
+    if kind in _NATIVE_TYPES:
+        return "native"
+    return "fat" if kind in _FAT_TYPES else "exfat" if kind in _EXFAT_TYPES else "other"
+
+
+def _text(path):
+    """A sysfs or procfs file, stripped, or None when it cannot be read; a file that fills the read limit loses its last
+    line, which may be cut."""
+    try:
+        with open(path, encoding="ascii", errors="surrogateescape") as stream:
+            data = stream.read(_TEXT_LIMIT)
+    except (OSError, ValueError):
+        return None
+    return (data.rpartition("\n")[0] if len(data) == _TEXT_LIMIT else data).strip()
+
+
+def _members(path, realpath, read, listdir, depth=0):
+    """The whole-disk sysfs folders under the block device folder ``path`` (a partition's parent), following
+    device-mapper (LVM, LUKS) and md through slaves/ to their members, or None when one member cannot be traced
+    (loop, zram, network, an unknown path)."""
+    if depth > 8 or not path.startswith("/sys/devices/"):
+        return None
+    whole = path.rpartition("/")[0] if read(path + "/partition") is not None else path
+    if not path.startswith("/sys/devices/virtual/"):
+        return [whole]
+    try:  # an md partition (md0p1) has no slaves/ of its own: its array (md0) has
+        slaves = sorted(listdir(whole + "/slaves"))
+    except OSError:
+        return None
+    found = []
+    for name in slaves:
+        member = _members(realpath("/sys/class/block/" + name), realpath, read, listdir, depth + 1)
+        if member is None:
+            return None
+        found += member
+    return found or None
+
+
+def _disks(descriptor, device, realpath, read, listdir):
+    """The distinct whole disks holding the file system of the open ``descriptor`` (device number ``device``, else its
+    fstat), or None when sysfs cannot trace them. A btrfs file system has anonymous device numbers that differ from
+    mountinfo's, so its mount is found by the descriptor's mnt_id (/proc/self/fdinfo); its mount source and
+    /sys/fs/btrfs/<fsid>/devices/ then give its member devices."""
+    try:
+        device = os.fstat(descriptor).st_dev if device is None else device
+    except OSError:
+        return None
+    if os.major(device):
+        found = _members(realpath(f"/sys/dev/block/{os.major(device)}:{os.minor(device)}"), realpath, read, listdir)
+        return list(dict.fromkeys(found)) if found else None
+    fdinfo = (read(f"/proc/self/fdinfo/{descriptor}") or "").splitlines()
+    mount, found = dict(line.split(":", 1) for line in fdinfo if ":" in line).get("mnt_id", "").strip(), None
+    for line in (read("/proc/self/mountinfo") or "").splitlines() if mount else ():
+        fields = line.split()
+        dash = fields.index("-") if "-" in fields else len(fields)
+        if fields[:1] == [mount] and fields[dash + 1:dash + 2] == ["btrfs"] and len(fields) > dash + 2:
+            source = re.sub(r"\\([0-7]{3})", lambda escape: chr(int(escape[1], 8)), fields[dash + 2])
+            source = os.path.basename(realpath(source))
+            for fsid in sorted(_listing(listdir, "/sys/fs/btrfs")):
+                members = sorted(_listing(listdir, f"/sys/fs/btrfs/{fsid}/devices"))
+                if source in members:
+                    disks = [_members(realpath(f"/sys/class/block/{name}"), realpath, read, listdir) for name in members]
+                    found = None if None in disks else [disk for group in disks for disk in group]
+    return list(dict.fromkeys(found)) if found else None
+
+
+def _listing(listdir, path):
+    try:
+        return listdir(path)
+    except OSError:
+        return []
+
+
+def _fixed(folder, read):
+    """One whole disk is proven fixed: removable flag 0, no USB bus on its path, not a card in a reader (mmc never
+    sets the flag, so an mmcblk disk needs device/type "MMC", eMMC; Memory Stick disks never count), not an iSCSI,
+    FireWire or Ceph RBD disk, and no device above it marked "removable" (only Thunderbolt/USB4 ports that firmware
+    marks external do that; USB is caught by its path)."""
+    name = folder.rpartition("/")[2]
+    if (read(folder + "/removable") != "0" or "/usb" in folder or name.startswith(("mspblk", "msblk"))
+            or name.startswith("mmcblk") and read(folder + "/device/type") != "MMC"
+            or _NETWORK_DISK.search(folder) or folder.startswith("/sys/devices/rbd/")):
+        return False
+    while folder.count("/") > 3:
+        folder = folder.rpartition("/")[0]
+        if read(folder + "/removable") == "removable":
+            return False
+    return True
+
+
+def fixed_disk(descriptor, *, device=None, realpath=os.path.realpath, read=_text, listdir=os.listdir):
+    """True only when sysfs proves that every disk holding the file system of the open ``descriptor`` is fixed (D-069,
+    D-072): device-mapper, md and btrfs are followed to their member disks. A device it cannot trace is not fixed."""
+    disks = _disks(descriptor, device, realpath, read, listdir)
+    return bool(disks) and all(_fixed(folder, read) for folder in disks)
+
+
+def physical_disk(descriptor, *, device=None, realpath=os.path.realpath, read=_text, listdir=os.listdir):
+    """An identity of the one physical disk holding the file system of the open ``descriptor``, to tell two disks
+    apart, or None when sysfs cannot prove one: a device it cannot trace or that spans several disks, any disk of a
+    virtual machine (a virtio, VMBus or Xen disk, or a CPU reporting a hypervisor), and any machine whose CPU flags
+    line cannot be read (an arm64 guest has none). An NVMe disk is its subsystem ("nvme:" + subsysnqn), so namespaces,
+    ports and controllers of one drive are one disk; an mmc disk (also its boot and gp areas) is its card device."""
+    disks = _disks(descriptor, device, realpath, read, listdir)
+    flags = [line.split() for line in (read("/proc/cpuinfo") or "").splitlines() if line.startswith("flags")]
+    if (not disks or len(disks) > 1 or not flags or "hypervisor" in flags[0]
+            or any(marker in disks[0].lower() for marker in _VIRTUAL_DISK_MARKERS)):
+        return None
+    head, controller, rest = disks[0].partition("/nvme/")
+    if controller:
+        nqn = read(head + controller + rest.split("/")[0] + "/subsysnqn")
+        return "nvme:" + nqn if nqn else None
+    return realpath(disks[0] + "/device") if disks[0].rpartition("/")[2].startswith("mmcblk") else disks[0]

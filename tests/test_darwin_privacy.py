@@ -76,6 +76,38 @@ class DarwinPrivacyTests(unittest.TestCase):
         self.assertIs(self.library.acl_free.restype, ctypes.c_int)
         self.assertEqual(self.metadata.call_count, 2)
 
+    def test_descriptor_acl_check_reads_the_open_object(self):
+        self.library.acl_get_fd_np = mock.Mock(return_value=0x12340)
+        held = info(st_mode=stat.S_IFREG | 0o600, st_nlink=1)
+        with mock.patch.object(privacy.os, "fstat", return_value=held) as fstat:
+            self.assertIsNone(privacy.assert_no_extended_acl_fd(17))
+            self.library.acl_get_fd_np.assert_called_once_with(17, 0x00000100)
+            self.assertEqual(self.library.acl_get_fd_np.argtypes, (ctypes.c_int, ctypes.c_int))
+            self.assertIs(self.library.acl_get_fd_np.restype, ctypes.c_void_p)
+            self.assertEqual(fstat.call_args_list, [mock.call(17), mock.call(17)])
+            self.metadata.assert_not_called()  # no path is resolved
+            self.library.acl_get_fd_np.side_effect = lambda *_: (ctypes.set_errno(errno.ENOENT), None)[1]
+            self.assertIsNone(privacy.assert_no_extended_acl_fd(17))  # an absent ACL property
+            self.library.acl_get_fd_np.side_effect = None
+            self.library.acl_get_entry.side_effect = lambda acl, entry_id, output: 0
+            with self.assertRaises(privacy.DarwinPrivacyHold) as caught:
+                privacy.assert_no_extended_acl_fd(17)
+            self.assertEqual(caught.exception.code, "darwin-acl-not-empty")
+            self.library.acl_get_entry.side_effect = self.empty_entry
+            fstat.side_effect = [held, info(st_mode=held.st_mode, st_nlink=1, st_ino=999)]
+            with self.assertRaises(privacy.DarwinPrivacyHold) as caught:
+                privacy.assert_no_extended_acl_fd(17)
+            self.assertEqual(caught.exception.code, "darwin-acl-path-changed")
+        for bad in (-1, "17", None, True):
+            with self.subTest(descriptor=bad):
+                with self.assertRaises(privacy.DarwinPrivacyHold) as caught:
+                    privacy.assert_no_extended_acl_fd(bad)
+                self.assertEqual(caught.exception.code, "darwin-acl-path-invalid")
+        del self.library.acl_get_fd_np
+        with mock.patch.object(privacy.os, "fstat", return_value=held), self.assertRaises(privacy.DarwinPrivacyHold) as caught:
+            privacy.assert_no_extended_acl_fd(17)
+        self.assertEqual(caught.exception.code, "darwin-acl-api-unavailable")
+
     def test_source_verified_missing_acl_property_on_same_object_passes(self):
         def no_property(*_):
             ctypes.set_errno(errno.ENOENT)
@@ -371,6 +403,29 @@ class DarwinFilesystemTests(unittest.TestCase):
         self.kind, self.flags = b"hfs", 0x1000
         for self.subtype in (4, 127, 128, 0xFFFFFFFF):
             self.assert_hold("darwin-fs-unsupported-filesystem")
+
+    def test_destination_volume_kind_from_an_open_descriptor(self):
+        # removable: MNT_REMOVABLE (external drives, disk images) or "ignore ownership" (set on external drives).
+        for self.kind, self.flags, self.extended, expected in (
+                (b"apfs", 0x1000, 0, ("native", False)), (b"hfs", 0x1000, 0, ("native", False)),
+                (b"apfs", 0x1000 | 0x00200000, 0, ("native", True)), (b"apfs", 0x1000 | 0x200, 0, ("native", True)),
+                (b"hfs", 0x1000 | 0x200, 0, ("native", True)), (b"msdos", 0x1000 | 0x200, 0, ("fat", True)),
+                (b"msdos", 0x1000 | 0x00200000, 0, ("fat", True)), (b"exfat", 0x1000, 2, ("exfat", False)),
+                (b"apfs", 0x1000, 2, ("other", False)), (b"apfs", 0x1001, 0, ("other", False)),
+                (b"msdos", 0x1001, 0, ("other", False)), (b"smbfs", 0, 0, ("other", False)),
+                (b"nfs", 0, 0, ("other", False)), (b"macfuse", 0x1000, 0, ("other", False))):
+            with self.subTest(kind=self.kind, flags=hex(self.flags), extended=self.extended):
+                self.assertEqual(privacy.volume_kind(17), expected)
+        self.descriptor.assert_not_called()  # the open descriptor is used as it is, never a path
+        for bad in (-1, "17", None, True):
+            with self.subTest(descriptor=bad):
+                with self.assertRaises(privacy.DarwinPrivacyHold) as caught:
+                    privacy.volume_kind(bad)
+                self.assertEqual(caught.exception.code, "darwin-fs-path-invalid")
+        self.query.side_effect, self.query.return_value = None, -1
+        with self.assertRaises(privacy.DarwinPrivacyHold) as caught:
+            privacy.volume_kind(17)
+        self.assertEqual(caught.exception.code, "darwin-fs-query-unavailable")
 
     def test_native_failure_is_categorical_and_does_not_expose_mount_data(self):
         for result in (-1, 1):

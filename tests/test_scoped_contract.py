@@ -242,7 +242,7 @@ class FakeRoot(scoped_base.RootBase):
     def move_to(self, relative, *, destination, destination_relative, expected):
         scoped_base.expected_record(expected, relative)
         if not isinstance(destination, FakeRoot) or destination.device != self.device:
-            scoped_base.refuse("cross-filesystem", "Cross-filesystem copy/delete fallback is forbidden")
+            scoped_base.refuse("same-volume-required", "Files are only moved within one drive; nothing is copied")
         node = self.node(relative, "file")
         destination.require_absent(destination_relative)
         with self.open_read(relative, expected=expected) as handle:
@@ -269,7 +269,7 @@ class FakeRoot(scoped_base.RootBase):
         if observed != target or not scoped_base.same_identity(handle.record(), expected, self.identity_keys):
             scoped_base.refuse("stale-content", "File content does not match the archived entry")
         if self.nodes.get(relative) is not node:
-            scoped_base.refuse("remove-verification", "The name no longer refers to the hashed file")
+            scoped_base.refuse("stale-identity", "The name no longer refers to the hashed file")
         del self.nodes[relative]
         self.node(relative.rpartition("/")[0]).mtime_ns += 1
         return {**expected, "sha256": observed}
@@ -343,6 +343,14 @@ class RootContract:
 
     def alias(self, root, relative):
         """Another spelling the file system resolves to ``relative`` (an 8.3 alias), or None."""
+        raise NotImplementedError
+
+    def link_target(self, root):
+        """The real folder (a Path) that links made by add_raw_name point to, or None where links point nowhere."""
+        raise NotImplementedError
+
+    def other_volume_root(self, root):
+        """Another open root of this backend that reports a different volume (device) than ``root``."""
         raise NotImplementedError
 
     def new_destination_root(self, volume, *, non_private_destination):
@@ -652,7 +660,7 @@ class RootContract:
         self.assertEqual(len(swapped), 1)
         # A backend whose delete handle blocks the swap (Windows sharing rules) declares "swap" absent.
         if self.capability("swap", swapped[0]):
-            self.assertIsNotNone(refusal)
+            self.assertIn(getattr(refusal, "code", None), {"stale-identity", "stale-content"})
             self.assertEqual(self.root.inspect("victim.bin", hash_file=True)["sha256"], sha256(b"swapped-in"))
         else:
             self.assertIsNone(refusal)
@@ -729,6 +737,14 @@ class RootContract:
                            destination_relative="folder/c.txt", expected=changed)
         self.assertIn("c.txt", self.names())
         self.assertNotIn("folder/c.txt", self.names("folder"))
+
+    def test_move_to_another_volume_is_refused_with_one_code(self):
+        record = self.seed("a.txt", b"stays here")
+        other = self.other_volume_root(self.root)
+        self.addCleanup(other.close)
+        self.assertRefused("same-volume-required", self.root.move_to, "a.txt", destination=other,
+                           destination_relative="a.txt", expected=record)
+        self.assertIn("a.txt", self.names())
 
     def test_snapshot_lists_and_hashes_the_tree(self):
         self.root.mkdir("a")
@@ -839,6 +855,31 @@ class RootContract:
                          lambda: self.root.open_read("shortcut", expected={**secret, "relative_path": "shortcut"}).__enter__()):
                 self.assertRaises(ScopedFSError, call)
             self.assertNotIn("shortcut", self.names())
+            # F-368: a link used as a middle component is refused for every operation, even when its target holds
+            # the named entries, and nothing appears in (or leaves) the target.
+            target = self.link_target(self.root)
+            if target is not None:
+                (target / "inner").mkdir()
+                (target / "planted.txt").write_bytes(b"outside")
+                before = sorted(os.listdir(target))
+            through = {**secret, "relative_path": "shortcut/planted.txt"}
+            for operation, call in (
+                    ("inspect", lambda: self.root.inspect("shortcut/planted.txt", hash_file=True)),
+                    ("list_directory", lambda: self.root.list_directory("shortcut/inner")),
+                    ("open_read", lambda: self.root.open_read("shortcut/planted.txt", expected=through).__enter__()),
+                    ("open_new", lambda: self.root.open_new("shortcut/new.bin").__enter__()),
+                    ("mkdir", lambda: self.root.mkdir("shortcut/new-folder")),
+                    ("remove_file", lambda: self.root.remove_file("shortcut/planted.txt", expected=through))):
+                with self.subTest(operation=operation):
+                    with self.assertRaises(ScopedFSError) as caught:
+                        call()
+                    # A backend that followed the link would reach planted.txt and refuse only as a stale record.
+                    self.assertNotIn(caught.exception.code, {"stale-identity", "stale-content", "read-drift"})
+            if target is not None:
+                self.assertEqual(sorted(os.listdir(target)), before)
+                self.assertEqual(os.listdir(target / "inner"), [])
+                self.assertEqual((target / "planted.txt").read_bytes(), b"outside")
+            self.assertEqual(self.temp_names(self.root), [])
         alias = self.alias(self.root, "secret.txt")
         if self.capability("alias", alias is not None):
             self.assertRaises(ScopedFSError, self.root.inspect, alias)
@@ -912,6 +953,12 @@ class FakeRootContractTests(RootContract, unittest.TestCase):
     def alias(self, root, relative):
         root.aliases["SECRET~1.TXT"] = relative
         return "SECRET~1.TXT"
+
+    def link_target(self, root):
+        return None  # an in-memory link node points nowhere
+
+    def other_volume_root(self, root):
+        return FakeRoot(device=root.device + 1)
 
     def new_destination_root(self, volume, *, non_private_destination):
         return FakeRoot(volume=volume, non_private_destination=non_private_destination)
@@ -1367,6 +1414,15 @@ class WindowsRootContractTests(RootContract, unittest.TestCase):
     def alias(self, root, relative):
         return None
 
+    def link_target(self, root):
+        return self.case / "outside"
+
+    def other_volume_root(self, root):
+        import windows_scoped
+        other = windows_scoped.WindowsRoot(str(self.case / "outside"))
+        other._device = root._device + 1  # no runner is sure to have a second NTFS volume
+        return other
+
     def new_destination_root(self, volume, *, non_private_destination):
         import windows_scoped
         filesystem, drive_type = {"private": ("NTFS", 3), "removable-exfat": ("exFAT", 2), "fat32": ("FAT32", 2),
@@ -1375,6 +1431,150 @@ class WindowsRootContractTests(RootContract, unittest.TestCase):
         folder.mkdir()
         return windows_scoped.admit_destination(str(folder), non_private_destination=non_private_destination,
                                                volumes=lambda handle, drive: {"filesystem": filesystem, "drive_type": drive_type})
+
+
+@unittest.skipUnless(os.name == "posix", "only on posix: PosixRoot runs on POSIX descriptors")
+class PosixRootContractTests(RootContract, unittest.TestCase):
+    """The contract against the POSIX backend (Linux and macOS), on real folders under work/test-fixtures/.
+
+    The hooks change files for real: grow appends, shrink truncates, swap renames another file over the name, and
+    touch and rewrite_in_place set explicit times (D-056). "alias" is absent (POSIX has no 8.3 names); "case-pair" is
+    absent exactly when a probe of the fixture folder finds it case-insensitive (the macOS default). A file is
+    "inherited" when its mode is what the umask leaves of the original's bits masked to 0o644 (D-022, D-027), so the
+    hooks remember what each open_new call asked for.
+    """
+
+    absent_capabilities = frozenset({"alias"})
+
+    def new_root(self):
+        import scoped_fs
+        self.case = FIXTURES / ("posix-contract-" + uuid.uuid4().hex)
+        (self.case / "root").mkdir(parents=True)
+        (self.case / "outside").mkdir()
+        self.addCleanup(shutil.rmtree, self.case)
+        (self.case / "outside" / "Probe").write_bytes(b"")
+        if (self.case / "outside" / "PROBE").exists():
+            self.absent_capabilities = frozenset({"alias", "case-pair"})
+        (self.case / "outside" / "Probe").unlink()
+        self.umask = os.umask(0o077)
+        os.umask(self.umask)
+        root = scoped_fs.PosixRoot(str(self.case / "root"))
+        self.requested, real = {}, root.open_new
+
+        def open_new(relative, **options):
+            self.requested[relative] = options
+            return real(relative, **options)
+
+        root.open_new = open_new
+        return root
+
+    def path(self, relative):
+        return self.case / "root" / relative
+
+    def grow(self, root, relative, extra):
+        with open(self.path(relative), "ab") as stream:
+            stream.write(extra)
+
+    def shrink(self, root, relative, size):
+        os.truncate(self.path(relative), size)
+
+    def touch(self, root, relative):
+        info = os.stat(self.path(relative))
+        os.utime(self.path(relative), ns=(info.st_atime_ns, info.st_mtime_ns + 10 ** 9))
+
+    def rewrite_in_place(self, root, relative, data):
+        info = os.stat(self.path(relative))
+        self.assertEqual(len(data), info.st_size)
+        with open(self.path(relative), "r+b") as stream:
+            stream.write(data)
+        os.utime(self.path(relative), ns=(info.st_atime_ns, info.st_mtime_ns))
+
+    def swap(self, root, relative, data):
+        other = self.case / "outside" / ("swap-" + uuid.uuid4().hex)
+        other.write_bytes(data)
+        os.rename(other, self.path(relative))
+        return True
+
+    def temp_names(self, root):
+        found = []
+        for folder, _dirs, files in os.walk(self.case / "root"):
+            found += [os.path.relpath(os.path.join(folder, name), self.case / "root")
+                      for name in files if scoped_base.PARTIAL_NAME.search(name)]
+        return found
+
+    def make_read_only(self, root, relative):
+        os.chmod(self.path(relative), 0o400)
+
+    def permissions(self, root, relative):
+        info = os.stat(self.path(relative))
+        options = self.requested.get(relative, {})
+        if options.get("private", True):
+            private = stat.S_IMODE(info.st_mode) == 0o600 and info.st_uid == os.geteuid()
+            return "private" if private else "other"
+        inherited = stat.S_IMODE(options["original_mode"]) & 0o644 & ~self.umask
+        return "inherited" if stat.S_IMODE(info.st_mode) == inherited else "other"
+
+    def restored_mode(self, root, relative):
+        return stat.S_IMODE(os.stat(self.path(relative)).st_mode)
+
+    def fail_sync(self, root):
+        import scoped_fs
+        # macOS syncs with fcntl(F_FULLFSYNC), Linux with fsync: the first sync call after this fails.
+        owner, name = (scoped_fs.fcntl, "fcntl") if sys.platform == "darwin" else (scoped_fs.os, "fsync")
+        real, failed = getattr(owner, name), []
+
+        def sync(*args):
+            if not failed:
+                failed.append(True)
+                raise OSError(5, "fictional sync failure")
+            return real(*args)
+
+        patcher = mock.patch.object(owner, name, sync)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return True
+
+    def add_raw_name(self, root, parent, name, kind="file", nlink=1):
+        target = self.path(parent) / name if parent else self.path(name)
+        if kind == "link":
+            os.symlink(self.case / "outside", target, target_is_directory=True)
+        elif kind == "special":
+            os.mkfifo(target)
+        else:
+            with open(target, "xb") as stream:
+                stream.write(b"raw")
+            if nlink == 2:
+                os.link(target, self.case / "outside" / (uuid.uuid4().hex + ".link"))
+        return True
+
+    def add_case_pair(self, root, parent, first, second):
+        self.add_raw_name(root, parent, first)
+        try:
+            self.add_raw_name(root, parent, second)
+        except FileExistsError:
+            return False
+        return True
+
+    def alias(self, root, relative):
+        return None
+
+    def link_target(self, root):
+        return self.case / "outside"
+
+    def other_volume_root(self, root):
+        import scoped_fs
+        other = scoped_fs.PosixRoot(str(self.case / "outside"))
+        other._device = root._device + 1  # no runner is sure to have a second file system
+        return other
+
+    def new_destination_root(self, volume, *, non_private_destination):
+        import scoped_fs
+        facts = {"private": ("native", False), "removable-exfat": ("exfat", True), "fat32": ("fat", True),
+                 "unsupported": ("other", False)}[volume]
+        folder = self.case / ("destination-" + uuid.uuid4().hex)
+        folder.mkdir()
+        return scoped_fs.admit_destination(str(folder), non_private_destination=non_private_destination,
+                                           volumes=lambda fd: {"filesystem": facts[0], "removable": facts[1]})
 
 
 if __name__ == "__main__":

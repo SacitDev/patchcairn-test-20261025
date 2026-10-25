@@ -25,6 +25,7 @@ _SYSTEM_LIBRARY = "/usr/lib/libSystem.B.dylib"
 # x86-64 selects the $INODE64 symbol; arm64 has only the modern ABI.
 _MNT_LOCAL = 0x00001000
 _MNT_RDONLY = 0x00000001
+_MNT_REMOVABLE = 0x00000200  # set by XNU for external drives and disk images
 _MNT_IGNORE_OWNERSHIP = 0x00200000
 _MNT_EXT_FSKIT = 0x00000002
 _O_EVTONLY = 0x00008000  # Apple bsd/sys/fcntl.h; metadata-only file open.
@@ -156,34 +157,65 @@ def assert_private_filesystem(path):
             or (raw != "/" and any(part in {"", ".", ".."} for part in raw.split("/")[1:]))
             or any(0xD800 <= ord(char) <= 0xDFFF for char in raw)):
         _hold("darwin-fs-path-invalid")
-    result = _StatFS64()
     with _volume_descriptor(raw) as descriptor:
-        try:
-            status = query(descriptor, ctypes.byref(result))
-        except (OSError, ctypes.ArgumentError, TypeError):
-            _hold("darwin-fs-query-unavailable")
-        if status != 0:
-            _hold("darwin-fs-query-unavailable")
+        result = _statfs(query, descriptor)
     if result.f_flags & _MNT_IGNORE_OWNERSHIP:
         _hold("darwin-fs-ownership-ignored")
-    kind = bytes(result.f_fstypename)
-    if (not result.f_flags & _MNT_LOCAL or result.f_flags & _MNT_RDONLY or result.f_flags_ext & _MNT_EXT_FSKIT
-            or kind not in {b"apfs", b"hfs"} or kind == b"hfs" and result.f_fssubtype not in {0, 1, 2, 3}):
+    if not _native_volume(result):
         _hold("darwin-fs-unsupported-filesystem")
 
 
+def _statfs(query, descriptor):
+    result = _StatFS64()
+    try:
+        status = query(descriptor, ctypes.byref(result))
+    except (OSError, ctypes.ArgumentError, TypeError):
+        _hold("darwin-fs-query-unavailable")
+    if status != 0:
+        _hold("darwin-fs-query-unavailable")
+    return result
+
+
+def _native_volume(result):
+    """A writable local APFS or HFS+ volume without an FSKit adapter (ownership is judged separately)."""
+    kind = bytes(result.f_fstypename)
+    return bool(result.f_flags & _MNT_LOCAL and not result.f_flags & _MNT_RDONLY
+                and not result.f_flags_ext & _MNT_EXT_FSKIT
+                and (kind == b"apfs" or kind == b"hfs" and result.f_fssubtype in {0, 1, 2, 3}))
+
+
+def volume_kind(descriptor):
+    """(kind, removable) of the volume an open descriptor is on, for backup destination admission. kind is "native"
+    (what assert_private_filesystem admits apart from the ownership flag), "fat" (msdos, so FAT32 too) or "exfat" on a
+    writable local volume, else "other" (network, read-only, FUSE, unknown). removable is False only for a volume not
+    marked external or virtual: neither MNT_REMOVABLE (external drives, disk images) nor "ignore ownership" (which macOS
+    sets on external drives) is set. Holds when the ABI or the query is unavailable; reads no content."""
+    library, query = _volume_api()  # Retain the native library for the call lifetime.
+    if type(descriptor) is not int or descriptor < 0:
+        _hold("darwin-fs-path-invalid")
+    result = _statfs(query, descriptor)
+    removable = bool(result.f_flags & (_MNT_REMOVABLE | _MNT_IGNORE_OWNERSHIP))
+    if _native_volume(result):
+        return "native", removable
+    if not result.f_flags & _MNT_LOCAL or result.f_flags & _MNT_RDONLY:
+        return "other", removable
+    return {b"msdos": "fat", b"exfat": "exfat"}.get(bytes(result.f_fstypename), "other"), removable
+
+
 class _DarwinACL:
-    """Only ACL retrieval, working-copy validity/iteration and memory release."""
-    def __init__(self):
+    """Only ACL retrieval (acl_get_file by path, or acl_get_fd_np by descriptor), working-copy validity/iteration and
+    memory release."""
+    def __init__(self, getter="acl_get_file"):
         if os.name != "posix" or sys.platform != "darwin" or sys.version_info < (3, 12):
             _hold("darwin-acl-platform-unavailable")
         try:
             self.library = ctypes.CDLL(_SYSTEM_LIBRARY, use_errno=True)
-            self.get_file = self.library.acl_get_file
+            self.get = getattr(self.library, getter)
             self.valid = self.library.acl_valid
             self.get_entry = self.library.acl_get_entry
             self.free = self.library.acl_free
-            self.get_file.argtypes, self.get_file.restype = (ctypes.c_char_p, ctypes.c_int), ctypes.c_void_p
+            target = ctypes.c_char_p if getter == "acl_get_file" else ctypes.c_int
+            self.get.argtypes, self.get.restype = (target, ctypes.c_int), ctypes.c_void_p
             self.valid.argtypes, self.valid.restype = (ctypes.c_void_p,), ctypes.c_int
             self.get_entry.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p))
             self.get_entry.restype = ctypes.c_int
@@ -201,7 +233,7 @@ def _native(function, *arguments):
 
 def _ordinary_identity(path):
     try:
-        info = os.lstat(path)
+        info = os.fstat(path) if type(path) is int else os.lstat(path)
     except OSError:
         _hold("darwin-acl-path-unavailable")
     if (stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400
@@ -237,15 +269,31 @@ def assert_no_extended_acl(path):
             or any(0xD800 <= ord(char) <= 0xDFFF for char in raw)):
         _hold("darwin-acl-path-invalid")
     before = _ordinary_identity(raw)
-    api = _DarwinACL()
+    _assert_empty(_DarwinACL(), os.fsencode(raw), raw, before)
+
+
+def assert_no_extended_acl_fd(descriptor):
+    """As assert_no_extended_acl for an open descriptor (acl_get_fd_np), so the object checked is the object held
+    and no path is resolved; the descriptor's full identity must be the same before and after."""
+    if os.name != "posix" or sys.platform != "darwin" or sys.version_info < (3, 12):
+        _hold("darwin-acl-platform-unavailable")
+    if type(descriptor) is not int or descriptor < 0:
+        _hold("darwin-acl-path-invalid")
+    before = _ordinary_identity(descriptor)
+    _assert_empty(_DarwinACL("acl_get_fd_np"), descriptor, descriptor, before)
+
+
+def _assert_empty(api, target, raw, before):
+    """The ACL of ``target`` (a path in bytes or a descriptor) is absent or valid and empty, and ``raw`` (its path or
+    descriptor) still has the identity ``before``."""
     ctypes.set_errno(0)
-    acl = _native(api.get_file, os.fsencode(raw), ACL_TYPE_EXTENDED)
+    acl = _native(api.get, target, ACL_TYPE_EXTENDED)
     read_errno = ctypes.get_errno()
     if not acl:
         # Apple Libc posix1e/acl_file.c -> gen/filesec.c FILESEC_ACL:
-        # NULL/ENOENT for an absent ACL property. sys/statx_np.c deliberately
-        # leaves that property unset for KAUTH_FILESEC_NOACL. A missing path
-        # also returns ENOENT, so require the exact ordinary identity again.
+        # NULL/ENOENT for an absent ACL property (statx_np and fstatx_np alike).
+        # sys/statx_np.c deliberately leaves that property unset for KAUTH_FILESEC_NOACL.
+        # A missing path also returns ENOENT, so require the exact ordinary identity again.
         if read_errno == errno.ENOENT:
             if _ordinary_identity(raw) != before:
                 _hold("darwin-acl-path-changed")
