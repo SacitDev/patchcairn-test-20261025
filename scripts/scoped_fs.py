@@ -12,61 +12,42 @@ import errno
 import hashlib
 import os
 from pathlib import Path
-import re
 import stat
 import sys
+
+import pc_paths
+import scoped_base
+# The one error hierarchy of the selected-root backends, re-exported for existing callers.
+from scoped_base import CapabilityHold, ScopedFSError, relative_path
+from scoped_base import RECORD_KEYS as _RECORD_KEYS, cap as _cap, expected_record as _expected, refuse as _refuse
 
 DEFAULT_MAX_FILE_BYTES = 64 * 1024 * 1024
 DEFAULT_MAX_TOTAL_BYTES = 256 * 1024 * 1024
 MAX_STREAM_BYTES = 1024 ** 4
 MAX_ENTRIES = 20000
-MAX_DEPTH = 64
 _LINUX_RENAME_NOREPLACE = 1
 # Apple XNU bsd/sys/stdio.h: RENAME_EXCL; renameatx_np is macOS 10.12+.
 # https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/stdio.h
 _DARWIN_RENAME_EXCL = 0x00000004
-_RECORD_KEYS = {"relative_path", "kind", "device", "inode", "mode", "size",
-                "mtime_ns", "ctime_ns", "nlink", "sha256", "attributes"}
 
 
-class ScopedFSError(ValueError):
-    """Categorical refusal; no automatic retry or weaker fallback is implied."""
-    def __init__(self, code, message=None):
-        self.code = code
-        super().__init__(code if message is None else f"{code}: {message}")
+def _collisions(names):
+    """Names that share a pc_paths.casefold_key (case or NFC/NFD form) with another name of the same folder."""
+    groups = {}
+    for name in names:
+        groups.setdefault(pc_paths.casefold_key(name), []).append(name)
+    return {name for group in groups.values() if len(group) > 1 for name in group}
 
 
-class CapabilityHold(ScopedFSError):
-    """The current platform cannot provide a required safe native primitive."""
-
-
-def _refuse(code, message):
-    raise ScopedFSError(code, message)
-
-
-def _cap(value, maximum, label):
-    if type(value) is not int or not 0 < value <= maximum:
-        _refuse("invalid-cap", f"{label} must be a positive integer within its documented cap")
-    return value
-
-
-def relative_path(value, *, allow_root=False):
-    """Validate a literal portable relative name; never resolve links or '..'."""
-    if allow_root and value == "":
-        return value
-    if (not isinstance(value, str) or not value or len(value) > 4096
-            or "\\" in value or ":" in value or value.startswith("/")):
-        _refuse("relative-path", "A literal slash-separated relative path is required")
-    parts = value.split("/")
-    if len(parts) > MAX_DEPTH:
-        _refuse("depth-cap", "Selected path exceeds the depth cap")
-    for part in parts:
-        if (not part or part in {".", ".."} or part[-1] in {".", " "}
-                or len(part.encode("utf-8", errors="surrogatepass")) > 255
-                or any(ord(c) < 32 or ord(c) == 127 or 0xD800 <= ord(c) <= 0xDFFF for c in part)
-                or re.fullmatch(r"(?i:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?", part)):
-            _refuse("relative-path", "Ambiguous, reserved or unsafe path component")
-    return value
+def _left_out(info):
+    """The scoped_base reason an entry of this kind is not admitted, or None for an ordinary entry."""
+    if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+        return "link"
+    if stat.S_ISDIR(info.st_mode):
+        return None
+    if not stat.S_ISREG(info.st_mode):
+        return "special"
+    return "hard-link" if info.st_nlink != 1 else None
 
 
 def _posix_capable():
@@ -130,7 +111,7 @@ def capabilities():
                     "stream_to": False, "stream_max_bytes": 0}
     available = _posix_capable()
     return {"available": available, "platform": sys.platform,
-            "adapter": "posix-dirfd-nofollow-v1" if available else None,
+            "adapter": "posix-dirfd-nofollow" if available else None,
             "reason": None if available else "Python 3.12+ native no-follow/dir-fd support required",
             "pinning": available, "move_noreplace": available and _rename_function() is not None,
             "remove_file": available, "create_file": available, "mkdir": available,
@@ -163,18 +144,6 @@ def _record(relative, info, sha256=None):
             "device": info.st_dev, "inode": info.st_ino, "mode": info.st_mode,
             "size": info.st_size, "mtime_ns": info.st_mtime_ns, "ctime_ns": info.st_ctime_ns,
             "nlink": info.st_nlink, "sha256": sha256, "attributes": getattr(info, "st_file_attributes", 0)}
-
-
-def _expected(value, relative):
-    if (not isinstance(value, dict) or set(value) != _RECORD_KEYS or value.get("kind") != "file"
-            or value.get("relative_path") != relative or not isinstance(value.get("sha256"), str)
-            or not re.fullmatch("[a-f0-9]{64}", value["sha256"])):
-        _refuse("expected-record", "An exact hashed ordinary-file record for this relative path is required")
-    if (any(type(value[key]) is not int or value[key] < 0 for key in
-            ("device", "inode", "mode", "size", "mtime_ns", "ctime_ns", "nlink", "attributes"))
-            or value["inode"] == 0 or value["nlink"] != 1 or value["size"] > MAX_STREAM_BYTES):
-        _refuse("expected-record", "Expected native file identity is malformed or unbounded")
-    return value
 
 
 class ScopedRoot:
@@ -262,13 +231,15 @@ class ScopedRoot:
         names = os.listdir(fd)
         if len(names) > self.max_entries:
             _refuse("entry-cap", "Directory membership exceeds its entry cap")
-        folded = set()
-        for name in names:
-            relative_path(name)
-            if name.casefold() in folded:
-                _refuse("case-collision", "Directory contains case-ambiguous entry names")
-            folded.add(name.casefold())
         return sorted(names)
+
+    @staticmethod
+    def _member(name, names):
+        """An explicit operation's own name: present, and not one of a case collision."""
+        if name not in names:
+            _refuse("missing-entry", "Exact selected entry name is missing")
+        if name in _collisions(names):
+            _refuse("case-collision", "Directory contains case-ambiguous entry names")
 
     @contextlib.contextmanager
     def _parent(self, relative):
@@ -279,8 +250,7 @@ class ScopedRoot:
         parts = relative.split("/")
         try:
             for part in parts[:-1]:
-                if part not in self._names(fd):
-                    _refuse("missing-entry", "Exact parent name is missing")
+                self._member(part, self._names(fd))
                 before = _ordinary(os.stat(part, dir_fd=fd, follow_symlinks=False), directory=True)
                 child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
                 held.append(child)
@@ -296,9 +266,8 @@ class ScopedRoot:
             for item in reversed(held):
                 os.close(item)
 
-    def _stat(self, fd, name, *, checked_names=None):
-        if name not in (self._names(fd) if checked_names is None else checked_names):
-            _refuse("missing-entry", "Exact selected entry name is missing")
+    def _stat(self, fd, name):
+        self._member(name, self._names(fd))
         info = _ordinary(os.stat(name, dir_fd=fd, follow_symlinks=False))
         if info.st_dev != self._device:
             _refuse("filesystem-boundary", "Nested filesystem boundary refused")
@@ -317,9 +286,26 @@ class ScopedRoot:
                 return self._read(fd, name, relative, expected=None, writer=lambda _: None, max_bytes=max_bytes)
             return _record(relative, info)
 
-    def list_directory(self, relative=""):
+    def list_directory(self, relative="", *, excluded=None):
+        """Records of a folder's admitted entries, sorted by name (scoped_base.RootBase contract).
+
+        Names that are not portable, paths beyond the portable limit, every name of a case collision,
+        links, special files and hard-linked files are left out, never opened, and reported through
+        scoped_base.exclude when ``excluded`` is a list (D-025). Without ``excluded`` the first such
+        entry refuses the listing (a folder PatchCairn owns must hold nothing unknown), and an explicit
+        operation on such a name is always refused.
+        """
         relative_path(relative, allow_root=True)
+        if excluded is not None and not isinstance(excluded, list):
+            _refuse("invalid-option", "excluded must be a list or None")
         self._validate_anchor()
+        try:
+            return self._listing(relative, excluded)
+        except OSError as exc:
+            # A refused folder read (for example a macOS privacy prompt) is a clean refusal, not a raw error.
+            raise ScopedFSError("filesystem-access", "Scoped folder is missing, inaccessible or changed") from exc
+
+    def _listing(self, relative, excluded):
         with contextlib.ExitStack() as stack:
             fd = self._fd
             if relative:
@@ -332,32 +318,46 @@ class ScopedRoot:
                     _refuse("directory-drift", "Directory changed during open")
             before = _identity(os.fstat(fd))
             names = self._names(fd)
-            checked_names = set(names)
-            result = [_record(f"{relative}/{name}" if relative else name,
-                              self._stat(fd, name, checked_names=checked_names)) for name in names]
+            colliding = _collisions(names)
+            result, left_out = [], []
+            for name in names:
+                reason = scoped_base.name_reason(relative, name) or ("case-collision" if name in colliding else None)
+                info = None if reason else os.stat(name, dir_fd=fd, follow_symlinks=False)
+                reason = reason or _left_out(info)
+                if reason:
+                    scoped_base.exclude(left_out if excluded is None else excluded, relative, name, reason)
+                    continue
+                if info.st_dev != self._device:
+                    _refuse("filesystem-boundary", "Nested filesystem boundary refused")
+                result.append(_record(f"{relative}/{name}" if relative else name, info))
             if before != _identity(os.fstat(fd)) or names != self._names(fd):
                 _refuse("membership-drift", "Directory membership changed during listing")
+            if excluded is None and left_out:
+                _refuse(left_out[0]["reason"], "The folder holds an entry that cannot be admitted")
             self._validate_anchor()
             return result
 
     def snapshot(self, *, hash_files=False, max_file_bytes=DEFAULT_MAX_FILE_BYTES,
-                 max_total_bytes=DEFAULT_MAX_TOTAL_BYTES):
+                 max_total_bytes=DEFAULT_MAX_TOTAL_BYTES, excluded=None):
+        """Records of the whole tree; entries list_directory leaves out are reported in ``excluded``
+        (scoped_base.exclude) instead of refusing the snapshot (D-025)."""
         _cap(max_file_bytes, MAX_STREAM_BYTES, "max_file_bytes")
         _cap(max_total_bytes, MAX_STREAM_BYTES, "max_total_bytes")
         if type(hash_files) is not bool:
             _refuse("invalid-option", "hash_files must be boolean")
+        if excluded is not None and not isinstance(excluded, list):
+            _refuse("invalid-option", "excluded must be a list or None")
         records = [self.inspect("")]
         total = 0
         pending = [""]
         directories = []
         while pending:
             relative = pending.pop()
-            children = self.list_directory(relative)
+            children = self.list_directory(relative, excluded=excluded)
             directories.append((relative, [r["relative_path"] for r in children]))
             for row in children:
                 if len(records) >= self.max_entries:
                     _refuse("entry-cap", "Snapshot exceeds its total entry cap")
-                relative_path(row["relative_path"])
                 if row["kind"] == "directory":
                     pending.append(row["relative_path"])
                 elif hash_files:
@@ -371,11 +371,11 @@ class ScopedRoot:
         if root != by_path[""]:
             _refuse("snapshot-drift", "Root changed during snapshot")
         for relative, names in directories:
-            current = self.list_directory(relative)
+            current = self.list_directory(relative, excluded=[])
             if names != [r["relative_path"] for r in current]:
                 _refuse("snapshot-drift", "Snapshot membership changed")
             if any(any(row[key] != by_path[row["relative_path"]][key] for key in _RECORD_KEYS - {"sha256"})
-                   for row in current):
+                   for row in current if row["relative_path"] in by_path):
                 _refuse("snapshot-drift", "Entry changed during snapshot")
         return sorted(records, key=lambda row: row["relative_path"])
 
@@ -436,7 +436,7 @@ class ScopedRoot:
         return b"".join(chunks)
 
     def _absent(self, fd, name):
-        if name.casefold() in {entry.casefold() for entry in self._names(fd)}:
+        if pc_paths.casefold_key(name) in {pc_paths.casefold_key(entry) for entry in self._names(fd)}:
             _refuse("destination-exists", "Destination or case-equivalent entry already exists")
         try:
             os.stat(name, dir_fd=fd, follow_symlinks=False)

@@ -13,15 +13,14 @@ import re
 import stat
 import sys
 
+import pc_records
+
 # Linux UAPI linux/magic.h. No foreign/network/emulated filesystem is admitted.
 _NATIVE_TYPES = frozenset({0xEF53, 0x58465342, 0x9123683E, 0x01021994, 0x858458F6})
 
 
-class LinuxPrivacyHold(ValueError):
+class LinuxPrivacyHold(pc_records.Refusal):
     """Categorical refusal without paths, filesystem IDs or native error text."""
-    def __init__(self, code):
-        self.code = code
-        super().__init__(code)
 
 
 def _hold(code):

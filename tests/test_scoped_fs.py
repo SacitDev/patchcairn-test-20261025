@@ -27,11 +27,22 @@ import scoped_fs as fs
 class ContractTests(unittest.TestCase):
     def test_literal_relative_paths(self):
         for path in ("../escape", "a/../b", "/abs", "a\\b", "a//b", "a/./b", "x:",
-                     "con.txt", "nul", "foo.", "foo ", "a/", "x\x00y", "x\ud800y"):
+                     "con.txt", "nul", "foo.", "foo ", "a/", "x\x00y", "x\ud800y", "COM¹.txt", "lpt0", "a" * 201):
             with self.subTest(path=repr(path)), self.assertRaises(fs.ScopedFSError):
                 fs.relative_path(path)
         self.assertEqual(fs.relative_path("safe names/a-file.txt"), "safe names/a-file.txt")
         self.assertEqual(fs.relative_path("", allow_root=True), "")
+
+    def test_errors_and_path_grammar_are_the_shared_ones(self):
+        import pc_records
+        import scoped_base
+        self.assertIs(fs.ScopedFSError, scoped_base.ScopedFSError)
+        self.assertIs(fs.CapabilityHold, scoped_base.CapabilityHold)
+        self.assertIs(fs.relative_path, scoped_base.relative_path)
+        self.assertTrue(issubclass(fs.CapabilityHold, pc_records.Refusal))
+        with self.assertRaises(fs.ScopedFSError) as caught:
+            fs.relative_path("/".join(["a"] * 65))
+        self.assertEqual(caught.exception.code, "path-too-long")
 
     def test_windows_missing_native_adapter_is_hold(self):
         with mock.patch.object(fs.os, "name", "nt"), mock.patch.dict(sys.modules, {"windows_scoped": None}):
@@ -139,10 +150,10 @@ class ContractTests(unittest.TestCase):
                 native.assert_not_called()
 
 
-@unittest.skipUnless(fs._posix_capable(), "Native POSIX no-follow/dir-fd support unavailable")
+@unittest.skipUnless(fs._posix_capable(), "only on posix: native POSIX no-follow/dir-fd support is required")
 class PosixTests(unittest.TestCase):
     def setUp(self):
-        self.base = ROOT / "work" / "upgrade_v3" / "filesystem" / ("fixture-" + uuid.uuid4().hex)
+        self.base = ROOT / "work" / "test-fixtures" / "filesystem" / ("fixture-" + uuid.uuid4().hex)
         self.base.mkdir(parents=True)
         self.source = self.base / "selected"
         self.source.mkdir()
@@ -279,7 +290,7 @@ class PosixTests(unittest.TestCase):
 
     def test_quarantine_restore_no_overwrite_and_identity(self):
         if fs._rename_function() is None:
-            self.skipTest("Native atomic no-overwrite rename unavailable")
+            self.skipTest("only on posix: native atomic no-overwrite rename unavailable")
         original = self.hashed()
         with fs.ScopedRoot(self.target, quiet_workspace=True) as target:
             try:
@@ -287,7 +298,7 @@ class PosixTests(unittest.TestCase):
             except fs.CapabilityHold:
                 self.assertTrue((self.source / "a.txt").exists())
                 self.assertFalse((self.target / "saved.txt").exists())
-                self.skipTest("Owned filesystem refuses native atomic no-overwrite rename; source preserved")
+                self.skipTest("only on posix: the owned filesystem refuses native atomic no-overwrite rename; source preserved")
             self.assertFalse((self.source / "a.txt").exists())
             self.assertEqual(moved["inode"], original["inode"])
             self.assertEqual(moved["sha256"], original["sha256"])
@@ -318,11 +329,17 @@ class PosixTests(unittest.TestCase):
                 self.fs.move_to("a.txt", destination=target, destination_relative="occupied.txt", expected=restored)
             self.assertEqual((self.target / "occupied.txt").read_bytes(), b"preserve")
 
-    def test_mocked_case_collision_refuses(self):
-        with mock.patch.object(fs.os, "listdir", return_value=["Case.txt", "case.txt"]):
-            with self.assertRaises(fs.ScopedFSError) as caught:
-                self.fs.list_directory()
-            self.assertEqual(caught.exception.code, "case-collision")
+    def test_mocked_case_collision_is_left_out_and_refused_explicitly(self):
+        excluded = []
+        with mock.patch.object(fs.os, "listdir", return_value=["Case.txt", "case.txt", "cafe\u0301.txt", "caf\u00e9.txt"]):
+            self.assertEqual(self.fs.list_directory(excluded=excluded), [])
+            for name in ("case.txt", "caf\u00e9.txt"):
+                with self.subTest(name=name), self.assertRaises(fs.ScopedFSError) as caught:
+                    self.fs.inspect(name)
+                self.assertEqual(caught.exception.code, "case-collision")
+        # Case and NFC/NFD forms both collide (pc_paths.casefold_key), so a restore onto APFS cannot clash.
+        self.assertEqual(excluded, [{"parent": "", "name": name, "reason": "case-collision"}
+                                    for name in sorted(["Case.txt", "case.txt", "cafe\u0301.txt", "caf\u00e9.txt"])])
 
     def test_no_native_rename_is_hold_and_never_copy_delete(self):
         with fs.ScopedRoot(self.target, quiet_workspace=True) as target, mock.patch.object(fs, "_rename_function", return_value=None):
@@ -345,11 +362,17 @@ class PosixTests(unittest.TestCase):
             (self.source / "alias").symlink_to(self.target, target_is_directory=True)
             (self.base / "root-alias").symlink_to(self.source, target_is_directory=True)
         except OSError as exc:
-            self.skipTest(f"Owned filesystem symlink creation unavailable: {exc.errno}")
-        with self.assertRaises(fs.ScopedFSError):
+            self.skipTest(f"only on posix: owned filesystem symlink creation unavailable: {exc.errno}")
+        excluded = []
+        self.assertEqual([row["relative_path"] for row in self.fs.list_directory(excluded=excluded)], ["a.txt"])
+        self.assertEqual(excluded, [{"parent": "", "name": "alias", "reason": "link"}])
+        # Without ``excluded`` (a folder PatchCairn owns) the unknown entry refuses the listing.
+        with self.assertRaises(fs.ScopedFSError) as caught:
             self.fs.list_directory()
-        with self.assertRaises(fs.ScopedFSError):
-            self.fs.inspect("alias/escape.txt")
+        self.assertEqual(caught.exception.code, "link")
+        for relative in ("alias", "alias/escape.txt"):
+            with self.subTest(relative=relative), self.assertRaises(fs.ScopedFSError):
+                self.fs.inspect(relative)
         with self.assertRaises(fs.ScopedFSError):
             fs.ScopedRoot(self.base / "root-alias", quiet_workspace=True)
 
@@ -357,30 +380,74 @@ class PosixTests(unittest.TestCase):
         try:
             os.link(self.source / "a.txt", self.source / "second.txt")
         except OSError as exc:
-            self.skipTest(f"Owned filesystem hardlink creation unavailable: {exc.errno}")
+            self.skipTest(f"only on posix: owned filesystem hardlink creation unavailable: {exc.errno}")
+        excluded = []
         with mock.patch.object(fs.os, "open", side_effect=AssertionError("file opened")):
-            with self.assertRaises(fs.ScopedFSError):
-                self.fs.list_directory()
+            self.assertEqual(self.fs.list_directory(excluded=excluded), [])
+        self.assertEqual(excluded, [{"parent": "", "name": name, "reason": "hard-link"} for name in ("a.txt", "second.txt")])
+        with self.assertRaises(fs.ScopedFSError) as caught:
+            self.fs.inspect("second.txt", hash_file=True)
+        self.assertEqual(caught.exception.code, "file-type")
 
     def test_special_file_refused_without_blocking(self):
         try:
             os.mkfifo(self.source / "fictional-pipe")
         except (OSError, AttributeError) as exc:
-            self.skipTest(f"Owned filesystem FIFO unavailable: {getattr(exc, 'errno', None)}")
-        with self.assertRaises(fs.ScopedFSError):
-            self.fs.list_directory()
+            self.skipTest(f"only on posix: owned filesystem FIFO unavailable: {getattr(exc, 'errno', None)}")
+        excluded = []
+        self.assertEqual([row["relative_path"] for row in self.fs.list_directory(excluded=excluded)], ["a.txt"])
+        self.assertEqual(excluded, [{"parent": "", "name": "fictional-pipe", "reason": "special"}])
         with self.assertRaises(fs.ScopedFSError):
             self.fs.inspect("fictional-pipe", hash_file=True)
 
-    def test_case_collision_refuses(self):
+    def test_case_collision_names_are_left_out_and_refused_explicitly(self):
         (self.source / "Case.txt").write_bytes(b"one")
         (self.source / "case.txt").write_bytes(b"two")
         names = os.listdir(self.source)
-        if not {"Case.txt", "case.txt"} <= set(names):
-            self.skipTest("Owned filesystem folds case, cannot create collision")
+        if {"Case.txt", "case.txt"} <= set(names):
+            excluded = []
+            self.assertEqual([row["relative_path"] for row in self.fs.list_directory(excluded=excluded)], ["a.txt"])
+            self.assertEqual(excluded, [{"parent": "", "name": name, "reason": "case-collision"} for name in ("Case.txt", "case.txt")])
+            with self.assertRaises(fs.ScopedFSError) as caught:
+                self.fs.inspect("case.txt")
+            self.assertEqual(caught.exception.code, "case-collision")
+        else:
+            # A case-insensitive volume (the macOS default) keeps the first spelling as one entry, so no
+            # collision can exist; the listing is in code-point order.
+            self.assertIn("Case.txt", names)
+            self.assertEqual([row["relative_path"] for row in self.fs.list_directory()], sorted(names))
+
+    def test_names_other_systems_cannot_use_are_left_out_not_refused(self):
+        # Legal on Linux and macOS, but not portable: listed as not included; the folder itself stays usable.
+        for name in ("ok.txt", "What now?.txt", "lpt0.log"):
+            (self.source / name).write_bytes(b"Fictional portable-name fixture")
+        excluded = []
+        self.assertEqual([row["relative_path"] for row in self.fs.list_directory(excluded=excluded)], ["a.txt", "ok.txt"])
+        self.assertEqual(sorted(excluded, key=lambda row: row["name"]),
+                         [{"parent": "", "name": "What now?.txt", "reason": "not-portable"}, {"parent": "", "name": "lpt0.log", "reason": "not-portable"}])
+        self.assertEqual(self.fs.inspect("ok.txt")["kind"], "file")
+        for name in ("What now?.txt", "lpt0.log"):
+            with self.subTest(name=name), self.assertRaises(fs.ScopedFSError):
+                self.fs.inspect(name)
+        snapshot_excluded = []
+        self.assertEqual([row["relative_path"] for row in self.fs.snapshot(excluded=snapshot_excluded)], ["", "a.txt", "ok.txt"])
+        self.assertEqual(sorted(row["name"] for row in snapshot_excluded), ["What now?.txt", "lpt0.log"])
+
+    def test_path_beyond_portable_limit_is_left_out_and_never_admitted(self):
+        deep = self.source / ("d" * 120) / ("e" * 90)
+        deep.mkdir(parents=True)
+        (deep / "unopened.txt").write_bytes(b"fictional entry beyond the portable path limit")
+        long_path = ("d" * 120) + "/" + ("e" * 90)
+        listed = []
+        self.assertEqual(self.fs.list_directory("d" * 120, excluded=listed), [])
+        self.assertEqual(listed, [{"parent": "d" * 120, "name": "e" * 90, "reason": "path-too-long"}])
         with self.assertRaises(fs.ScopedFSError) as caught:
-            self.fs.list_directory()
-        self.assertEqual(caught.exception.code, "case-collision")
+            self.fs.inspect(long_path)
+        self.assertEqual(caught.exception.code, "path-too-long")
+        excluded = []
+        rows = self.fs.snapshot(excluded=excluded)
+        self.assertNotIn(long_path, [row["relative_path"] for row in rows])
+        self.assertEqual(excluded, [{"parent": "d" * 120, "name": "e" * 90, "reason": "path-too-long"}])
 
     def test_root_replacement_invalidates_pinned_handle(self):
         self.source.rename(self.base / "old-selected")

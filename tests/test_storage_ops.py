@@ -8,7 +8,6 @@ import json
 import os
 import stat
 import sys
-import tempfile
 import unittest
 from unittest import mock
 import uuid
@@ -17,16 +16,16 @@ from pathlib import Path
 
 ROOT = Path(__file__).absolute().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
-from scoped_fs import CapabilityHold, ScopedFSError, ScopedRoot
+from scoped_fs import ScopedFSError
 from private_workspace import (PrivateWorkspaceError, ensure_private_directory,
                                ensure_private_file, write_private_new)
-from storage_ops import (StorageRefusal, StorageService, VERSION, canonical,
+import scoped_base
+import storage_contract
+import storage_ops
+from storage_ops import (StorageRefusal, StorageService, SCHEMA, canonical,
                          plan_sha256, render_storage, sha256, storage_capabilities)
 
-FIXTURES = ROOT / "work" / "upgrade_v3" / "storage"
-if os.name == "nt":
-    import windows_scoped
-    windows_scoped._WORK_ROOT = FIXTURES / ("private-adapter-" + uuid.uuid4().hex)
+FIXTURES = ROOT / "work" / "test-fixtures" / "storage"
 
 
 def fixture_directory():
@@ -35,7 +34,54 @@ def fixture_directory():
     try:
         return ensure_private_directory(path, create=True, boundary=ROOT / "work")
     except PrivateWorkspaceError as exc:
-        raise unittest.SkipTest("Actual filesystem cannot establish the required private namespace: " + exc.code) from exc
+        if os.name != "posix":
+            raise
+        raise unittest.SkipTest("only on posix: the actual filesystem cannot establish the required private namespace: " + exc.code) from exc
+
+
+def make_directory_link(link, target):
+    """A directory link the product must refuse: a symbolic link on POSIX, a junction on Windows (which needs no
+    symbolic-link privilege), so the refusal runs on every platform."""
+    if os.name == "nt":
+        import _winapi
+        _winapi.CreateJunction(str(target), str(link))
+    else:
+        link.symlink_to(target, target_is_directory=True)
+
+
+def create_file_everyone_may_read(path, data):
+    """A new Windows file whose DACL adds access for Everyone to what it inherits, so it is broad wherever the
+    repository is cloned (an inherited DACL may be private, for example in a user's profile). No ACL is changed."""
+    import ctypes
+    from ctypes import wintypes
+
+    class Attributes(ctypes.Structure):
+        _fields_ = [("length", wintypes.DWORD), ("descriptor", ctypes.c_void_p), ("inherit", wintypes.BOOL)]
+    advapi, kernel = ctypes.WinDLL("advapi32", use_last_error=True), ctypes.WinDLL("kernel32", use_last_error=True)
+    convert = advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW
+    convert.argtypes, convert.restype = (wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.DWORD)), wintypes.BOOL
+    kernel.LocalFree.argtypes, kernel.LocalFree.restype = (ctypes.c_void_p,), ctypes.c_void_p
+    kernel.CreateFileW.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(Attributes), wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
+    kernel.CreateFileW.restype = wintypes.HANDLE
+    kernel.WriteFile.argtypes = (wintypes.HANDLE, ctypes.c_char_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p)
+    kernel.WriteFile.restype = wintypes.BOOL
+    kernel.CloseHandle.argtypes, kernel.CloseHandle.restype = (wintypes.HANDLE,), wintypes.BOOL
+    descriptor, size = ctypes.c_void_p(), wintypes.DWORD()
+    # Everyone may do anything (so the owner can still remove the fixture); no "P", so inherited ACEs merge.
+    if not convert("D:(A;;FA;;;WD)", 1, ctypes.byref(descriptor), ctypes.byref(size)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        handle = kernel.CreateFileW(str(path), 0x40000000, 0, ctypes.byref(Attributes(ctypes.sizeof(Attributes), descriptor, False)), 1, 0x80, None)
+        if handle in (None, ctypes.c_void_p(-1).value):
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            written = wintypes.DWORD()
+            if not kernel.WriteFile(handle, data, len(data), ctypes.byref(written), None) or written.value != len(data):
+                raise ctypes.WinError(ctypes.get_last_error())
+        finally:
+            kernel.CloseHandle(handle)
+    finally:
+        kernel.LocalFree(descriptor)
 
 
 def private_child(parent, name):
@@ -45,21 +91,21 @@ def private_child(parent, name):
 class StoragePrivacyAdmissionTests(unittest.TestCase):
     def test_unsafe_existing_output_root_refuses_before_selected_scope_access(self):
         FIXTURES.mkdir(parents=True, exist_ok=True)
-        base = Path(tempfile.mkdtemp(prefix="unsafe-admission-", dir=FIXTURES))
+        base = FIXTURES / ("unsafe-admission-" + uuid.uuid4().hex)
+        os.mkdir(base)
         output = base / "output"
-        output.mkdir(mode=0o755)
-        try:
-            ensure_private_directory(output)
-        except PrivateWorkspaceError:
-            pass
-        else:
-            self.skipTest("Ordinary creation was already private on this host; no permissions are broadened for the fixture")
+        os.mkdir(output)
+        if os.name == "posix":
+            output.chmod(0o755)  # Attack fixture only (a host umask of 077 would create it private).
+        expected = "private-owner-or-mode-refused" if os.name == "posix" else "private-dacl-unprotected"
         with mock.patch.object(StorageService, "_scope", side_effect=AssertionError("Selected scope must stay unopened")):
-            with self.assertRaisesRegex(StorageRefusal, "Owner-private"):
+            with self.assertRaisesRegex(StorageRefusal, "Owner-private") as caught:
                 StorageService(output_root=output, quiet_workspace=True)
+        self.assertEqual(caught.exception.code, expected)
         self.assertEqual(list(output.iterdir()), [])
-        with self.assertRaises(PrivateWorkspaceError):
+        with self.assertRaises(PrivateWorkspaceError) as caught:
             ensure_private_directory(output)
+        self.assertEqual(caught.exception.code, expected)
 
     def test_private_namespace_creation_or_actual_unsupported_hold(self):
         FIXTURES.mkdir(parents=True, exist_ok=True)
@@ -93,7 +139,7 @@ class StoragePrivacyAdmissionTests(unittest.TestCase):
 class PureStorageTests(unittest.TestCase):
     def test_quiet_workspace_and_output_scope_are_explicit(self):
         with self.assertRaises(StorageRefusal):
-            StorageService(output_root=ROOT / "work" / "upgrade_v3" / "storage", quiet_workspace=False)
+            StorageService(output_root=ROOT / "work" / "test-fixtures" / "storage", quiet_workspace=False)
         with self.assertRaises(StorageRefusal):
             StorageService(output_root=ROOT / "scripts", quiet_workspace=True)
         with self.assertRaises(StorageRefusal):
@@ -125,7 +171,7 @@ class PureStorageTests(unittest.TestCase):
             info.external_attr = ((stat.S_IFREG | 0o600) << 16) if external_attr is None else external_attr
             archive.writestr(info, content)
         data = stream.getvalue()
-        manifest = {"schema_version": VERSION, "kind": "backup_manifest", "archive_sha256": sha256(data),
+        manifest = {"schema": SCHEMA, "schema_version": 1, "kind": "backup_manifest", "archive_sha256": sha256(data),
                     "archive_bytes": len(data), "files": [{"entry": name, "root_id": "r001", "relative_path": "fictional.txt",
                                                               "size": len(content), "sha256": sha256(content)}],
                     "limits": {"max_entries": 100, "max_depth": 10, "max_file_bytes": 1000, "max_total_bytes": 1000}}
@@ -185,15 +231,6 @@ class PureStorageTests(unittest.TestCase):
 
 
 class NativeStorageTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        base = fixture_directory()
-        try:
-            with ScopedRoot(base, quiet_workspace=True, max_entries=100) as scope:
-                scope.inspect("")
-        except CapabilityHold as exc:
-            raise unittest.SkipTest("Actual host lacks checked selected-root primitives: " + getattr(exc, "code", "capability_hold"))
-
     def setUp(self):
         self.base = fixture_directory()
         self.source = self.base / "source"
@@ -234,17 +271,15 @@ class NativeStorageTests(unittest.TestCase):
         ensure_private_directory(Path(restored["destination"]))
         ensure_private_directory(Path(restored["destination"]) / "r001")
 
-    @unittest.skipUnless(os.name == "nt", "Windows rename preserves file DACL; POSIX uses private directory traversal")
+    @unittest.skipUnless(os.name == "nt", "only on windows: Windows rename preserves file DACL; POSIX uses private directory traversal")
     def test_windows_broad_quarantine_source_holds_without_acl_change(self):
-        source = Path(tempfile.mkdtemp(prefix="ordinary-public-source-", dir=FIXTURES))
+        source = FIXTURES / ("ordinary-public-source-" + uuid.uuid4().hex)
+        os.mkdir(source)  # Inherits the fixture folder's ordinary DACL; no ACL is changed.
         target = source / "public-fixture.txt"
-        target.write_bytes(b"fictional public source")
-        try:
+        create_file_everyone_may_read(target, b"fictional public source")
+        with self.assertRaises(PrivateWorkspaceError) as caught:
             ensure_private_file(target)
-        except PrivateWorkspaceError:
-            pass
-        else:
-            self.skipTest("Ordinary source inherited a private file DACL; no ACLs are broadened to force this fixture")
+        self.assertEqual(caught.exception.code, "private-dacl-broad-or-unknown")
         inventory = self.service.assess_storage(roots=[source])
         with mock.patch.object(self.service, "_hashed", side_effect=AssertionError("No source bytes before the privacy hold")) as hashing:
             with self.assertRaisesRegex(StorageRefusal, "Owner-private"):
@@ -257,7 +292,7 @@ class NativeStorageTests(unittest.TestCase):
         self.assertTrue(target.exists())
         self.assertEqual(list(self.output.iterdir()), [])
 
-    @unittest.skipUnless(os.name == "nt", "Actual Windows DACL preservation regression")
+    @unittest.skipUnless(os.name == "nt", "only on windows: actual Windows DACL preservation regression")
     def test_private_windows_quarantine_and_restore_recheck_file_acl(self):
         inventory = self.inventory()
         plan = self.service.plan_cleanup(inventory=inventory, selected=["r001/readme.txt"],
@@ -353,7 +388,7 @@ class NativeStorageTests(unittest.TestCase):
         evidence = self.service.check_preconditions(plan=plan, expected_plan_sha256=plan_sha256(plan))
         self.assertFalse(evidence["mutation_performed"])
         self.assertEqual(list(self.output.iterdir()), [])
-        invented = {"schema_version": VERSION, "kind": "backup_receipt", "plan_sha256": plan_sha256(plan)}
+        invented = {"schema": SCHEMA, "schema_version": 1, "kind": "backup_receipt", "plan_sha256": plan_sha256(plan)}
         with self.assertRaises((StorageRefusal, ScopedFSError)):
             self.service.verify_outcome(plan=plan, expected_plan_sha256=plan_sha256(plan), receipt=invented)
         (self.source / "new.txt").write_bytes(b"fictional changed scope")
@@ -385,7 +420,7 @@ class NativeStorageTests(unittest.TestCase):
         folder = self.output / "invented-quarantine"
         folder.mkdir()
         (folder / "000001").write_bytes(b"fictional retained recovery")
-        receipt = {"schema_version": VERSION, "kind": "quarantine_receipt", "plan_sha256": "0" * 64,
+        receipt = {"schema": SCHEMA, "schema_version": 1, "kind": "quarantine_receipt", "plan_sha256": "0" * 64,
                    "quarantine_destination": str(folder), "records": [], "recovery_required": False,
                    "recovery_backup": None, "recovery_verification": None, "attempt": "invented"}
         with self.assertRaises((StorageRefusal, ScopedFSError)):
@@ -413,8 +448,10 @@ class NativeStorageTests(unittest.TestCase):
     def test_verified_backup_restore_and_immutable_archive(self):
         plan, receipt = self.backup()
         attempt = json.loads((self.output / receipt["attempt"]).read_bytes())
-        self.assertEqual(attempt["exact_plan"], plan)
+        self.assertNotIn("exact_plan", attempt)
         self.assertEqual(attempt["plan_sha256"], plan_sha256(plan))
+        self.assertEqual(attempt["entry_count"], len(plan["files"]))
+        self.assertEqual(json.loads((self.output / attempt["plan_file"]).read_bytes()), plan)
         verified = self.service.verify_backup(receipt=receipt)
         self.assertTrue(verified["verified"])
         self.assertTrue(self.service.verify_outcome(plan=plan, expected_plan_sha256=plan_sha256(plan), receipt=receipt)["verification_passed"])
@@ -455,18 +492,52 @@ class NativeStorageTests(unittest.TestCase):
         with self.assertRaisesRegex(StorageRefusal, "protected"):
             self.service.plan_cleanup(inventory=inventory, selected=selected, quarantine_destination=self.output / "quarantine", content_read_authorized=True, recovery_backup=receipt, protected=selected)
 
+    def test_unknown_link_or_special_entry_in_the_quarantine_folder_refuses(self):
+        # Only a person's selections list left-out entries as "not included"; PatchCairn's own quarantine folder
+        # must hold exactly the receipt's files (sitting-b review).
+        inventory = self.inventory()
+        cleanup = self.service.plan_cleanup(inventory=inventory, selected=["r001/readme.txt"], quarantine_destination=self.output / "quarantine",
+                                            content_read_authorized=True, recovery_required=False)
+        receipt = self.service.quarantine(plan=cleanup, expected_plan_sha256=plan_sha256(cleanup))
+        folder = self.output / "quarantine"
+        planted = [("planted-link", lambda path: make_directory_link(path, self.source / "notes"))]
+        if os.name == "posix":
+            planted.append(("planted-pipe", os.mkfifo))
+        for name, plant in planted:
+            plant(folder / name)
+            with self.subTest(name=name), self.assertRaisesRegex(StorageRefusal, "Unknown, missing or changed quarantine files"):
+                self.service.plan_quarantine_restore(receipt=receipt)
+            # Remove only the exact synthetic entry just created (never a link's target), never recursion.
+            os.rmdir(folder / name) if os.name == "nt" else (folder / name).unlink()
+        self.assertEqual(self.service.plan_quarantine_restore(receipt=receipt)["kind"], "quarantine_restore")
+        self.assertTrue((self.source / "notes" / "draft.md").is_file())
+
+    def test_storage_decoder_reads_every_record_its_writer_produces(self):
+        # A planted folder of names full of "[" must not make a written plan, manifest or attempt unreadable
+        # (the strict decoder counts every bracket, also inside strings).
+        names = ["[" * 180 + str(number) for number in range(6_000)]
+        for kind in sorted(storage_contract.KINDS):
+            record = {"schema": SCHEMA, "schema_version": 1, "kind": kind, "files": names}
+            data = canonical(record)
+            with self.subTest(kind=kind):
+                self.assertGreater(data.count(b"["), 1_000_000)
+                self.assertLessEqual(len(data), storage_ops.MAX_ARCHIVE_BYTES)
+                self.assertEqual(storage_ops.decode_storage(data, "Fictional unreadable record"), record)
+
     def test_quarantine_restore_and_distinct_purge_plan(self):
+        if os.name == "posix":
+            # A quarantined source keeps its own mode behind the private quarantine parents (moved, never re-permissioned).
+            (self.source / "readme.txt").chmod(0o644)
         inventory = self.inventory()
         _, backup = self.backup(inventory)
         probe = self.probe(backup)
         cleanup = self.service.plan_cleanup(inventory=inventory, selected=["r001/readme.txt"],
                                             quarantine_destination=self.output / "quarantine", content_read_authorized=True, recovery_backup=backup, recovery_verification=probe)
         self.assertEqual(cleanup["cost"]["expected_free_space_gain_bytes"], 0)
-        try:
-            receipt = self.service.quarantine(plan=cleanup, expected_plan_sha256=plan_sha256(cleanup))
-        except CapabilityHold as exc:
-            self.skipTest("Actual filesystem lacks safe no-overwrite move: " + getattr(exc, "code", "capability_hold"))
+        receipt = self.service.quarantine(plan=cleanup, expected_plan_sha256=plan_sha256(cleanup))
         self.assertFalse((self.source / "readme.txt").exists())
+        if os.name == "posix":
+            self.assertEqual(stat.S_IMODE((self.output / "quarantine" / "000001").stat().st_mode), 0o644)
         self.assertTrue(self.service.verify_outcome(plan=cleanup, expected_plan_sha256=plan_sha256(cleanup), receipt=receipt)["verification_passed"])
         purge = self.service.plan_purge(receipt=receipt)
         self.assertTrue(purge["irreversible"])
@@ -492,10 +563,7 @@ class NativeStorageTests(unittest.TestCase):
         inventory = self.inventory()
         cleanup = self.service.plan_cleanup(inventory=inventory, selected=["r001/readme.txt"],
                                             quarantine_destination=self.output / "quarantine", content_read_authorized=True, recovery_required=False)
-        try:
-            receipt = self.service.quarantine(plan=cleanup, expected_plan_sha256=plan_sha256(cleanup))
-        except CapabilityHold as exc:
-            self.skipTest("Actual filesystem lacks safe no-overwrite move: " + getattr(exc, "code", "capability_hold"))
+        receipt = self.service.quarantine(plan=cleanup, expected_plan_sha256=plan_sha256(cleanup))
         (self.output / "quarantine" / "unknown.txt").write_bytes(b"fictional unregistered")
         with self.assertRaisesRegex(StorageRefusal, "Unknown"):
             self.service.plan_purge(receipt=receipt)
@@ -504,10 +572,7 @@ class NativeStorageTests(unittest.TestCase):
         inventory = self.inventory()
         cleanup = self.service.plan_cleanup(inventory=inventory, selected=["r001/readme.txt"],
                                             quarantine_destination=self.output / "quarantine", content_read_authorized=True, recovery_required=False)
-        try:
-            receipt = self.service.quarantine(plan=cleanup, expected_plan_sha256=plan_sha256(cleanup))
-        except CapabilityHold as exc:
-            self.skipTest("Actual filesystem lacks safe no-overwrite move: " + getattr(exc, "code", "capability_hold"))
+        receipt = self.service.quarantine(plan=cleanup, expected_plan_sha256=plan_sha256(cleanup))
         purge = self.service.plan_purge(receipt=receipt)
         result = self.service.purge_quarantine(plan=purge, expected_plan_sha256=plan_sha256(purge))
         self.assertTrue(result["irreversible"])
@@ -516,22 +581,102 @@ class NativeStorageTests(unittest.TestCase):
         self.assertTrue((self.source / "copy.txt").exists())
         self.assertTrue((self.source / "large.bin").exists())
 
-    def test_symlink_and_hardlink_never_form_duplicates(self):
-        linked = self.source / "linked.txt"
-        try:
-            os.symlink(self.source / "readme.txt", linked)
-        except (OSError, NotImplementedError):
-            self.skipTest("This native fixture filesystem does not support symlink creation")
-        with self.assertRaises((StorageRefusal, ScopedFSError)):
-            self.inventory()
-        # Remove only the exact synthetic link we just created, never recursion.
-        linked.unlink()
-        try:
-            os.link(self.source / "readme.txt", linked)
-        except (OSError, NotImplementedError):
-            self.skipTest("This native fixture filesystem does not support hardlinks")
-        with self.assertRaises((StorageRefusal, ScopedFSError)):
-            self.inventory()
+    def test_links_and_hardlinks_are_not_included_and_never_form_duplicates(self):
+        linked = self.source / "linked-folder"
+        make_directory_link(linked, self.source / "notes")
+        links = ["linked-folder"]
+        if os.name == "posix":
+            (self.source / "linked.txt").symlink_to(self.source / "readme.txt")
+            links.append("linked.txt")
+        inventory = self.inventory()
+        self.assertEqual(sorted(row["name"] for row in inventory["not_included"]), links)
+        self.assertEqual({row["reason"] for row in inventory["not_included"]}, {"link"})
+        self.assertFalse(any(row["relative_path"].startswith(tuple(links)) for row in inventory["entries"]))
+        # Remove only the exact synthetic links we just created (never their targets), never recursion.
+        os.rmdir(linked) if os.name == "nt" else linked.unlink()
+        if os.name == "posix":
+            (self.source / "linked.txt").unlink()
+        self.assertTrue((self.source / "notes" / "draft.md").is_file())
+        os.link(self.source / "readme.txt", self.source / "hard.txt")
+        inventory = self.inventory()
+        self.assertEqual([(row["name"], row["reason"]) for row in inventory["not_included"]], [("hard.txt", "hard-link"), ("readme.txt", "hard-link")])
+        self.assertFalse(any(row["relative_path"] in {"hard.txt", "readme.txt"} for row in inventory["entries"]))
+
+    def test_assess_lists_left_out_entries_as_not_included_on_every_platform(self):
+        record = {"kind": "file", "device": 7, "inode": 11, "mode": 0o100600, "size": 5, "mtime_ns": 1, "ctime_ns": 1, "nlink": 1, "sha256": None, "attributes": 0}
+        deep = "d" * 120 + "/" + "e" * 76  # admitted by the root, but r001/<path> exceeds the portable limit
+        left_out = (("What now?.txt", "not-portable"), ("bad\udc80name.txt", "not-portable"), ("linked", "link"), ("f" * 205, "path-too-long"))
+
+        class FakeRoot:
+            """A selected root that lists one ordinary file, one folder and four entries it does not admit."""
+            def __init__(self, path, *, quiet_workspace, max_entries):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *unused):
+                return False
+
+            def inspect(self, relative):
+                return {**record, "relative_path": relative, "kind": "directory", "inode": 1}
+
+            def list_directory(self, relative, *, excluded):
+                if relative:
+                    return [{**record, "relative_path": deep, "inode": 14}]
+                for name, reason in left_out:
+                    scoped_base.exclude(excluded, "", name, reason)
+                return [{**record, "relative_path": "d" * 120, "kind": "directory", "inode": 13}, {**record, "relative_path": "ok.txt", "inode": 12}]
+        with mock.patch.object(storage_ops, "ScopedRoot", FakeRoot):
+            inventory = self.service.assess_storage(roots=[self.source])
+        self.assertEqual([row["relative_path"] for row in inventory["entries"]], ["d" * 120, "ok.txt"])
+        rows = inventory["not_included"]
+        self.assertEqual([(row["root_id"], row["parent"], row["reason"]) for row in rows],
+                         [("r001", "", "not-portable"), ("r001", "", "not-portable"), ("r001", "", "link"), ("r001", "", "path-too-long"), ("r001", "d" * 120, "path-too-long")])
+        # Exact row layouts (F-011): an inventoried entry, a selected root and a not-included row.
+        self.assertEqual(inventory["entries"][1], {"root_id": "r001", "key": "r001/ok.txt", **record, "relative_path": "ok.txt", "inode": 12})
+        self.assertEqual(inventory["roots"], [{"root_id": "r001", "path": str(self.source), "record": {**record, "relative_path": "", "kind": "directory", "inode": 1}}])
+        self.assertEqual(rows[0], {"root_id": "r001", "parent": "", "name": "What now?.txt", "reason": "not-portable"})
+        self.assertNotIn("\udc80", rows[1]["name"])  # escaped for display; the inventory still encodes
+        self.assertEqual(rows[4]["name"], "e" * 76)
+        self.assertEqual(inventory["summary"]["not_included"], 5)
+        self.assertEqual(inventory["summary"]["excluded"], 0)
+        self.assertEqual(inventory["inventory_sha256"], sha256(canonical({key: inventory[key] for key in ("schema", "schema_version", "roots", "entries", "not_included", "limits")})))
+        report = render_storage(inventory)
+        self.assertIn("0 protected entries were excluded", report)
+        broken = {key: value for key, value in inventory.items() if key != "not_included"}
+        with self.assertRaisesRegex(StorageRefusal, "Inventory binding"):
+            self.service.plan_backup(inventory=broken, selected=["r001/ok.txt"], destination=self.output / "broken.zip", content_read_authorized=True)
+        self.assertIn("5 entries were not included", report)
+
+    @unittest.skipUnless(os.name == "posix", "only on posix: how deep a real Windows fixture can go under the 240-unit full-path cap depends "
+                                             "on the checkout path; the storage rule runs everywhere in the fake-root test and the Windows "
+                                             "backend's in W-IO's test_windows_io")
+    def test_path_beyond_portable_limit_is_not_included(self):
+        deep = self.source / ("d" * 120) / ("e" * 90)
+        deep.mkdir(parents=True)
+        (deep / "unopened.txt").write_bytes(b"fictional entry beyond the portable path limit")
+        inventory = self.inventory()
+        long_path = ("d" * 120) + "/" + ("e" * 90)
+        self.assertEqual(inventory["not_included"], [{"root_id": "r001", "parent": "d" * 120, "name": "e" * 90, "reason": "path-too-long"}])
+        self.assertFalse(any(row["relative_path"].startswith(long_path) for row in inventory["entries"]))
+        self.assertEqual((inventory["summary"]["not_included"], inventory["summary"]["excluded"]), (1, 0))
+        plan = self.service.plan_backup(inventory=inventory, selected=["r001/readme.txt"],
+                                        destination=self.output / "fictional.zip", content_read_authorized=True)
+        self.assertIn({"key": "r001/" + long_path, "kind": "not_included", "reason": "path longer than the portable limit; not included"}, plan["skipped"])
+
+    def test_restore_whose_paths_would_exceed_the_portable_limit_is_refused_at_plan_time(self):
+        name = "n" * 96 + ".txt"  # short absolute paths on every backend
+        (self.source / name).write_bytes(b"fictional long-named file")
+        inventory = self.inventory()
+        plan, receipt = self.backup(inventory, ["r001/" + name])
+        with self.assertRaises(StorageRefusal) as caught:
+            self.service.plan_restore(receipt=receipt, destination=self.output / ("restored-" + "x" * 90))
+        self.assertEqual(caught.exception.code, "path-too-long")
+        self.assertFalse((self.output / ("restored-" + "x" * 90)).exists())
+        self.assertFalse(list(self.output.glob("attempt-restore-*")))
+        restore = self.service.plan_restore(receipt=receipt, destination=self.output / "r")
+        self.assertTrue(self.service.restore_backup(plan=restore, expected_plan_sha256=plan_sha256(restore))["verified"])
 
 
 if __name__ == "__main__":

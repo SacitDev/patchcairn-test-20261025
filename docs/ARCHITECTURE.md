@@ -20,7 +20,7 @@ flowchart TD
     Records[Assessment ledger and report snapshot] -. exact immutable evidence reference only .-> Engine
 ```
 
-`scripts/workflow_core.py` validates conversation sessions and implements fixed command handlers. `scripts/patchcairn_workflow.py` supplies human terminal output; its no-argument or bare-start menu creates no session. `templates/workflows.json` and `templates/session-contract.json` describe the public contract. Executable code still enforces schemas, stage checks and adapter allowlists; editing a template cannot extend them.
+`scripts/workflow_core.py` validates conversation sessions and implements fixed command handlers. `scripts/patchcairn_workflow.py` supplies human terminal output; its no-argument or bare-start menu creates no session. `templates/workflows.json` describes the public contract. Executable code still enforces schemas, stage checks and adapter allowlists; editing a template cannot extend them.
 
 Human output begins **PatchCairn — Developed by Michael** and presents the four jobs, guided/automatic control, independent now/scheduled timing, selectable checkpoints, privacy limits and all commands. Commands use `PatchCairn: start`, `help`, `status`, `options`, `cost`, `settings`, `pause`, `resume`, `stop` and `resolve`. Host slash commands retain their host meaning. Validated state and fixed templates produce explanations; JSON envelopes, IDs and hashes are internal bookkeeping rather than a user editing interface. Decision cards explain meaning, benefits, drawbacks, known or unknown costs, reversibility and a recommendation.
 

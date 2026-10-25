@@ -15,9 +15,12 @@ import uuid
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).absolute().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
-from workflow_core import WorkflowEngine, WorkflowRefusal, PrivacyCapabilityHold, digest, encoded, utc_now
-from workflow_service import WorkflowService, ServiceRefusal, native_platform
+from workflow_core import WorkflowEngine, WorkflowRefusal, PrivacyCapabilityHold, digest, encoded
+import pc_records
+from clock_helpers import start_forward_only_clock, utc_now
+from workflow_service import WorkflowService, ServiceRefusal, native_platform, verify_storage_artifact
 from storage_ops import StorageService, StorageRefusal
+import diagnostic_core
 from diagnostic_core import DiagnosticRefusal
 from scoped_fs import ScopedFSError, ScopedRoot
 from private_workspace import PrivateWorkspaceError, ensure_private_directory, ensure_private_file, write_private_new
@@ -27,9 +30,19 @@ PRIVATE_CAPABILITY_HOLDS = frozenset({
     "private-linux-foreign-filesystem", "private-linux-abi-unavailable", "private-linux-libc-unavailable", "private-linux-descriptor-unavailable",
 })
 
-if os.name == "nt":
-    import windows_scoped
-    windows_scoped._WORK_ROOT = ROOT / "work" / "sv-rpc"
+def broad_namespace_fixture(namespace):
+    """Make a new fixture folder broad when this host created it private: POSIX mode 0755 (an attack fixture, never
+    runtime remediation). A Windows folder that inherits a private DACL cannot be made broad without changing an ACL."""
+    if os.name != "posix":
+        raise AssertionError("The fixture parent already inherits a private DACL; no ACL is broadened for the test")
+    namespace.chmod(0o755)
+    try:
+        ensure_private_directory(namespace)
+    except PrivateWorkspaceError as exc:
+        if exc.code != "private-owner-or-mode-refused":
+            raise
+    else:
+        raise AssertionError("A 0755 folder was admitted as private")
 
 
 PROSE = dict(target="Selected fictional file", benefit="Preserve selected example contents", risk="A synthetic file can change",
@@ -37,7 +50,7 @@ PROSE = dict(target="Selected fictional file", benefit="Preserve selected exampl
 INSTALLER_BYTES = b"Fictional immutable installer artifact; never execute."
 
 
-class ExternalHandoffDrainTests(unittest.TestCase):
+class ExternalHandoffOrderTests(unittest.TestCase):
     """Fictional service ordering only; no files, child process or installer."""
     def prepared(self, *, mode="fixture", platform="windows"):
         events, written = [], {}
@@ -45,10 +58,10 @@ class ExternalHandoffDrainTests(unittest.TestCase):
                  "status": "active", "stage": "apply", "operations": {}}
         operation = {"operation_id": "operation-drain", "action_id": "action-drain",
                      "plan_sha256": "a" * 64, "outcome": None}
-        action = {"action_id": operation["action_id"], "adapter_id": "system.reviewed_external.v3",
+        action = {"action_id": operation["action_id"], "adapter_id": "system.reviewed_external",
                   "adapter_payload_sha256": "b" * 64, "requires_os_consent": True}
         payload = {"external_plan": {"mode": mode, "platform": platform, "fictional": True}}
-        engine = types.SimpleNamespace(_pending=mock.Mock(return_value=False))
+        engine = types.SimpleNamespace(pending_items=mock.Mock(return_value=False))
         engine._external_preflight = mock.Mock(side_effect=lambda: events.append("engine-preflight"))
         def begin(*args, **kwargs):
             events.append("begin-operation")
@@ -90,93 +103,40 @@ class ExternalHandoffDrainTests(unittest.TestCase):
                          precondition_evidence_ids=["fictional-proof"], owner_consent_evidence_id="fictional-consent")
         return service, state, operation, events, written, arguments
 
-    def test_owned_windows_drain_follows_both_preflights_intent_and_status(self):
-        for mode, claimed in (("fixture", "linux"), ("real", "windows")):
-            with self.subTest(mode=mode):
-                service, state, operation, events, written, arguments = self.prepared(mode=mode, platform=claimed)
-                def drain():
-                    self.assertIn(operation["operation_id"], state["operations"])
-                    self.assertIn("intent.json", written)
-                    self.assertEqual(events[-1], "status-1")
-                    events.append("drain")
-                    return True
-                owned = types.SimpleNamespace(shutdown_worker=mock.Mock(side_effect=drain))
-                with mock.patch("workflow_service.native_platform", return_value="windows"), mock.patch.dict(sys.modules, {"windows_scoped": owned}):
-                    result = service.execute_action(state["session_id"], **arguments)
-                self.assertEqual(events, ["sources", "service-preflight", "begin-operation", "engine-preflight", "intent", "status-1", "drain", "status-2", "handoff.json"])
-                owned.shutdown_worker.assert_called_once_with()
-                self.assertEqual(result, written["handoff.json"])
-                self.assertEqual(result["kind"], "reviewed_external_handoff")
-                self.assertEqual(result["mode"], mode)
-                self.assertIsNone(operation["outcome"])
-                service._finish.assert_not_called()
-
-    def test_drain_false_or_ordinary_failure_preserves_consumed_intent_and_no_handoff(self):
-        for case, answer in (("false", False), ("none", None), ("truthy", 1),
-                             ("os-error", OSError("fictional-private-detail")),
-                             ("runtime-error", RuntimeError("fictional-private-detail")), ("missing-api", None)):
-            with self.subTest(case=case):
-                service, state, operation, events, written, arguments = self.prepared()
-                owned = types.SimpleNamespace()
-                if case != "missing-api":
-                    owned.shutdown_worker = mock.Mock(side_effect=answer) if isinstance(answer, Exception) else mock.Mock(return_value=answer)
-                with mock.patch("workflow_service.native_platform", return_value="windows"), mock.patch.dict(sys.modules, {"windows_scoped": owned}):
-                    result = service.execute_action(state["session_id"], **arguments)
-                    with self.assertRaises(ServiceRefusal):
-                        service.execute_action(state["session_id"], **arguments)
-                self.assertEqual(result["outcome"], "failed")
-                self.assertEqual(result["receipt"], {"adapter_invoked": False, "external_handoff_created": False,
-                                 "automatic_retry": False, "reason": "owned-windows-worker-drain-failed"})
-                self.assertEqual(operation["outcome"], "failed")
-                self.assertEqual(len(state["operations"]), 1)
-                self.assertEqual(set(written), {"intent.json"})
-                self.assertIsNone(written["intent.json"]["operation"]["outcome"])
-                self.assertNotIn("fictional-private-detail", json.dumps(result))
-                service.engine.begin_operation.assert_called_once()
-                service.engine.read_session.assert_called_once()
-                service._finish.assert_called_once()
-                if case != "missing-api":
-                    owned.shutdown_worker.assert_called_once_with()
-
-    def test_pause_or_stop_during_drain_blocks_handoff_after_second_status_read(self):
-        for status in ("pause_pending", "stopped"):
-            with self.subTest(status=status):
-                service, state, operation, events, written, arguments = self.prepared()
-                def drain():
-                    events.append("drain")
-                    state["status"] = status
-                    return True
-                owned = types.SimpleNamespace(shutdown_worker=mock.Mock(side_effect=drain))
-                with mock.patch("workflow_service.native_platform", return_value="windows"), mock.patch.dict(sys.modules, {"windows_scoped": owned}):
-                    result = service.execute_action(state["session_id"], **arguments)
-                self.assertEqual(events[-3:], ["drain", "status-2", "finish"])
-                self.assertEqual(result["outcome"], "failed")
-                self.assertEqual(result["receipt"], {"adapter_invoked": False, "external_handoff_created": False,
-                                 "automatic_retry": False, "reason": "owner-state-changed-during-worker-drain"})
-                self.assertEqual(set(written), {"intent.json"})
-                self.assertIsNone(written["intent.json"]["operation"]["outcome"])
-                owned.shutdown_worker.assert_called_once_with()
-
-    def test_nonwindows_native_platform_never_imports_or_drains_windows_helper(self):
+    def test_handoff_follows_both_preflights_intent_and_status_without_any_worker(self):
         ordinary_import = __import__
         def guarded_import(name, *args, **kwargs):
             if name == "windows_scoped":
-                raise AssertionError("POSIX handoff must not import the Windows helper")
+                raise AssertionError("The reviewed handoff must not import or drain a Windows helper")
             return ordinary_import(name, *args, **kwargs)
-        for actual, mode, claimed in (("linux", "fixture", "windows"), ("macos", "real", "macos")):
+        for actual, mode, claimed in (("windows", "fixture", "linux"), ("windows", "real", "windows"), ("linux", "fixture", "windows"), ("macos", "real", "macos")):
             with self.subTest(actual=actual, mode=mode):
                 service, state, operation, events, written, arguments = self.prepared(mode=mode, platform=claimed)
                 with mock.patch("workflow_service.native_platform", return_value=actual), mock.patch("builtins.__import__", side_effect=guarded_import):
                     result = service.execute_action(state["session_id"], **arguments)
                 self.assertEqual(events, ["sources", "service-preflight", "begin-operation", "engine-preflight", "intent", "status-1", "handoff.json"])
                 self.assertEqual(result["kind"], "reviewed_external_handoff")
+                self.assertEqual(written["handoff.json"], result)
                 self.assertIsNone(operation["outcome"])
                 service._finish.assert_not_called()
 
+    def test_owner_pause_after_intent_records_consumed_failure_without_handoff(self):
+        service, state, operation, events, written, arguments = self.prepared()
+        def paused(*args):
+            events.append("status-" + str(service.engine.read_session.call_count))
+            state["status"] = "paused"
+            return state
+        service.engine.read_session.side_effect = paused
+        result = service.execute_action(state["session_id"], **arguments)
+        self.assertEqual(events, ["sources", "service-preflight", "begin-operation", "engine-preflight", "intent", "status-1", "finish"])
+        self.assertEqual(result["outcome"], "failed")
+        self.assertFalse(result["receipt"]["adapter_invoked"])
+        self.assertEqual(set(written), {"intent.json"})
+
     def test_nonordinary_interruption_keeps_intent_and_creates_no_handoff(self):
         service, state, operation, events, written, arguments = self.prepared()
-        owned = types.SimpleNamespace(shutdown_worker=mock.Mock(side_effect=KeyboardInterrupt))
-        with mock.patch("workflow_service.native_platform", return_value="windows"), mock.patch.dict(sys.modules, {"windows_scoped": owned}), self.assertRaises(KeyboardInterrupt):
+        service.engine.read_session.side_effect = KeyboardInterrupt
+        with self.assertRaises(KeyboardInterrupt):
             service.execute_action(state["session_id"], **arguments)
         self.assertEqual(set(written), {"intent.json"})
         self.assertIsNone(operation["outcome"])
@@ -187,14 +147,16 @@ class ExternalHandoffDrainTests(unittest.TestCase):
 class WorkflowServiceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.native_move_supported = True
+        # Capability probes only; a missing capability skips each test with a tagged reason (D-023).
+        cls.native_move_supported, cls.private_hold = True, None
         if os.name == "posix":
             probe = ROOT / "work" / ("sv-probe-" + uuid.uuid4().hex[:16])
             probe.mkdir(parents=True)
             try:
                 WorkflowEngine(probe)
             except PrivacyCapabilityHold as exc:
-                raise unittest.SkipTest("Selected filesystem cannot enforce new private engine namespaces; service actions are held") from exc
+                cls.private_hold = str(exc)
+                return
             base = ROOT / "work" / ("sv-move-" + uuid.uuid4().hex)
             source, output = base / "source", base / "output"
             source.mkdir(parents=True); output.mkdir()
@@ -209,13 +171,16 @@ class WorkflowServiceTests(unittest.TestCase):
                 cls.native_move_supported = False
 
     def setUp(self):
+        if self.private_hold:
+            self.skipTest("only on posix: the selected filesystem cannot enforce new private engine namespaces: " + self.private_hold)
         self.root = ROOT / "work" / ("sv-" + uuid.uuid4().hex[:16])
         self.source = self.root / "work" / "selected"
         self.output = self.root / "work" / "artifacts"
         ensure_private_directory(self.source, create=True, parents=True)
         ensure_private_directory(self.output, create=True)
         write_private_new(self.source / "example.txt", b"Fictional selected file; no host content.\n")
-        self.engine = WorkflowEngine(self.root)
+        start_forward_only_clock(self)
+        self.engine = WorkflowEngine(self.root, verify_artifact=verify_storage_artifact)
         self.service = WorkflowService(self.engine)
         self.scope = {"roots": [str(self.source)], "purpose": "Selected synthetic fixture only"}
         self.sid = self.session()
@@ -244,7 +209,7 @@ class WorkflowServiceTests(unittest.TestCase):
         plan = storage.plan_backup(inventory=inventory, selected=["r001/example.txt"],
                     destination=str(self.output / (suffix + ".zip")), content_read_authorized=True, required_recovery=True)
         return self.service.prepare_storage_action(sid or self.sid, action_id="backup-" + suffix,
-                    adapter_id="storage.backup_create.v3", storage_plan=plan, output_root=str(self.output),
+                    adapter_id="storage.backup_create", storage_plan=plan, output_root=str(self.output),
                     restore_probe_destination=str(self.output / (suffix + "-probe")) if probe else None, **PROSE), plan
 
     def approve(self, action, *, sid=None, purge_choice=False, ack=False):
@@ -274,15 +239,15 @@ class WorkflowServiceTests(unittest.TestCase):
         return sha
 
     def precondition(self, action, sha, *, sid=None, observed_utc=None):
-        if action["adapter_id"] == "system.reviewed_external.v3":
+        if action["adapter_id"] == "system.reviewed_external":
             sid = sid or self.sid
             observed = utc_now()
-            signature = {"schema_version": "patchcairn.publisher.signature.v3", "mode": "fixture", "platform": "windows",
+            signature = {"schema": "patchcairn.publisher.signature", "schema_version": 1, "mode": "fixture", "platform": "windows",
                          "artifact_sha256": digest(INSTALLER_BYTES), "publisher": "Fictional Example Publisher", "status": "verified",
                          "source_id": "publisher_download", "method": "windows.authenticode", "observed_utc": observed}
             signature_id = self.evidence("research", sid=sid, content=encoded(signature), observed_utc=observed)
             observed_metadata = utc_now()
-            metadata = {"schema_version": "patchcairn.installer.metadata.v3", "mode": "fixture", "platform": "windows",
+            metadata = {"schema": "patchcairn.installer.metadata", "schema_version": 1, "mode": "fixture", "platform": "windows",
                         "target_id": "Example.Editor",
                         "artifact_sha256": digest(INSTALLER_BYTES), "publisher": "Fictional Example Publisher", "source_id": "publisher_download",
                         "version": "2.0", "channel": "stable", "architecture": "x64", "installation_scope": "machine", "observed_utc": observed_metadata}
@@ -317,7 +282,7 @@ class WorkflowServiceTests(unittest.TestCase):
         self.assertEqual(inspected["intent"]["payload"]["storage_plan"], native)
         self.assertEqual(inspected["intent"]["action"]["adapter_payload_sha256"], action["adapter_payload_sha256"])
         recovery = result["receipt"]["recovery_evidence"]["evidence_id"]
-        self.engine._recovery(self.state(), [recovery])
+        self.engine.verify_recovery(self.state(), [recovery])
         self.assertIn(str(self.output), self.service.protected_roots())
         self.assertEqual(self.state()["stage"], "apply")
         with self.assertRaises((ServiceRefusal, WorkflowRefusal, StorageRefusal)):
@@ -331,15 +296,15 @@ class WorkflowServiceTests(unittest.TestCase):
             self.service.execute_action(self.sid, action_id=action["action_id"], plan_sha256="f" * 64, precondition_evidence_ids=[])
         other = self.root / "work" / "other-output"
         other.mkdir()
-        for adapter, plan, output in (("storage.permanent_purge.v3", native, self.output),
-                                      ("storage.backup_create.v3", native, other)):
+        for adapter, plan, output in (("storage.purge", native, self.output),
+                                      ("storage.backup_create", native, other)):
             with self.assertRaises((ServiceRefusal, StorageRefusal, ScopedFSError)):
                 self.service.prepare_storage_action(self.sid, action_id="wrong-target", adapter_id=adapter,
                             storage_plan=plan, output_root=str(output), **PROSE)
         altered = copy.deepcopy(native)
         altered["inventory"]["roots"][0]["path"] = str(self.root / "work" / "other-source")
         with self.assertRaises((ServiceRefusal, StorageRefusal)):
-            self.service.prepare_storage_action(self.sid, action_id="wrong-root", adapter_id="storage.backup_create.v3", storage_plan=altered, output_root=str(self.output), **PROSE)
+            self.service.prepare_storage_action(self.sid, action_id="wrong-root", adapter_id="storage.backup_create", storage_plan=altered, output_root=str(self.output), **PROSE)
         self.assertEqual(self.state()["operations"], {})
         self.assertFalse((self.output / "one.zip").exists())
 
@@ -399,11 +364,11 @@ class WorkflowServiceTests(unittest.TestCase):
 
     def test_partial_move_before_step_receipt_keeps_original_mapping_and_unknown(self):
         if not self.native_move_supported:
-            self.skipTest("Selected mounted filesystem refuses native no-overwrite move; no fallback")
+            self.skipTest("only on posix: the selected mounted filesystem refuses native no-overwrite move; no fallback")
         storage = self.storage()
         inventory = storage.assess_storage(roots=[str(self.source)])
         native = storage.plan_cleanup(inventory=inventory, selected=["r001/example.txt"], quarantine_destination=str(self.output / "quarantine"), content_read_authorized=True, recovery_required=False)
-        action = self.service.prepare_storage_action(self.sid, action_id="move-once", adapter_id="storage.cleanup_quarantine.v3", storage_plan=native, output_root=str(self.output), **PROSE)
+        action = self.service.prepare_storage_action(self.sid, action_id="move-once", adapter_id="storage.quarantine", storage_plan=native, output_root=str(self.output), **PROSE)
         sha = self.approve(action)
         original = StorageService._write_json
         def interrupt_step(instance, output, relative, value):
@@ -433,19 +398,19 @@ class WorkflowServiceTests(unittest.TestCase):
         storage = self.storage()
         inventory = storage.assess_storage(roots=[str(self.source)])
         plan = storage.plan_cleanup(inventory=inventory, selected=["r001/example.txt"], quarantine_destination=str(self.output / "quarantine"), content_read_authorized=True, recovery_backup=backup, recovery_verification=restore)
-        action = self.service.prepare_storage_action(sid, action_id="quarantine-selected", adapter_id="storage.cleanup_quarantine.v3", storage_plan=plan, output_root=str(self.output), recovery_evidence_ids=[recovery["evidence_id"]], **PROSE)
+        action = self.service.prepare_storage_action(sid, action_id="quarantine-selected", adapter_id="storage.quarantine", storage_plan=plan, output_root=str(self.output), recovery_evidence_ids=[recovery["evidence_id"]], **PROSE)
         result = self.execute(action, self.approve(action, sid=sid), sid=sid)
         self.assertEqual(result["outcome"], "succeeded")
         return result["receipt"]["native_receipt"], backup, restore
 
     def test_purge_requires_separate_typed_exact_loss_ack_and_preserves_recovery(self):
         if not self.native_move_supported:
-            self.skipTest("Selected mounted filesystem refuses native no-overwrite quarantine prerequisite; no fallback")
+            self.skipTest("only on posix: the selected mounted filesystem refuses the native no-overwrite quarantine prerequisite; no fallback")
         receipt, backup, restore = self.make_recovery_and_quarantine()
         sid = self.session(job="storage_cleanup")
         recovery = self.service.register_recovery(sid, output_root=str(self.output), backup_receipt=backup, restore_receipt=restore)
         plan = self.storage().plan_purge(receipt=receipt)
-        action = self.service.prepare_storage_action(sid, action_id="purge-selected", adapter_id="storage.permanent_purge.v3", storage_plan=plan, output_root=str(self.output), recovery_evidence_ids=[recovery["evidence_id"]], **PROSE)
+        action = self.service.prepare_storage_action(sid, action_id="purge-selected", adapter_id="storage.purge", storage_plan=plan, output_root=str(self.output), recovery_evidence_ids=[recovery["evidence_id"]], **PROSE)
         sha = self.approve(action, sid=sid, purge_choice=True)
         with self.assertRaises(WorkflowRefusal):
             self.execute(action, sha, sid=sid)
@@ -461,26 +426,152 @@ class WorkflowServiceTests(unittest.TestCase):
 
     def test_quarantine_restore_is_fixed_gated_and_verifies_original_bytes(self):
         if not self.native_move_supported:
-            self.skipTest("Selected mounted filesystem refuses native no-overwrite move; no fallback")
+            self.skipTest("only on posix: the selected mounted filesystem refuses native no-overwrite move; no fallback")
         storage = self.storage()
         inventory = storage.assess_storage(roots=[str(self.source)])
         quarantine = storage.plan_cleanup(inventory=inventory, selected=["r001/example.txt"], quarantine_destination=str(self.output / "unbacked-quarantine"), content_read_authorized=True, recovery_required=False)
-        move = self.service.prepare_storage_action(self.sid, action_id="quarantine-unbacked", adapter_id="storage.cleanup_quarantine.v3", storage_plan=quarantine, output_root=str(self.output), **PROSE)
+        move = self.service.prepare_storage_action(self.sid, action_id="quarantine-unbacked", adapter_id="storage.quarantine", storage_plan=quarantine, output_root=str(self.output), **PROSE)
         moved = self.execute(move, self.approve(move))
         self.assertEqual(moved["outcome"], "succeeded")
         receipt = moved["receipt"]["native_receipt"]
         self.assertFalse(receipt["recovery_required"])
         sid = self.session()
         plan = self.storage().plan_quarantine_restore(receipt=receipt)
-        action = self.service.prepare_storage_action(sid, action_id="restore-selected", adapter_id="storage.quarantine_restore.v3", storage_plan=plan, output_root=str(self.output), **PROSE)
+        action = self.service.prepare_storage_action(sid, action_id="restore-selected", adapter_id="storage.quarantine_restore", storage_plan=plan, output_root=str(self.output), **PROSE)
         recovery_id = action["recovery_evidence_ids"][0]
         recovery_row = self.state(sid)["evidence"][recovery_id]
         binding = json.loads((self.engine.work / sid / recovery_row["path"]).read_bytes())
-        self.assertEqual(binding["schema_version"], "patchcairn.quarantine.recovery.v3")
+        self.assertIs(pc_records.require_schema(binding, "patchcairn.quarantine.recovery"), binding)
         self.assertEqual(binding["restore_plan_sha256"], digest(plan))
         result = self.execute(action, self.approve(action, sid=sid), sid=sid)
         self.assertEqual(result["outcome"], "succeeded")
         self.assertEqual((self.source / "example.txt").read_text(), "Fictional selected file; no host content.\n")
+
+    def approved_purge(self):
+        """An approved, acknowledged purge whose recovery is a real verified backup and restoration probe."""
+        if not self.native_move_supported:
+            self.skipTest("only on posix: the selected mounted filesystem refuses the native no-overwrite quarantine prerequisite; no fallback")
+        receipt, backup, restore = self.make_recovery_and_quarantine()
+        sid = self.session(job="storage_cleanup")
+        recovery = self.service.register_recovery(sid, output_root=str(self.output), backup_receipt=backup, restore_receipt=restore)
+        action = self.service.prepare_storage_action(sid, action_id="purge-selected", adapter_id="storage.purge",
+                    storage_plan=self.storage().plan_purge(receipt=receipt), output_root=str(self.output),
+                    recovery_evidence_ids=[recovery["evidence_id"]], **PROSE)
+        sha = self.approve(action, sid=sid, purge_choice=True, ack=True)
+        return sid, action, sha, backup, restore
+
+    def begin(self, sid, action, sha, *, code=None):
+        """The engine's own begin, so its re-check of recovery from disk is exercised without the service preflight;
+        with ``code`` the begin must be refused with exactly that code and start no operation."""
+        evidence = [self.precondition(action, sha, sid=sid)]
+        if code is None:
+            return self.engine.begin_operation(sid, action_id=action["action_id"], plan_sha256=sha, precondition_evidence_ids=evidence)
+        with self.assertRaises(WorkflowRefusal) as caught:
+            self.engine.begin_operation(sid, action_id=action["action_id"], plan_sha256=sha, precondition_evidence_ids=evidence)
+        self.assertEqual(caught.exception.code, code)
+        self.assertEqual(self.state(sid)["operations"], {})
+
+    def test_begin_reverifies_recovery_artifact_from_disk(self):
+        sid, action, sha, backup, _ = self.approved_purge()
+        # The plan was registered and approved against these bytes; begin must read them again.
+        archive = Path(backup["archive"])
+        archive.rename(archive.with_name("moved-after-approval.zip"))
+        self.begin(sid, action, sha, code="recovery-missing")
+        self.assertEqual(self.state(sid)["operations"], {})
+        self.assertTrue((self.output / "quarantine" / "000001").exists())
+
+    def test_begin_refuses_when_recovery_bytes_changed(self):
+        sid, action, sha, _, restore = self.approved_purge()
+        restored = Path(restore["destination"]) / "r001" / "example.txt"
+        restored.write_bytes(restored.read_bytes().upper())
+        self.begin(sid, action, sha, code="recovery-changed")
+        self.assertEqual(self.state(sid)["operations"], {})
+        self.assertTrue((self.output / "quarantine" / "000001").exists())
+
+    def test_begin_refuses_changed_quarantine_mapping(self):
+        if not self.native_move_supported:
+            self.skipTest("only on posix: the selected mounted filesystem refuses native no-overwrite move; no fallback")
+        storage = self.storage()
+        quarantine = storage.plan_cleanup(inventory=storage.assess_storage(roots=[str(self.source)]), selected=["r001/example.txt"],
+                                          quarantine_destination=str(self.output / "quarantine"), content_read_authorized=True,
+                                          recovery_required=False)
+        move = self.service.prepare_storage_action(self.sid, action_id="quarantine-unbacked", adapter_id="storage.quarantine",
+                                                   storage_plan=quarantine, output_root=str(self.output), **PROSE)
+        receipt = self.execute(move, self.approve(move))["receipt"]["native_receipt"]
+        sid = self.session()
+        action = self.service.prepare_storage_action(sid, action_id="restore-selected", adapter_id="storage.quarantine_restore",
+                                                     storage_plan=self.storage().plan_quarantine_restore(receipt=receipt),
+                                                     output_root=str(self.output), **PROSE)
+        sha = self.approve(action, sid=sid)
+        (self.output / "quarantine" / "000001").rename(self.output / "quarantine" / "000002")
+        self.begin(sid, action, sha, code="recovery-changed")
+        self.assertEqual(self.state(sid)["operations"], {})
+        self.assertFalse((self.source / "example.txt").exists())
+
+    def test_begin_refuses_a_changed_quarantine_attempt_record(self):
+        if not self.native_move_supported:
+            self.skipTest("only on posix: the selected mounted filesystem refuses native no-overwrite move; no fallback")
+        storage = self.storage()
+        quarantine = storage.plan_cleanup(inventory=storage.assess_storage(roots=[str(self.source)]), selected=["r001/example.txt"],
+                                          quarantine_destination=str(self.output / "quarantine"), content_read_authorized=True,
+                                          recovery_required=False)
+        move = self.service.prepare_storage_action(self.sid, action_id="quarantine-unbacked", adapter_id="storage.quarantine",
+                                                   storage_plan=quarantine, output_root=str(self.output), **PROSE)
+        receipt = self.execute(move, self.approve(move))["receipt"]["native_receipt"]
+        sid = self.session()
+        action = self.service.prepare_storage_action(sid, action_id="restore-selected", adapter_id="storage.quarantine_restore",
+                                                     storage_plan=self.storage().plan_quarantine_restore(receipt=receipt),
+                                                     output_root=str(self.output), **PROSE)
+        sha = self.approve(action, sid=sid)
+        # Still decodable, with the same plan file and plan digest: only the retained bytes differ.
+        attempt = self.output / receipt["attempt"]
+        record = json.loads(attempt.read_bytes())
+        attempt.write_bytes(json.dumps({**record, "status": record["status"] + " (changed)"}, sort_keys=True, separators=(",", ":")).encode("ascii"))
+        self.begin(sid, action, sha, code="recovery-changed")
+        self.assertFalse((self.source / "example.txt").exists())
+
+    def test_backup_probe_whose_restore_paths_exceed_the_portable_limit_is_refused_before_the_backup(self):
+        name = "n" * 96 + ".txt"
+        write_private_new(self.source / name, b"Fictional long-named file.\n")
+        storage = self.storage()
+        plan = storage.plan_backup(inventory=storage.assess_storage(roots=[str(self.source)]), selected=["r001/" + name],
+                                   destination=str(self.output / "long.zip"), content_read_authorized=True, required_recovery=True)
+        with self.assertRaises(ServiceRefusal) as caught:
+            self.service.prepare_storage_action(self.sid, action_id="backup-long", adapter_id="storage.backup_create", storage_plan=plan,
+                                                output_root=str(self.output), restore_probe_destination=str(self.output / ("probe-" + "x" * 92)), **PROSE)
+        self.assertEqual(caught.exception.code, "path-too-long")
+        self.assertFalse((self.output / "long.zip").exists())
+        action = self.service.prepare_storage_action(self.sid, action_id="backup-long", adapter_id="storage.backup_create", storage_plan=plan,
+                                                     output_root=str(self.output), restore_probe_destination=str(self.output / "p"), **PROSE)
+        self.assertEqual(action["adapter_id"], "storage.backup_create")
+
+    def test_external_receipt_before_the_start_is_a_clock_step_or_stale(self):
+        # D-056: ordering keeps no tolerance; a gap within pc_records' future-skew bound is reported as a clock step.
+        sid, action, plan = self.external()
+        handoff = self.execute(action, self.approve(action, sid=sid), sid=sid)
+        started = datetime.fromisoformat(self.state(sid)["operations"][handoff["operation_id"]]["started_utc"].replace("Z", "+00:00"))
+        for seconds, code in ((1, "clock-step"), (pc_records.FUTURE_SKEW_SECONDS + 5, "service-refusal")):
+            receipt = self.external_receipt(sid, handoff)
+            receipt["observed_utc"] = (started - timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            with self.subTest(seconds=seconds), self.assertRaises(ServiceRefusal) as caught:
+                self.service.complete_external(sid, operation_id=handoff["operation_id"], actual_receipt=receipt, coordinator_observed=True)
+            self.assertEqual(caught.exception.code, code)
+        self.assertIn("clock moved back", diagnostic_core.CLOCK_STEP_MESSAGE)
+        self.assertIsNone(self.state(sid)["operations"][handoff["operation_id"]]["outcome"])
+
+    def test_storage_verifier_refuses_a_backup_that_does_not_cover_the_purge(self):
+        if not self.native_move_supported:
+            self.skipTest("only on posix: the selected mounted filesystem refuses the native no-overwrite quarantine prerequisite; no fallback")
+        receipt, backup, restore = self.make_recovery_and_quarantine()
+        binding = {"kind": "backup_recovery", "output_root": str(self.output), "backup_receipt": backup, "restore_receipt": restore, "purge_receipt": receipt}
+        self.assertIsNone(verify_storage_artifact(binding))
+        uncovered = copy.deepcopy(receipt)
+        uncovered["records"][0]["original"]["sha256"] = "0" * 64
+        for changed, code in (({"purge_receipt": uncovered}, "recovery-changed"), ({"backup_receipt": {**backup, "archive": backup["archive"] + ".missing"}}, "recovery-missing"),
+                              ({"kind": "fictional-unknown"}, "verifier-binding")):
+            with self.subTest(code=code), self.assertRaises(pc_records.Refusal) as caught:
+                verify_storage_artifact({**binding, **changed})
+            self.assertEqual(caught.exception.code, code)
 
     def test_recovery_boolean_or_changed_probe_cannot_supply_recovery(self):
         backup_action, native = self.backup_action(probe=True)
@@ -513,7 +604,7 @@ class WorkflowServiceTests(unittest.TestCase):
         action = self.service.prepare_diagnostic_action(sid, action_id="windows-version", recipe_id="windows.os_version", symptom="Fictional error E42", diagnostic_scope=[], **PROSE)
         handoff = self.execute(action, self.approve(action, sid=sid), sid=sid)
         request = handoff["request"]
-        observed = {key: request[key] for key in ("schema_version", "request_id", "platform", "recipe_id", "mode")}
+        observed = {key: request[key] for key in ("schema", "schema_version", "request_id", "platform", "recipe_id", "mode")}
         observed.update(kind="adapter_result", status="observed", observed_utc=utc_now(), facts={"version": "10.0.99999", "build": "99999", "architecture": "x64"},
                         limitations=["Fictional adapter callback; no host collector ran."], provenance=["https://learn.microsoft.com/en-us/windows/win32/cimwin32prov/win32-operatingsystem"])
         with self.assertRaises(ServiceRefusal):
@@ -528,9 +619,9 @@ class WorkflowServiceTests(unittest.TestCase):
     def external(self, *, sid=None):
         sid = sid or self.session(job="security_updates", platform="windows")
         provenance = self.evidence("research", {"official_sources_checked": True, "applicability_checked": True}, sid=sid)
-        recovery = {"schema_version": "patchcairn.external.recovery.v3", "strategy": "no_verified_rollback", "evidence_ids": [], "limits": "No verified rollback is claimed for this synthetic handoff."}
-        verification = {"schema_version": "patchcairn.external.verification.v3", "original_success_condition": "Selected fictional application reports the reviewed version and opens the example.", "checks": [{"check_id": "selected-behavior", "description": "Observe the selected fictional version and original behavior", "expected_result": "Reviewed version and successful original example operation"}]}
-        plan = {"schema_version": "patchcairn.external.plan.v3", "kind": "update", "platform": "windows", "mode": "fixture", "catalog_id": "windows.msiexec.install", "official_tool": "msiexec.exe", "targets": ["Example.Editor"],
+        recovery = {"schema": "patchcairn.external.recovery", "schema_version": 1, "strategy": "no_verified_rollback", "evidence_ids": [], "limits": "No verified rollback is claimed for this synthetic handoff."}
+        verification = {"schema": "patchcairn.external.verification", "schema_version": 1, "original_success_condition": "Selected fictional application reports the reviewed version and opens the example.", "checks": [{"check_id": "selected-behavior", "description": "Observe the selected fictional version and original behavior", "expected_result": "Reviewed version and successful original example operation"}]}
+        plan = {"schema": "patchcairn.external.plan", "schema_version": 1, "kind": "update", "platform": "windows", "mode": "fixture", "catalog_id": "windows.msiexec.install", "official_tool": "msiexec.exe", "targets": ["Example.Editor"],
                 "target_versions": {"Example.Editor": "2.0"},
                 "target_identities": {"Example.Editor": {"channel": "stable", "architecture": "x64", "publisher": "Fictional Example Publisher", "content_sha256": digest(INSTALLER_BYTES), "source_id": "publisher_download", "installation_scope": "machine"}},
                 "argv": ["/i", str(self.output / "fictional-installer.msi"), "/passive", "/norestart"],
@@ -544,34 +635,24 @@ class WorkflowServiceTests(unittest.TestCase):
         operation = self.state(sid)["operations"][handoff["operation_id"]]
         evidence = self.evidence("outcome", {**{k: operation[k] for k in ("operation_id", "action_id", "plan_sha256")}, "outcome": "succeeded"}, sid=sid,
                     content=encoded({"fictional_actual_target": "2.0", "original_behavior": "passed"}))
-        return {"schema_version": "patchcairn.external.receipt.v3", "operation_id": operation["operation_id"], "action_id": operation["action_id"], "plan_sha256": operation["plan_sha256"],
+        return {"schema": "patchcairn.external.receipt", "schema_version": 1, "operation_id": operation["operation_id"], "action_id": operation["action_id"], "plan_sha256": operation["plan_sha256"],
                 "adapter_payload_sha256": handoff["adapter_payload_sha256"], "mode": "fixture", "platform": "windows", "catalog_id": "windows.msiexec.install", "observed_utc": utc_now(), "outcome": "succeeded", "tool_exit_code": 0, "postcondition_state": "verified", "evidence_ids": [evidence], "observed_effects": ["Fictional selected application changed to the reviewed version."], "limitations": ["Synthetic callback; no real application was updated."]}
 
-    @unittest.skipUnless(os.name == "nt", "Windows owned-worker external handoff drain")
-    def test_failed_owned_worker_drain_records_consumed_failure_without_handoff(self):
-        import windows_scoped
-        self.addCleanup(lambda: self.assertIs(windows_scoped.shutdown_worker(), True))
-        sid, action, plan = self.external()
-        sha = self.approve(action, sid=sid)
-        with mock.patch("windows_scoped.shutdown_worker", return_value=False) as drain:
-            result = self.execute(action, sha, sid=sid)
-            self.assertEqual(result["outcome"], "failed")
-            self.assertEqual(result["receipt"], {"adapter_invoked": False, "external_handoff_created": False,
-                             "automatic_retry": False, "reason": "owned-windows-worker-drain-failed"})
-            operation = self.state(sid)["operations"][result["operation_id"]]
-            self.assertEqual(operation["outcome"], "failed")
-            self.assertEqual(self.state(sid)["status"], "held")
-            directory = self.service._operation_dir(sid, result["operation_id"])
-            intent = (directory / "intent.json").read_bytes()
-            self.assertFalse((directory / "handoff.json").exists())
-            self.assertFalse((directory / "entered.json").exists())
-            with self.assertRaises(ServiceRefusal):
-                self.service.execute_action(sid, action_id=action["action_id"], plan_sha256=sha,
-                            precondition_evidence_ids=[])
-            self.assertEqual((directory / "intent.json").read_bytes(), intent)
-            self.assertEqual(len(self.state(sid)["operations"]), 1)
-            drain.assert_called_once_with()
-
+    def test_service_supplies_storage_verifier(self):
+        with mock.patch("workflow_service.WorkflowEngine") as built:
+            self.assertIs(WorkflowService.default_engine(), built.return_value)
+        built.assert_called_once_with(verify_artifact=verify_storage_artifact)
+        # A service built without an engine uses that default.
+        with mock.patch.object(WorkflowService, "default_engine", return_value=self.engine) as default:
+            self.assertIs(WorkflowService().engine, self.engine)
+        default.assert_called_once_with()
+        # An engine built elsewhere without a verifier gets the storage verifier; any other verifier is refused.
+        bare = WorkflowEngine(self.root)
+        self.assertIsNone(bare.verify_artifact)
+        self.assertIs(WorkflowService(bare).engine.verify_artifact, verify_storage_artifact)
+        with self.assertRaises(ServiceRefusal) as caught:
+            WorkflowService(WorkflowEngine(self.root, verify_artifact=lambda binding: None))
+        self.assertEqual(caught.exception.code, "verifier-contract")
 
     def test_external_handoff_keeps_active_until_actual_callback_and_pause_stop_are_preserved(self):
         for command in ("pause", "stop"):
@@ -609,7 +690,7 @@ class WorkflowServiceTests(unittest.TestCase):
             def boot_record(last_boot):
                 observed = utc_now()
                 return self.evidence("outcome", sid=sid, observed_utc=observed, content=encoded({
-                    "schema_version": "patchcairn.windows.boot.observation.v3", "mode": "fixture", "platform": "windows",
+                    "schema": "patchcairn.windows.boot.observation", "schema_version": 1, "mode": "fixture", "platform": "windows",
                     "observed_utc": observed, "last_boot_utc": last_boot, "source": "windows.cim_last_boot_up_time"}),
                     facts={**{key: operation[key] for key in ("operation_id", "action_id", "plan_sha256")}, "outcome": "unknown"})
             before = boot_record(old_boot)
@@ -637,7 +718,7 @@ class WorkflowServiceTests(unittest.TestCase):
                 self.engine.stop(sid)
             after = boot_record(utc_now())
             observed = utc_now()
-            proof = {"schema_version": "patchcairn.restart.verification.v3", "session_id": sid,
+            proof = {"schema": "patchcairn.restart.verification", "schema_version": 1, "session_id": sid,
                      **{key: operation[key] for key in ("operation_id", "action_id", "plan_sha256", "settings_revision")},
                      "scope_sha256": digest(self.scope), "external_plan_sha256": digest(plan), "mode": "fixture", "platform": "windows",
                      "catalog_id": "windows.msiexec.install", "original_exit_code": 3010, "pending_evidence_id": pending["evidence_id"],
@@ -717,7 +798,7 @@ class WorkflowServiceTests(unittest.TestCase):
         sid, action, plan = self.external()
         sha = self.approve(action, sid=sid)
         weakened = {**action, "requires_os_consent": False}
-        payload = self.engine._action_binding(self.state(sid), action)
+        payload = self.engine.action_binding(self.state(sid), action)
         with mock.patch.object(self.service, "_binding", return_value=(weakened, payload)), mock.patch.object(self.service, "_external_preflight") as check, mock.patch.object(self.engine, "begin_operation") as begin:
             with self.assertRaisesRegex(ServiceRefusal, "protected OS consent"):
                 self.service.execute_action(sid, action_id=action["action_id"], plan_sha256=sha, precondition_evidence_ids=[])
@@ -804,7 +885,7 @@ class ServicePrivacyTests(unittest.TestCase):
 
     @staticmethod
     def fake_engine(root):
-        return types.SimpleNamespace(root=root, marker={"engine_id": "fictional-private-test", "backend": "patchcairn.workflow.python.v3"})
+        return types.SimpleNamespace(root=root, marker={"engine_id": "fictional-private-test", "backend": "patchcairn.workflow.python"}, verify_artifact=verify_storage_artifact)
 
     def test_namespace_refusal_precedes_marker_or_retention_write(self):
         root = self.fixture_root()
@@ -826,7 +907,7 @@ class ServicePrivacyTests(unittest.TestCase):
     def test_control_file_privacy_admission_precedes_content_read(self):
         from workflow_service import _private_read
         target = self.fixture_root() / "fictional-control.json"
-        with mock.patch("workflow_service.ensure_private_file", side_effect=PrivateWorkspaceError("fixture-file-private-hold")), mock.patch("workflow_service._read") as reader:
+        with mock.patch("workflow_service.ensure_private_file", side_effect=PrivateWorkspaceError("fixture-file-private-hold")), mock.patch("workflow_service.read_record_bytes") as reader:
             with self.assertRaises(PrivateWorkspaceError):
                 _private_read(target)
             reader.assert_not_called()
@@ -837,22 +918,22 @@ class ServicePrivacyTests(unittest.TestCase):
         state = {"status": "awaiting_user", "scope_authorization": {"fictional": True}}
         service.work = self.fixture_root()
         service.engine = types.SimpleNamespace(read_session=mock.Mock(return_value=state),
-            _require_schedule_activation=mock.Mock(side_effect=WorkflowRefusal("Current schedule is not due and activated")))
+            require_schedule_activation=mock.Mock(side_effect=WorkflowRefusal("Current schedule is not due and activated")))
         service._lock = mock.Mock(side_effect=nullcontext)
         service.diagnostics = types.SimpleNamespace(create_request=mock.Mock())
         with mock.patch("workflow_service.ensure_private_directory"), self.assertRaises(WorkflowRefusal):
             service.prepare_diagnostic_action("session-fixture", action_id="scheduled-diagnostic", recipe_id="macos.os_version",
                 symptom="Fictional symptom", diagnostic_scope=["os_metadata"], **PROSE)
-        service.engine._require_schedule_activation.assert_called_once_with(state)
+        service.engine.require_schedule_activation.assert_called_once_with(state)
         service.diagnostics.create_request.assert_not_called()
 
     def test_msi_restart_status_is_catalog_specific_and_never_translated_to_zero(self):
         service = object.__new__(WorkflowService)
-        service.engine = types.SimpleNamespace(_evidence=mock.Mock(return_value=[{}]))
+        service.engine = types.SimpleNamespace(evidence_rows=mock.Mock(return_value=[{}]))
         operation = {"operation_id": "fixture-operation", "action_id": "fixture-action", "plan_sha256": "a" * 64, "started_utc": utc_now()}
         intent = {"mode": "fixture", "platform": "windows", "action": {"adapter_payload_sha256": "b" * 64},
                   "payload": {"external_plan": {"catalog_id": "windows.msiexec.install"}}}
-        receipt = {"schema_version": "patchcairn.external.receipt.v3", "operation_id": operation["operation_id"],
+        receipt = {"schema": "patchcairn.external.receipt", "schema_version": 1, "operation_id": operation["operation_id"],
                    "action_id": operation["action_id"], "plan_sha256": operation["plan_sha256"], "adapter_payload_sha256": "b" * 64,
                    "mode": "fixture", "platform": "windows", "catalog_id": "windows.msiexec.install", "observed_utc": utc_now(),
                    "outcome": "installed_restart_pending", "tool_exit_code": 3010, "postcondition_state": "not_verified",
@@ -891,23 +972,23 @@ class ServicePrivacyTests(unittest.TestCase):
                      "restart_pending": {"evidence_id": "pending-fixture", "original_exit_code": 3010}}
         state = {"status": "active", "operations": {operation["operation_id"]: operation}, "pending": {}}
         engine._change = lambda session_id, event, mutate, expected_revision: mutate(copy.deepcopy(state))
-        engine._evidence = mock.Mock(return_value=[])
+        engine.evidence_rows = mock.Mock(return_value=[])
         for outcome in ("succeeded", "failed", "partial"):
             with self.subTest(outcome=outcome), self.assertRaises(WorkflowRefusal):
                 engine.finish_operation("session-fixture", operation_id=operation["operation_id"], outcome=outcome,
                     evidence_ids=["generic-true-facts"], summary="Fictional generic effects flags must not retire the boot requirement.")
             self.assertIsNone(state["operations"][operation["operation_id"]]["outcome"])
-        engine._evidence.assert_not_called()
+        engine.evidence_rows.assert_not_called()
 
     def test_restart_verification_cannot_replace_original_private_receipt_hash(self):
         root = self.fixture_root()
         service = object.__new__(WorkflowService)
         service.root = root
         operation = {"operation_id": "operation-fixture", "started_utc": utc_now(), "outcome": None}
-        intent = {"action": {"adapter_id": "system.reviewed_external.v3"}}
+        intent = {"action": {"adapter_id": "system.reviewed_external"}}
         state = {"session_id": "session-fixture"}
         service.engine = types.SimpleNamespace(work=root / "engine", read_session=mock.Mock(return_value=state),
-            _evidence=mock.Mock(side_effect=[[{"path": "proof.json"}], [{"path": "pending.json"}]]), record_restart_verification=mock.Mock())
+            evidence_rows=mock.Mock(side_effect=[[{"path": "proof.json"}], [{"path": "pending.json"}]]), record_restart_verification=mock.Mock())
         service._lock, service._original_authority = mock.Mock(side_effect=nullcontext), mock.Mock()
         service.inspect_operation = mock.Mock(return_value={"operation": operation, "intent": intent})
         service._external_receipt = mock.Mock(return_value={"observed_utc": utc_now()})
@@ -915,9 +996,9 @@ class ServicePrivacyTests(unittest.TestCase):
         service._finish = mock.Mock()
         original_path = root / "operation" / "external-restart-pending.json"
         content = {root / "engine" / state["session_id"] / "proof.json": encoded({
-                       "schema_version": "patchcairn.restart.verification.v3", "pending_evidence_id": "pending"}),
+                       "schema": "patchcairn.restart.verification", "schema_version": 1, "pending_evidence_id": "pending"}),
                    root / "engine" / state["session_id"] / "pending.json": encoded({
-                       "schema_version": "patchcairn.restart.pending.v3", "native_receipt_relative_path": original_path.relative_to(root).as_posix(), "native_receipt_sha256": "f" * 64}),
+                       "schema": "patchcairn.restart.pending", "schema_version": 1, "native_receipt_relative_path": original_path.relative_to(root).as_posix(), "native_receipt_sha256": "f" * 64}),
                    original_path: encoded({"tool_exit_code": 3010, "outcome": "installed_restart_pending"})}
         with mock.patch("workflow_service._private_read", side_effect=lambda path: content[path]), self.assertRaises(ServiceRefusal):
             service.complete_external_after_restart(state["session_id"], operation_id=operation["operation_id"], actual_receipt={},
@@ -939,15 +1020,16 @@ class ServicePrivacyTests(unittest.TestCase):
                         service.work = root / "service"
                         operation = {"operation_id": "operation-fixture", "outcome": previous_outcome,
                                      "action_id": "action-fixture", "plan_sha256": "c" * 64, "settings_revision": 0,
-                                     "started_utc": utc_now(), "adapter_id": "storage.backup_create.v3", "mutating": True}
+                                     "started_utc": utc_now(), "adapter_id": "storage.backup_create", "mutating": True}
                         state["operations"] = {operation["operation_id"]: operation}
                         payload = {"output_root": str(root / "output"), "protected_roots": [],
-                                   "operation": "storage.backup_create.v3", "storage_plan_sha256": "a" * 64,
+                                   "operation": "storage.backup_create", "storage_plan_sha256": "a" * 64,
                                    "storage_plan": {"fictional": True}}
                         receipt = {"fictional_native_receipt": True}
                         native_path = root / "output" / ("outcome-backup-" + "a" * 64 + ".json")
                         origin_path = service.work / ("origin-" + "a" * 64 + ".json")
                         content = {native_path: encoded(receipt), origin_path: encoded({
+                            "schema": "patchcairn.service", "schema_version": 1, "kind": "native_origin",
                             "operation_id": operation["operation_id"], **state})}
                         blocked_path = native_path
                         if blocked_kind == "probe":
@@ -966,7 +1048,7 @@ class ServicePrivacyTests(unittest.TestCase):
                         def admit(path):
                             if path == blocked_path:
                                 raise refusal
-                        with mock.patch("workflow_service.StorageService") as storage, mock.patch("workflow_service.ensure_private_file", side_effect=admit) as admission, mock.patch("workflow_service._read", side_effect=lambda path, *args: content[path]) as reader:
+                        with mock.patch("workflow_service.StorageService") as storage, mock.patch("workflow_service.ensure_private_file", side_effect=admit) as admission, mock.patch("workflow_service.read_record_bytes", side_effect=lambda path, *args: content[path]) as reader:
                             result = service.reconcile_operation("session-fixture", operation_id=operation["operation_id"])
                         admission.assert_any_call(blocked_path)
                         self.assertNotIn(blocked_path, [call.args[0] for call in reader.call_args_list])
@@ -984,12 +1066,13 @@ class ServicePrivacyTests(unittest.TestCase):
     def test_original_authority_cannot_be_retagged_after_scope_or_settings_change(self):
         root = self.fixture_root()
         operation = {"operation_id": "operation-fixture", "action_id": "action-fixture", "plan_sha256": "c" * 64,
-                     "settings_revision": 0, "started_utc": utc_now(), "adapter_id": "storage.backup_create.v3",
+                     "settings_revision": 0, "started_utc": utc_now(), "adapter_id": "storage.backup_create",
                      "mutating": True, "outcome": "unknown"}
         scope = {"roots": [str(root / "original-source")], "purpose": "Original fictional scope"}
         state = {"session_id": "session-fixture", "engine_id": "engine-fixture", "mode": "fixture", "platform": native_platform(),
                  "settings_revision": 0, "settings": {"scope": scope}, "operations": {operation["operation_id"]: copy.deepcopy(operation)}}
-        intent = {**{key: state[key] for key in ("session_id", "engine_id", "mode", "platform", "settings_revision")},
+        intent = {"schema": "patchcairn.service", "schema_version": 1, "kind": "operation_intent",
+                  **{key: state[key] for key in ("session_id", "engine_id", "mode", "platform", "settings_revision")},
                   "scope": copy.deepcopy(scope), "operation": copy.deepcopy(operation),
                   "action": {"adapter_id": operation["adapter_id"]}, "payload": {}}
         for status in ("active", "paused", "stopped"):
@@ -1034,11 +1117,11 @@ class ServicePrivacyTests(unittest.TestCase):
         for receipt in ({"recovery_required": False}, {"recovery_required": True},
                         {"recovery_required": True, "recovery_backup": {"unrelated": True}}):
             with self.subTest(receipt=receipt), self.assertRaises(ServiceRefusal):
-                WorkflowService._purge_original_recovery({"operation": "storage.permanent_purge.v3", "storage_plan": {"receipt": receipt}})
+                WorkflowService._purge_original_recovery({"operation": "storage.purge", "storage_plan": {"receipt": receipt}})
         service = object.__new__(WorkflowService)
         state = {"status": "active", "stage": "apply", "mode": "fixture", "settings": {"scope": {"roots": []}}}
-        service.engine = types.SimpleNamespace(read_session=mock.Mock(return_value=state), _pending=mock.Mock(return_value=False),
-            _recovery=mock.Mock(side_effect=WorkflowRefusal("Wrong original recovery binding")), begin_operation=mock.Mock())
+        service.engine = types.SimpleNamespace(read_session=mock.Mock(return_value=state), pending_items=mock.Mock(return_value=False),
+            verify_recovery=mock.Mock(side_effect=WorkflowRefusal("Wrong original recovery binding")), begin_operation=mock.Mock())
         service._lock = mock.Mock(side_effect=nullcontext)
         service._state = mock.Mock(return_value=state)
         service.protected_roots = mock.Mock(return_value=[])
@@ -1046,23 +1129,23 @@ class ServicePrivacyTests(unittest.TestCase):
         unbacked = {"kind": "purge", "receipt": {"recovery_required": False}}
         with mock.patch("workflow_service.StorageService") as lower:
             with self.assertRaises(ServiceRefusal):
-                WorkflowService._storage(service, state, {"operation": "storage.permanent_purge.v3", "mode": "fixture",
+                WorkflowService._storage(service, state, {"operation": "storage.purge", "mode": "fixture",
                     "output_root": str(root / "output"), "protected_roots": [], "storage_plan": unbacked,
                     "storage_plan_sha256": digest(unbacked)})
             lower.assert_not_called()
         service._storage = mock.Mock()
-        action = {"action_id": "purge-fixture", "adapter_id": "storage.permanent_purge.v3", "recovery_evidence_ids": ["unrelated-backup"]}
+        action = {"action_id": "purge-fixture", "adapter_id": "storage.purge", "recovery_evidence_ids": ["unrelated-backup"]}
         plan = {"kind": "purge", "receipt": {"recovery_required": True, "recovery_backup": {}, "recovery_verification": {}}}
         service._action = mock.Mock(return_value=action)
         with self.assertRaises(WorkflowRefusal):
             service.prepare_storage_action("session-fixture", action_id=action["action_id"], adapter_id=action["adapter_id"],
                 storage_plan=plan, output_root=str(root / "output"), recovery_evidence_ids=action["recovery_evidence_ids"], **PROSE)
-        service.engine._recovery.assert_called_once_with(state, action["recovery_evidence_ids"], action=action)
-        service.engine._recovery.reset_mock()
+        service.engine.verify_recovery.assert_called_once_with(state, action["recovery_evidence_ids"], action=action)
+        service.engine.verify_recovery.reset_mock()
         service._binding = mock.Mock(return_value=(action, {"operation": action["adapter_id"], "storage_plan": plan, "storage_plan_sha256": digest(plan)}))
         with self.assertRaises(WorkflowRefusal):
             service.execute_action("session-fixture", action_id=action["action_id"], plan_sha256="a" * 64, precondition_evidence_ids=[])
-        service.engine._recovery.assert_called_once_with(state, action["recovery_evidence_ids"], action=action)
+        service.engine.verify_recovery.assert_called_once_with(state, action["recovery_evidence_ids"], action=action)
         service.engine.begin_operation.assert_not_called()
 
     def test_reserved_quarantine_blocks_other_sessions_and_allows_only_exact_receipt_mapping(self):
@@ -1090,18 +1173,18 @@ class ServicePrivacyTests(unittest.TestCase):
                     "output_root": str(target), "mode": "fixture", "protected_roots": [str(output)]}
         restored = {"kind": "quarantine_restore", "receipt": receipt}
         with mock.patch("workflow_service.StorageService") as lower:
-            self.assertIs(service._storage(state, payload("storage.quarantine_restore.v3", restored)), lower.return_value)
+            self.assertIs(service._storage(state, payload("storage.quarantine_restore", restored)), lower.return_value)
             lower.reset_mock()
             wrong = copy.deepcopy(restored); wrong["receipt"]["records"][0]["quarantine_record"]["relative_path"] = "quarantine/000002"
             with self.assertRaises(ServiceRefusal):
-                service._storage(state, payload("storage.quarantine_restore.v3", wrong))
+                service._storage(state, payload("storage.quarantine_restore", wrong))
             lower.assert_not_called()
             with self.assertRaises(ServiceRefusal):
-                service._storage(state, payload("storage.backup_create.v3", {"kind": "backup", "inventory": original["inventory"]}))
+                service._storage(state, payload("storage.backup_create", {"kind": "backup", "inventory": original["inventory"]}))
             lower.assert_not_called()
             selected_reserved = {"kind": "backup", "inventory": {"roots": [{"path": str(output)}]}}
             with self.assertRaises(ServiceRefusal):
-                service._storage(state, payload("storage.backup_create.v3", selected_reserved, other_output))
+                service._storage(state, payload("storage.backup_create", selected_reserved, other_output))
             lower.return_value.check_preconditions.assert_not_called()
         inventory = object.__new__(StorageService)
         inventory.output_root, inventory.protected_roots = other_output, (output,)
@@ -1119,7 +1202,7 @@ class ServicePrivacyTests(unittest.TestCase):
             service = WorkflowService(engine)
         except PrivateWorkspaceError as exc:
             if os.name == "posix" and exc.code in PRIVATE_CAPABILITY_HOLDS:
-                self.skipTest("Actual private namespace unavailable; pure reservation boundaries run separately")
+                self.skipTest("only on posix: actual private namespace unavailable; pure reservation boundaries run separately")
             raise
         output = root / "work" / "quarantine-output"
         ensure_private_directory(output, create=True)
@@ -1127,20 +1210,21 @@ class ServicePrivacyTests(unittest.TestCase):
                 "files": [{"sha256": "b" * 64}], "quarantine_relative": "quarantine",
                 "quarantine_destination": str(output / "quarantine"), "recovery_required": False,
                 "recovery_backup": None, "recovery_verification": None}
-        payload = {"operation": "storage.cleanup_quarantine.v3", "storage_plan": plan,
+        payload = {"operation": "storage.quarantine", "storage_plan": plan,
                    "storage_plan_sha256": digest(plan), "output_root": str(output), "mode": "fixture", "protected_roots": []}
         state = {"engine_id": engine.marker["engine_id"], "session_id": "session-fixture", "mode": "fixture",
                  "platform": native_platform(), "status": "active", "stage": "apply"}
         action = {"action_id": "quarantine-fixture", "adapter_id": payload["operation"], "adapter_payload_sha256": digest(payload)}
         operation = {"operation_id": "operation-fixture", "action_id": action["action_id"], "plan_sha256": "a" * 64}
-        engine.read_session, engine._pending = mock.Mock(return_value=state), mock.Mock(return_value=False)
+        engine.read_session, engine.pending_items = mock.Mock(return_value=state), mock.Mock(return_value=False)
         engine.begin_operation = mock.Mock(return_value={"data": operation})
         service._state, service._binding = mock.Mock(return_value=state), mock.Mock(return_value=(action, payload))
         native = mock.Mock()
         service._storage = mock.Mock(return_value=native)
         def persist_intent(*args):
             path = service._operation_dir(state["session_id"], operation["operation_id"], create=True)
-            intent = {"payload": payload, "action": action, "operation": operation, "quarantine_mapping": service._quarantine_mapping(plan)}
+            intent = {"schema": "patchcairn.service", "schema_version": 1, "kind": "operation_intent", "payload": payload,
+                      "action": action, "operation": operation, "quarantine_mapping": service._quarantine_mapping(plan)}
             service._immutable(path / "intent.json", intent)
             return path, intent
         service._intent = mock.Mock(side_effect=persist_intent)
@@ -1189,16 +1273,16 @@ class ServicePrivacyTests(unittest.TestCase):
         root = self.fixture_root()
         namespace = root / "work" / "services"
         namespace.mkdir(parents=True)
-        before = namespace.stat().st_mode
         try:
             ensure_private_directory(namespace)
         except PrivateWorkspaceError as exc:
             if exc.code in PRIVATE_CAPABILITY_HOLDS - {"private-owner-or-mode-refused", "private-linux-foreign-filesystem"}:
-                self.skipTest("Native private-ACL admission unavailable; refusal is covered separately")
+                self.skipTest("only on posix: native private-ACL admission unavailable; refusal is covered separately")
             if exc.code not in {"private-owner-or-mode-refused", "private-dacl-unprotected", "private-dacl-broad-or-unknown", "private-linux-foreign-filesystem"}:
                 raise
         else:
-            self.skipTest("This parent already gives the fixture private permissions")
+            broad_namespace_fixture(namespace)
+        before = namespace.stat().st_mode
         with self.assertRaises(PrivateWorkspaceError):
             WorkflowService(self.fake_engine(root))
         self.assertEqual(namespace.stat().st_mode, before)
@@ -1207,10 +1291,10 @@ class ServicePrivacyTests(unittest.TestCase):
     def test_neutral_default_and_explicit_service_namespaces_do_not_adopt_old_records(self):
         root = self.fixture_root()
         try:
-            old = WorkflowService(self.fake_engine(root), work_relative="work/service-v3")
+            old = WorkflowService(self.fake_engine(root), work_relative="work/service-previous")
         except PrivateWorkspaceError as exc:
             if os.name == "posix" and exc.code in PRIVATE_CAPABILITY_HOLDS:
-                self.skipTest("Private namespace unavailable; native refusal covered separately")
+                self.skipTest("only on posix: private namespace unavailable; native refusal covered separately")
             raise
         old_marker = (old.work / "service.json").read_bytes()
         current = WorkflowService(self.fake_engine(root))
@@ -1218,7 +1302,7 @@ class ServicePrivacyTests(unittest.TestCase):
         self.assertEqual(current.work, root / "work/services")
         self.assertEqual(current.diagnostics.base, root / "work/services/diagnostics")
         self.assertEqual(explicit.work, root / "work/selected-service")
-        self.assertEqual(WorkflowService(self.fake_engine(root), work_relative="work/service-v3").work, old.work)
+        self.assertEqual(WorkflowService(self.fake_engine(root), work_relative="work/service-previous").work, old.work)
         self.assertEqual((old.work / "service.json").read_bytes(), old_marker)
         self.assertNotEqual(current.work, old.work)
 

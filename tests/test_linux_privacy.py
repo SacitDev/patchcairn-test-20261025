@@ -252,15 +252,18 @@ class LinuxPrivacyTests(unittest.TestCase):
             self.assertEqual(closed.call_count, 3)
 
 
-@unittest.skipUnless(os.name == "posix" and sys.platform == "linux", "Native Linux runtime unavailable")
+@unittest.skipUnless(os.name == "posix" and sys.platform == "linux", "only on linux: native Linux runtime")
 class NativeSelectedRootTests(unittest.TestCase):
     def test_actual_owned_selected_filesystem_is_admitted_or_explicitly_foreign(self):
-        if not privacy._supported_abi():
-            self.skipTest("Actual Linux ABI is outside the reviewed x86-64 LP64 scope")
-        fixture = ROOT / "work" / "upgrade_v3" / "filesystem" / "privacy_fs" / ("fixture-" + uuid.uuid4().hex)
+        fixture = ROOT / "work" / "test-fixtures" / "filesystem" / "privacy_fs" / ("fixture-" + uuid.uuid4().hex)
         fixture.mkdir(parents=True, mode=0o700)
         expected_foreign = "microsoft" in os.uname().release.casefold() and str(ROOT).startswith("/mnt/")
-        if expected_foreign:
+        if not privacy._supported_abi():
+            # Outside the reviewed x86-64 LP64 ABI the gate holds instead of guessing a struct layout.
+            with self.assertRaises(privacy.LinuxPrivacyHold) as caught:
+                privacy.assert_native_private_filesystem(fixture)
+            self.assertEqual(caught.exception.code, "linux-private-abi-unavailable")
+        elif expected_foreign:
             with self.assertRaises(privacy.LinuxPrivacyHold) as caught:
                 privacy.assert_native_private_filesystem(fixture)
             self.assertEqual(caught.exception.code, "linux-private-foreign-filesystem")
@@ -270,7 +273,7 @@ class NativeSelectedRootTests(unittest.TestCase):
             except privacy.LinuxPrivacyHold as error:
                 if error.code != "linux-private-foreign-filesystem":
                     raise
-                self.skipTest("Actual selected filesystem is outside the reviewed native allowlist")
+                self.skipTest("only on linux: the actual selected filesystem is outside the reviewed native allowlist")
 
 
 if __name__ == "__main__":

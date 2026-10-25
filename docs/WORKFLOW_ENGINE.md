@@ -83,7 +83,7 @@ A broad authorized inventory may be assembled from bounded observations availabl
 
 ## Python API and exact action contract
 
-Import `WorkflowEngine`, `WorkflowRefusal`, `parse_command`, `initial_menu`, `encoded` and `digest` from `scripts/workflow_core.py`. The machine-readable summaries are [workflows](../templates/workflows.json) and [session contract](../templates/session-contract.json). These are descriptive public contracts; changing a template cannot extend the fixed executable allowlist.
+Import `WorkflowEngine`, `WorkflowRefusal`, `parse_command`, `initial_menu`, `encoded` and `digest` from `scripts/workflow_core.py`. The machine-readable summary is [workflows](../templates/workflows.json); the record formats are defined and checked in the code. It is a descriptive public contract; changing a template cannot extend the fixed executable allowlist.
 
 `WorkflowEngine(root=None, *, work_relative="work/sessions", backend="patchcairn.workflow.python.v3")` uses only a named repository `work/` child. The default creates new records under `work/sessions/<session_id>`; changing this default does not discover, adopt, migrate or delete older namespaces. Explicitly selected owned namespaces keep their exact markers and admission checks. A supplied root is for an explicitly owned fixture or installation; it is not a way to migrate existing sessions. Public methods accept a session ID, never a session path. Mutating methods accept optional `expected_revision` to reject stale concurrent callers.
 

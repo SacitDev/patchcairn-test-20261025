@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.0",
+  "schema_version": 1,
   "catalog_kind": "documentation_only",
   "access_review_completed_utc": "2026-10-24T00:56:40Z",
   "scope": "Candidate tools for selected PatchCairn work. This is not installed inventory, a current-version target list, an execution API or permission to install or connect anything.",

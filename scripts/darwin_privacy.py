@@ -15,6 +15,8 @@ import os
 import stat
 import sys
 
+import pc_records
+
 # Apple Libc include/sys/acl.h; these are Darwin values, not Linux ACL values.
 ACL_TYPE_EXTENDED = 0x00000100
 ACL_FIRST_ENTRY = 0
@@ -40,11 +42,8 @@ class _StatFS64(ctypes.Structure):
                 ("f_reserved", ctypes.c_uint32 * 7)]
 
 
-class DarwinPrivacyHold(ValueError):
+class DarwinPrivacyHold(pc_records.Refusal):
     """Categorical privacy refusal; no path, ACL content or native error text."""
-    def __init__(self, code):
-        self.code = code
-        super().__init__(code)
 
 
 def _hold(code):

@@ -13,7 +13,8 @@ import uuid
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).absolute().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
-from diagnostic_core import DiagnosticStore, DiagnosticRefusal, utc_now
+from diagnostic_core import DiagnosticRefusal
+from workflow_service import DiagnosticStore
 from private_workspace import PrivateWorkspaceError, ensure_private_directory
 import diagnostic_posix as adapter
 
@@ -21,6 +22,8 @@ import diagnostic_posix as adapter
 class PosixDiagnosticTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        # Capability probe only; a missing capability skips each test with a tagged reason (D-023).
+        cls.private_hold = None
         if os.name == "posix":
             probe = ROOT / "work" / ("dx-probe-" + uuid.uuid4().hex)
             try:
@@ -28,9 +31,11 @@ class PosixDiagnosticTests(unittest.TestCase):
             except PrivateWorkspaceError as exc:
                 if exc.code not in {"private-owner-or-mode-refused", "private-darwin-acl-capability-unavailable", "private-platform-unavailable", "private-linux-foreign-filesystem", "private-linux-abi-unavailable", "private-linux-libc-unavailable", "private-linux-descriptor-unavailable"}:
                     raise
-                raise unittest.SkipTest("Selected filesystem cannot enforce a new private diagnostic namespace; no recipe is run") from exc
+                cls.private_hold = exc.code
 
     def setUp(self):
+        if self.private_hold:
+            self.skipTest("only on posix: the selected filesystem cannot enforce a new private diagnostic namespace: " + self.private_hold)
         self.root = ROOT / "work" / ("dx-" + uuid.uuid4().hex)
         self.root.mkdir(parents=True)
         self.store = DiagnosticStore(self.root)

@@ -10,7 +10,7 @@ import sys
 sys.dont_write_bytecode = True
 # Isolated Python omits this directory; admit only the trusted sibling location.
 sys.path.insert(0, str(Path(__file__).absolute().parent))
-from workflow_core import JOBS, WorkflowEngine, WorkflowRefusal, PrivacyCapabilityHold, initial_menu, parse_command
+from workflow_core import JOBS, SCHEMA_VERSION, WorkflowEngine, WorkflowRefusal, PrivacyCapabilityHold, initial_menu, older_format_message, parse_command
 
 
 def creation_platform(mode, requested):
@@ -57,10 +57,10 @@ def main(argv=None):
     try:
         parsed = parse_command(command)
         if not parsed["ok"]:
-            result = {"schema_version": 3, "ok": False, "code": parsed["code"], "message": parsed["message"], "session_id": args.session, "revision": None, "data": {}}
+            result = {"schema_version": SCHEMA_VERSION, "ok": False, "code": parsed["code"], "message": parsed["message"], "session_id": args.session, "revision": None, "data": {}}
         elif not args.session and (parsed["command"] == "help" or parsed["command"] == "start" and not (parsed["arguments"] or args.job)):
             # Help needs neither a storage directory nor a registered session.
-            result = {"schema_version": 3, "ok": True, "code": "help", "message": initial_menu(), "session_id": None, "revision": None, "data": {}}
+            result = {"schema_version": SCHEMA_VERSION, "ok": True, "code": "help", "message": initial_menu(), "session_id": None, "revision": None, "data": {}}
         else:
             selected_platform = creation_platform(args.mode, args.platform) if parsed["command"] == "start" and not args.session else args.platform
             engine = WorkflowEngine()
@@ -71,7 +71,11 @@ def main(argv=None):
                 result = engine.dispatch(args.session, command, expected_revision=args.expected_revision)
     except (WorkflowRefusal, OSError, ValueError, TypeError, KeyError) as error:
         storage_unavailable = isinstance(error, PrivacyCapabilityHold)
-        result = {"schema_version": 3, "ok": False, "code": "held", "message": "Work is held: " + str(error) + ". Preserve evidence and review the specific next step; no automatic retry.", "session_id": args.session, "revision": None, "data": {}}
+        if older_format_message(error):
+            # Records in an older format are never migrated; the person reads the plain reason and next step.
+            result = {"schema_version": SCHEMA_VERSION, "ok": False, "code": "older_format", "message": older_format_message(error), "session_id": args.session, "revision": None, "data": {}}
+        else:
+            result = {"schema_version": SCHEMA_VERSION, "ok": False, "code": "held", "message": "Work is held: " + str(error) + ". Preserve evidence and review the specific next step; no automatic retry.", "session_id": args.session, "revision": None, "data": {}}
     if args.json:
         print(json.dumps(result, ensure_ascii=True, allow_nan=False, sort_keys=True))
     else:

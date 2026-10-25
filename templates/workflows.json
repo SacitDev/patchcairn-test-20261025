@@ -1,6 +1,6 @@
 {
-  "schema_version": 3,
-  "backend": "patchcairn.workflow.python.v3",
+  "schema_version": 1,
+  "backend": "patchcairn.workflow.python",
   "attribution": "PatchCairn — Developed by Michael",
   "command_prefix": "PatchCairn:",
   "commands": ["start", "help", "status", "options", "cost", "settings", "pause", "resume", "stop", "resolve"],

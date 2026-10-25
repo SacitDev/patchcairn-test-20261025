@@ -8,8 +8,7 @@ from pathlib import Path
 
 # Explicit sibling import supports isolated -I -S -B without ambient PYTHONPATH.
 sys.path.insert(0, str(Path(__file__).absolute().parent))
-from storage_ops import StorageRefusal, StorageService, render_storage, storage_capabilities
-from scoped_fs import ScopedFSError
+from storage_ops import ScopedFSError, StorageRefusal, StorageService, render_storage, storage_capabilities
 
 
 def main(argv=None):

@@ -1,6 +1,7 @@
 """Fictional diagnostic records only; all fixtures remain in owned work/."""
 from __future__ import annotations
 import copy
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
@@ -13,7 +14,10 @@ import uuid
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).absolute().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
-from diagnostic_core import DiagnosticStore, DiagnosticRefusal, sanitize_text, utc_now, validate_adapter_result
+from diagnostic_core import DiagnosticRefusal, sanitize_text, validate_adapter_result
+from workflow_service import DiagnosticStore
+import pc_records
+from clock_helpers import start_forward_only_clock, utc_now
 from private_workspace import PrivateWorkspaceError, ensure_private_directory, ensure_private_file, write_private_new
 
 PRIVATE_CAPABILITY_HOLDS = frozenset({
@@ -25,6 +29,8 @@ PRIVATE_CAPABILITY_HOLDS = frozenset({
 class DiagnosticCoreTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        # Capability probe only; a missing capability skips each test with a tagged reason (D-023).
+        cls.private_hold = None
         if os.name == "posix":
             probe = ROOT / "work" / ("dc-probe-" + uuid.uuid4().hex)
             try:
@@ -32,9 +38,12 @@ class DiagnosticCoreTests(unittest.TestCase):
             except PrivateWorkspaceError as exc:
                 if exc.code not in PRIVATE_CAPABILITY_HOLDS:
                     raise
-                raise unittest.SkipTest("Selected filesystem cannot enforce new owner-only private namespaces; private records are held") from exc
+                cls.private_hold = exc.code
 
     def setUp(self):
+        if self.private_hold:
+            self.skipTest("only on posix: the selected filesystem cannot enforce new owner-only private namespaces: " + self.private_hold)
+        start_forward_only_clock(self)
         self.root = ROOT / "work" / ("dc-" + uuid.uuid4().hex)
         self.root.mkdir(parents=True)
         self.store = DiagnosticStore(self.root)
@@ -44,7 +53,7 @@ class DiagnosticCoreTests(unittest.TestCase):
         self.id = self.request["request_id"]
 
     def adapter(self, **changes):
-        result = {key: self.request[key] for key in ("schema_version", "request_id", "platform", "recipe_id", "mode")}
+        result = {key: self.request[key] for key in ("schema", "schema_version", "request_id", "platform", "recipe_id", "mode")}
         result.update(kind="adapter_result", status="observed", observed_utc=utc_now(), facts={"product_version": "15.1"},
                       limitations=["Fictional version evidence; application behavior unknown."],
                       provenance=["https://support.apple.com/en-us/109033"])
@@ -88,7 +97,7 @@ class DiagnosticCoreTests(unittest.TestCase):
 
     def test_untrusted_identifiers_and_traversal_refused_before_read(self):
         for value in ("../outside", "diag-" + "0" * 32 + "/secret", "$(malicious)", "C:\\private"):
-            with self.subTest(value=value), mock.patch("diagnostic_core.os.open") as opened:
+            with self.subTest(value=value), mock.patch("workflow_service.os.open") as opened:
                 with self.assertRaises(DiagnosticRefusal):
                     self.store.read_request(value)
                 opened.assert_not_called()
@@ -174,6 +183,39 @@ class DiagnosticCoreTests(unittest.TestCase):
             with self.assertRaises(DiagnosticRefusal):
                 validate_adapter_result(request, bad)
 
+    def test_result_time_tolerates_a_small_clock_step_but_not_a_future_date(self):
+        # WSL2 and NTP can step the clock back between two reads (#80); pc_records' tolerance applies.
+        request = self.store.create_request(platform="windows", recipe_id="windows.update_event_metadata", symptom="Fictional error", scope=[])["record"]
+        result = self.adapter()
+        for key in ("request_id", "platform", "recipe_id"):
+            result[key] = request[key]
+        now = datetime.now(timezone.utc)
+        result.update(facts={"events": []}, provenance=["https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.diagnostics/get-winevent"])
+        clock = (now - timedelta(seconds=1)).isoformat().replace("+00:00", "Z")
+        for ahead, accepted in ((0.5, True), (5, False)):
+            result["observed_utc"] = (now + timedelta(seconds=ahead)).isoformat().replace("+00:00", "Z")
+            with self.subTest(ahead=ahead), mock.patch("pc_records.utc_now", return_value=clock):
+                if accepted:
+                    self.assertEqual(validate_adapter_result(request, result)["facts"], {"events": []})
+                else:
+                    with self.assertRaises(DiagnosticRefusal):
+                        validate_adapter_result(request, result)
+
+    def test_result_before_its_request_is_a_clock_step_or_refused(self):
+        # D-056: ordering keeps no tolerance; a gap within pc_records' future-skew bound is reported as a clock step.
+        request = self.store.create_request(platform="windows", recipe_id="windows.update_event_metadata", symptom="Fictional error", scope=[])["record"]
+        result = self.adapter()
+        for key in ("request_id", "platform", "recipe_id"):
+            result[key] = request[key]
+        result.update(facts={"events": []}, provenance=["https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.diagnostics/get-winevent"])
+        requested = datetime.fromisoformat(request["observed_utc"].replace("Z", "+00:00"))
+        for seconds, code in ((1, "clock-step"), (pc_records.FUTURE_SKEW_SECONDS + 5, "diagnostic-refusal")):
+            result["observed_utc"] = (requested - timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            with self.subTest(seconds=seconds), self.assertRaises(DiagnosticRefusal) as caught:
+                validate_adapter_result(request, result)
+            self.assertEqual(caught.exception.code, code)
+        self.assertEqual(str(caught.exception), "Result must fall between request and current UTC")
+
     def hypothesis(self, evidence_ids=None):
         return {"hypothesis_id": "version-context", "statement": "Version mismatch may explain the error.",
                 "mechanism": "Unknown until behavior is checked.", "original_cause": "Unknown.",
@@ -217,12 +259,9 @@ class DiagnosticCoreTests(unittest.TestCase):
     def test_hardlinks_refused_before_open(self):
         path = self.root / self.receipt["evidence"]["path"]
         extra = path.with_name("fictional-hardlink.json")
-        try:
-            os.link(path, extra)
-        except OSError:
-            self.skipTest("Native hardlink capability unavailable")
+        os.link(path, extra)
         # Keep native namespace admission's descriptor capability checks intact.
-        with mock.patch("diagnostic_core.os", wraps=os) as diagnostic_os:
+        with mock.patch("workflow_service.os", wraps=os) as diagnostic_os:
             with self.assertRaisesRegex(DiagnosticRefusal, "Single-link ordinary file required"):
                 self.store.read_record(self.id, self.receipt["record_id"])
             diagnostic_os.open.assert_not_called()
@@ -231,10 +270,11 @@ class DiagnosticCoreTests(unittest.TestCase):
         target = self.root / "ordinary-target"
         target.mkdir()
         link = self.root / "fictional-link"
-        try:
+        if os.name == "nt":
+            import _winapi  # A junction needs no symbolic-link privilege, so the refusal also runs on Windows.
+            _winapi.CreateJunction(str(target), str(link))
+        else:
             link.symlink_to(target, target_is_directory=True)
-        except OSError:
-            self.skipTest("Native symlink capability unavailable")
         with self.assertRaises(DiagnosticRefusal):
             DiagnosticStore(link)
 
@@ -247,7 +287,7 @@ class DiagnosticPrivacyTests(unittest.TestCase):
 
     def test_namespace_refusal_precedes_private_record_writer(self):
         root = self.fixture_root()
-        with mock.patch("diagnostic_core.ensure_private_directory", side_effect=PrivateWorkspaceError("fixture-private-hold")), mock.patch("diagnostic_core.write_private_new") as writer:
+        with mock.patch("workflow_service.ensure_private_directory", side_effect=PrivateWorkspaceError("fixture-private-hold")), mock.patch("workflow_service.write_private_new") as writer:
             with self.assertRaises(PrivateWorkspaceError):
                 DiagnosticStore(root)
             writer.assert_not_called()
@@ -276,11 +316,15 @@ class DiagnosticPrivacyTests(unittest.TestCase):
             ensure_private_directory(namespace)
         except PrivateWorkspaceError as exc:
             if exc.code in PRIVATE_CAPABILITY_HOLDS - {"private-owner-or-mode-refused", "private-linux-foreign-filesystem"}:
-                self.skipTest("Native private-ACL admission unavailable; refusal is covered separately")
+                self.skipTest("only on posix: native private-ACL admission unavailable; refusal is covered separately")
             if exc.code not in {"private-owner-or-mode-refused", "private-dacl-unprotected", "private-dacl-broad-or-unknown", "private-linux-foreign-filesystem"}:
                 raise
         else:
-            self.skipTest("This parent already gives the fixture a private namespace")
+            # This host created the folder private (umask 077); make the attack fixture broad on POSIX.
+            if os.name != "posix":
+                self.fail("The fixture parent already inherits a private DACL; no ACL is broadened for the test")
+            namespace.chmod(0o755)
+            before = namespace.stat().st_mode
         with self.assertRaises(PrivateWorkspaceError):
             DiagnosticStore(root)
         self.assertEqual(namespace.stat().st_mode, before)
@@ -289,10 +333,10 @@ class DiagnosticPrivacyTests(unittest.TestCase):
     def test_neutral_default_is_separate_from_explicit_old_diagnostic_store(self):
         root = self.fixture_root()
         try:
-            old = DiagnosticStore(root, work_relative="work/diagnostics-v3")
+            old = DiagnosticStore(root, work_relative="work/diagnostics-previous")
         except PrivateWorkspaceError as exc:
             if os.name == "posix" and exc.code in PRIVATE_CAPABILITY_HOLDS:
-                self.skipTest("Private namespace unavailable; native refusal covered separately")
+                self.skipTest("only on posix: private namespace unavailable; native refusal covered separately")
             raise
         receipt = old.create_request(platform="macos", recipe_id="macos.os_version", symptom="Fictional E42", scope=["os_metadata"])
         original = old.evidence_bytes(receipt["record"]["request_id"], receipt["record_id"])
@@ -301,7 +345,7 @@ class DiagnosticPrivacyTests(unittest.TestCase):
         self.assertFalse(list(current.base.iterdir()))
         with self.assertRaises(FileNotFoundError):
             current.read_request(receipt["record"]["request_id"])
-        reopened = DiagnosticStore(root, work_relative="work/diagnostics-v3")
+        reopened = DiagnosticStore(root, work_relative="work/diagnostics-previous")
         self.assertEqual(reopened.evidence_bytes(receipt["record"]["request_id"], receipt["record_id"]), original)
 
     def test_file_privacy_admission_precedes_content_open(self):
@@ -310,10 +354,10 @@ class DiagnosticPrivacyTests(unittest.TestCase):
             store = DiagnosticStore(root)
         except PrivateWorkspaceError as exc:
             if os.name == "posix" and exc.code in PRIVATE_CAPABILITY_HOLDS:
-                self.skipTest("Private namespace unavailable; native refusal covered separately")
+                self.skipTest("only on posix: private namespace unavailable; native refusal covered separately")
             raise
         receipt = store.create_request(platform="macos", recipe_id="macos.os_version", symptom="Fictional E42", scope=["os_metadata"])
-        with mock.patch("diagnostic_core.ensure_private_file", side_effect=PrivateWorkspaceError("fixture-file-private-hold")), mock.patch("diagnostic_core.os.open") as opened:
+        with mock.patch("workflow_service.ensure_private_file", side_effect=PrivateWorkspaceError("fixture-file-private-hold")), mock.patch("workflow_service.os.open") as opened:
             with self.assertRaises(PrivateWorkspaceError):
                 store.read_record(receipt["record"]["request_id"], receipt["record_id"])
             opened.assert_not_called()

@@ -10,19 +10,21 @@ from __future__ import annotations
 
 import hashlib
 import io
-import json
 import os
 import re
 import stat
 import zipfile
 from contextlib import ExitStack
-from datetime import datetime, timezone
 from pathlib import Path
 
+import pc_paths
+import pc_records
+import scoped_base
+import storage_contract
 from scoped_fs import ScopedRoot, ScopedFSError, capabilities
 from private_workspace import PrivateWorkspaceError, ensure_private_directory, ensure_private_file
 
-VERSION = "patchcairn.storage.v3"
+SCHEMA = "patchcairn.storage"
 REPOSITORY_ROOT = Path(__file__).absolute().parent.parent
 MAX_FILE_BYTES = 16 * 1024 * 1024
 MAX_TOTAL_BYTES = 48 * 1024 * 1024
@@ -30,52 +32,54 @@ MAX_ARCHIVE_BYTES = 64 * 1024 * 1024
 MAX_ENTRIES = 10000
 MAX_DEPTH = 48
 HASH_RE = re.compile(r"[0-9a-f]{64}\Z")
-NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,95}\Z")
-PROTECTED_COMPONENTS = frozenset({
-    ".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker", ".git",
-    "appdata", "keychains", "keychain", "credentials", "credential",
-    "passwords", "password", "secrets", "secret", "vault", "wallets",
-    "google-chrome", "chromium", "chrome", "firefox", "mozilla", "edge",
-    "brave", "brave-browser", "safari", "opera", "vivaldi", "tor browser",
-    "chatgpt", "chats", "chat", "sessions", "session", "conversation",
-    "conversations", ".codex", ".claude", ".gemini", "signal", "telegram",
-    "discord", "slack", "teams", "whatsapp", "keyrings", "keyring", "kwalletd", "kwallet",
-    "keepass", "keepassxc", "1password", "bitwarden", "lastpass", "enpass", "dashlane",
-    "gnome-keyring", "gcloud", "gh", "git-credential-manager", "git", "rclone",
-    "identityservice", "identitycache", "microsoft.aad.brokerplugin", "microsoftaccounts",
-    "globalstorage", "workspacestorage", "chatsessions",
-    "windows", "system32", "syswow64", "programdata", "$recycle.bin",
-    "system volume information", "proc", "sys", "dev", "etc", "boot",
-})
-PROTECTED_FILES = frozenset({
-    ".env", ".npmrc", ".pypirc", ".netrc", "_netrc", "id_rsa", "id_dsa",
-    "id_ecdsa", "id_ed25519", "authorized_keys", "known_hosts", "cookies",
-    "cookies.sqlite", "history", "history.db", "login data", "web data",
-    "key4.db", "logins.json", "cert9.db", "credential.json", "credentials.json",
-    "token.json", "tokens.json", "auth.json", "secrets.json", "passwords.json",
-    ".git-credentials", ".gitconfig", ".bash_history", ".zsh_history", ".python_history",
-    ".psql_history", "consolehost_history.txt", "state.vscdb", "access_tokens.db",
-    "credentials.db", "application_default_credentials.json",
-})
-PROTECTED_SUFFIXES = frozenset({".pem", ".key", ".pfx", ".p12", ".kdbx", ".kdb", ".keyring", ".wallet",
-                                ".jks", ".keystore", ".keychain", ".keychain-db"})
-BROWSER_PREFIXES = ("google-chrome", "microsoft-edge", "edge", "chrome", "chromium",
-                    "firefox", "mozilla", "brave", "brave-browser", "safari", "opera", "vivaldi")
+# Plain reasons for entries an assessment lists as not included (scoped_base.EXCLUDED_REASONS, D-025).
+NOT_INCLUDED = {"link": "a link; not included", "special": "a special file; not included",
+                "hard-link": "a file with more than one hard link; not included",
+                "not-portable": "a name that cannot be used on every system; not included",
+                "path-too-long": "path longer than the portable limit; not included",
+                "case-collision": "a name that differs from another only by case or form; not included",
+                scoped_base.MORE_EXCLUDED: "more entries not included"}
 
 
-class StorageRefusal(ValueError):
+class StorageRefusal(pc_records.Refusal):
     """An explicit hold; preserve evidence and do not use a weaker fallback."""
 
+    def __init__(self, message, *, code="storage-refusal"):
+        super().__init__(code, message)
 
-def _now():
-    return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+def _shared(check, *args, **kwargs):
+    """Run a shared pc_records/pc_paths check; its refusal becomes a StorageRefusal with the same code."""
+    try:
+        return check(*args, **kwargs)
+    except (pc_records.Refusal, pc_paths.PathRefusal) as exc:
+        if isinstance(exc, StorageRefusal):
+            raise
+        raise StorageRefusal(str(exc), code=exc.code) from exc
+
+
+def _record(value, kind, message):
+    """A storage record of ``kind``; ``message`` explains a missing or different record."""
+    if not isinstance(value, dict) or value.get("kind") != kind:
+        raise StorageRefusal(message)
+    return _shared(storage_contract.read_storage, value)
+
+
+def decode_storage(data, message):
+    """Strictly decoded hash-bound storage bytes; ``message`` explains a refusal. Every value and every bracket
+    takes at least one byte, so a node cap equal to the byte cap accepts every record its writer produced."""
+    try:
+        return pc_records.decode_strict(data, max_bytes=MAX_ARCHIVE_BYTES, max_nodes=MAX_ARCHIVE_BYTES)
+    except pc_records.Refusal as exc:
+        raise StorageRefusal(message, code=exc.code) from exc
 
 
 def canonical(value):
+    """The canonical record bytes of pc_records.encoded, with a storage refusal."""
     try:
-        return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
-    except (TypeError, ValueError, RecursionError) as exc:
-        raise StorageRefusal("Bounded JSON-compatible data required") from exc
+        return pc_records.encoded(value)
+    except pc_records.Refusal as exc:
+        raise StorageRefusal("Bounded JSON-compatible data required", code=exc.code) from exc
 
 
 def sha256(data):
@@ -87,15 +91,8 @@ def plan_sha256(plan):
 
 
 def _relative(value):
-    if (not isinstance(value, str) or not value or len(value) > 1024 or "\\" in value
-            or "\x00" in value or value.startswith("/") or ":" in value):
-        raise StorageRefusal("A bounded ordinary relative path is required")
-    for part in value.split("/"):
-        if (not part or part in {".", ".."} or part.endswith((".", " "))
-                or any(ord(char) < 32 or ord(char) == 127 for char in part)
-                or re.fullmatch(r"(?i:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?", part)):
-            raise StorageRefusal("Unsafe or ambiguous relative path")
-    return value
+    """A relative path in the one pc_paths grammar."""
+    return _shared(pc_paths.relative, value)
 
 
 def _absolute(value):
@@ -111,15 +108,6 @@ def _within(path, parent):
         return True
     except ValueError:
         return False
-
-
-def _protected(relative):
-    parts = [part.casefold() for part in relative.replace("\\", "/").split("/")]
-    return (any(part in PROTECTED_COMPONENTS for part in parts)
-            or any(part.replace(" ", "-") == prefix or part.replace(" ", "-").startswith(prefix + "-")
-                   for part in parts for prefix in BROWSER_PREFIXES)
-            or any(part in PROTECTED_FILES or part.startswith(".env.") for part in parts)
-            or Path(parts[-1]).suffix in PROTECTED_SUFFIXES)
 
 
 def _limits(value=None):
@@ -145,18 +133,39 @@ def _files(inventory):
 
 
 def _fingerprint(inventory):
-    return sha256(canonical({key: inventory[key] for key in ("schema_version", "roots", "entries", "limits")}))
+    try:
+        return sha256(canonical({key: inventory[key] for key in ("schema", "schema_version", "roots", "entries", "not_included", "limits")}))
+    except (KeyError, TypeError) as exc:
+        raise StorageRefusal("Inventory binding is missing or changed") from exc
+
+
+def restorable(destination_relative, files):
+    """Refuse, before any attempt record or output, a restore whose target path would exceed the portable limit."""
+    if any(not pc_paths.portable(f"{destination_relative}/{row['root_id']}/{row['relative_path']}") for row in files):
+        raise StorageRefusal("A restored path would be longer than the portable limit; choose a shorter destination folder",
+                             code="path-too-long")
 
 
 def _bound_plan(plan, expected, kind):
     if not isinstance(expected, str) or not HASH_RE.fullmatch(expected) or plan_sha256(plan) != expected:
         raise StorageRefusal("The exact reviewed plan hash is required; this is not proof of owner consent")
-    if plan.get("schema_version") != VERSION or plan.get("kind") != kind:
-        raise StorageRefusal("Foreign or wrong-kind storage plan")
+    _record(plan, kind, "Foreign or wrong-kind storage plan")
+
+
+def _storage_value(kind, **fields):
+    return {"schema": SCHEMA, "schema_version": pc_records.SCHEMA_VERSION, "kind": kind, **fields}
+
+
+def attempt_record(operation, plan_sha256, plan_file, plan):
+    """The attempt record of one storage operation: the plan's digest, its hash-bound file and its entry count."""
+    entries = plan.get("files", plan.get("receipt", {}).get("records", []))
+    return {**_storage_value("attempt"), "operation": operation, "plan_sha256": plan_sha256, "plan_file": plan_file,
+            "entry_count": len(entries), "started_utc": pc_records.utc_now(),
+            "status": "attempted; inspect immutable step and outcome receipts before recovery", "automatic_retry": False}
 
 
 def _new_plan(kind, **fields):
-    return {"schema_version": VERSION, "kind": kind, "created_utc": _now(),
+    return {**_storage_value(kind), "created_utc": pc_records.utc_now(),
             "exclusive_workspace_required": True, "not_an_os_sandbox": True, **fields}
 
 
@@ -200,7 +209,11 @@ def render_storage(inventory, *, width=20):
     lines.extend(["", "File size | Files", "--- | ---:"])
     for item in inventory["size_buckets"]:
         lines.append(f"{_display(item['bucket'])} | {item['files']}")
-    lines.extend(["", f"{summary['excluded']} protected entries were excluded before descent or content reads.",
+    lines.extend(["", f"{summary['excluded']} protected entries were excluded before descent or content reads."])
+    if summary["not_included"]:
+        lines.append(f"{summary['not_included']} entries were not included: links, special files, or names and paths that cannot be "
+                     "used on every system. They are listed in the assessment, never opened, and not backed up.")
+    lines.extend([
                   "Next: choose exact files for an optional content comparison or a reviewed backup.",
                   "Equal file bytes do not establish that either file can be removed."])
     return "\n".join(lines)
@@ -224,12 +237,16 @@ class StorageService:
             raise StorageRefusal("Output must be an existing owned child of this toolkit's work directory")
         self._require_private_output()
         self.quiet_workspace = True
-        if protected_roots is not None and (not isinstance(protected_roots, (list, tuple)) or len(protected_roots) > 128):
+        if protected_roots is not None and (not isinstance(protected_roots, (list, tuple)) or len(protected_roots) > storage_contract.MAX_PROTECTED_ROOTS):
             raise StorageRefusal("Protected roots require a bounded explicit path list")
         self.protected_roots = tuple(_absolute(path) for path in (protected_roots or []))
 
-    def _protected_path(self, path):
-        return _protected(path.as_posix()) or any(_within(path, root) for root in self.protected_roots)
+    def _protected_root(self, path):
+        """A selected source root that must be refused: pc_paths' absolute-path floor or a retained root."""
+        return pc_paths.protected_root(str(path)) or any(_within(path, root) for root in self.protected_roots)
+
+    def _protected_entry(self, root, relative):
+        return pc_paths.protected(relative, root=str(root)) or any(_within(root / relative, item) for item in self.protected_roots)
 
     def _scope(self, path):
         self._require_private_output()
@@ -238,7 +255,7 @@ class StorageService:
     @staticmethod
     def _privacy_hold(exc):
         return StorageRefusal("Owner-private storage namespace or file could not be verified (" + exc.code
-                              + "); existing permissions will not be changed. Preserve any attempted outputs and receipts")
+                              + "); existing permissions will not be changed. Preserve any attempted outputs and receipts", code=exc.code)
 
     def _require_private_output(self):
         try:
@@ -324,12 +341,12 @@ class StorageService:
             raise StorageRefusal("Select between one and 32 explicit directory roots")
         paths = sorted((_absolute(root) for root in roots), key=lambda path: os.path.normcase(str(path)))
         for index, path in enumerate(paths):
-            if path == Path(path.anchor) or self._protected_path(path):
+            if path == Path(path.anchor) or self._protected_root(path):
                 raise StorageRefusal("Protected or whole-volume source roots are excluded")
             for earlier in paths[:index]:
                 if _within(path, earlier) or _within(earlier, path):
                     raise StorageRefusal("Overlapping or duplicate source roots are refused")
-        root_rows, entries, identities = [], [], set()
+        root_rows, entries, not_included, identities = [], [], [], set()
         total = 0
         for number, path in enumerate(paths, 1):
             root_id = f"r{number:03d}"
@@ -340,15 +357,23 @@ class StorageService:
                     raise StorageRefusal("Aliased selected roots are refused")
                 identities.add(identity)
                 root_rows.append({"root_id": root_id, "path": str(path), "record": root_record})
+                # D-025: entries the root does not admit are listed as not included (scoped_base rows, names
+                # escaped for display), never opened, and never refuse the whole selection.
+                left_out = []
                 pending = [""]
                 while pending:
                     current = pending.pop()
-                    for record in sorted(source.list_directory(current), key=lambda item: item["relative_path"]):
+                    for record in sorted(source.list_directory(current, excluded=left_out), key=lambda item: item["relative_path"]):
                         rel = _relative(record["relative_path"])
+                        parent, _, name = rel.rpartition("/")
+                        if not pc_paths.portable(f"{root_id}/{rel}"):
+                            # Restores write <destination>/<root id>/<path>; keep that headroom.
+                            scoped_base.exclude(left_out, parent, name, "path-too-long")
+                            continue
                         if len(entries) >= limit["max_entries"] or rel.count("/") >= limit["max_depth"]:
                             raise StorageRefusal("Selected metadata traversal exceeds entry/depth cap; select narrower roots")
                         item = {"root_id": root_id, "key": f"{root_id}/{rel}", **record}
-                        if self._protected_path(path / rel):
+                        if self._protected_entry(path, rel):
                             item["kind"] = "excluded"
                             item["reason"] = "protected browser, session, credential or system boundary"
                         elif record["kind"] == "directory":
@@ -362,6 +387,7 @@ class StorageService:
                         else:
                             raise StorageRefusal("Nonordinary metadata entry; no traversal fallback")
                         entries.append(item)
+                not_included.extend({"root_id": root_id, **row} for row in left_out)
         entries.sort(key=lambda item: item["key"])
         extensions, tree = {}, {}
         buckets = {"0 B": 0, "1 B–1 KiB": 0, "1 KiB–1 MiB": 0, "1 MiB–16 MiB": 0, "over 16 MiB": 0}
@@ -381,11 +407,12 @@ class StorageService:
                 group["logical_bytes"] += size
             bucket = "0 B" if size == 0 else "1 B–1 KiB" if size <= 1024 else "1 KiB–1 MiB" if size <= 1024**2 else "1 MiB–16 MiB" if size <= 16*1024**2 else "over 16 MiB"
             buckets[bucket] += 1
-        inventory = {"schema_version": VERSION, "kind": "inventory", "observed_utc": _now(),
-                     "roots": root_rows, "entries": entries, "limits": limit,
+        inventory = {**_storage_value("inventory"), "observed_utc": pc_records.utc_now(),
+                     "roots": root_rows, "entries": entries, "not_included": not_included, "limits": limit,
                      "summary": {"files": sum(item["kind"] == "file" for item in entries),
                                  "directories": sum(item["kind"] == "directory" for item in entries),
                                  "excluded": sum(item["kind"] == "excluded" for item in entries),
+                                 "not_included": sum(row.get("count", 1) for row in not_included),
                                  "logical_bytes": total, "physical_bytes": None, "reclaimable_bytes": None},
                      "extensions": sorted(extensions.values(), key=lambda row: (-row["logical_bytes"], row["extension"])),
                      "tree": sorted(tree.values(), key=lambda row: row["key"]),
@@ -395,7 +422,8 @@ class StorageService:
         return inventory
 
     def _fresh_inventory(self, inventory):
-        if inventory.get("schema_version") != VERSION or _fingerprint(inventory) != inventory.get("inventory_sha256"):
+        _record(inventory, "inventory", "Inventory binding is missing or changed")
+        if _fingerprint(inventory) != inventory.get("inventory_sha256"):
             raise StorageRefusal("Inventory binding is missing or changed")
         current = self.assess_storage(roots=[item["path"] for item in inventory["roots"]], limits=inventory["limits"])
         if current["inventory_sha256"] != inventory["inventory_sha256"]:
@@ -449,8 +477,8 @@ class StorageService:
         if kind not in {"backup", "restore", "quarantine", "quarantine_restore", "purge"}:
             raise StorageRefusal("Unknown fixed storage operation")
         _bound_plan(plan, expected_plan_sha256, kind)
-        snapshot = {"schema_version": VERSION, "kind": "storage_preconditions", "storage_plan_sha256": expected_plan_sha256,
-                    "operation_kind": kind, "observed_utc": _now(), "output_root": str(self.output_root),
+        snapshot = {**_storage_value("storage_preconditions"), "storage_plan_sha256": expected_plan_sha256,
+                    "operation_kind": kind, "observed_utc": pc_records.utc_now(), "output_root": str(self.output_root),
                     "protected_roots": [str(path) for path in self.protected_roots], "mutation_performed": False}
         with self._scope(self.output_root) as output:
             snapshot["output_root_record"] = output.inspect("")
@@ -487,7 +515,7 @@ class StorageService:
                     if any(row["device"] != snapshot["output_root_record"]["device"] for row in plan["files"]):
                         raise StorageRefusal("Cross-volume quarantine is refused; no copy/delete fallback")
                     if plan["recovery_required"]:
-                        self._verified_recovery(backup=plan["recovery_backup"], restoration=plan["recovery_verification"])
+                        self.verified_recovery(backup=plan["recovery_backup"], restoration=plan["recovery_verification"])
             elif kind == "restore":
                 verified = self.verify_backup(receipt=plan["receipt"])
                 if plan["files"] != verified["manifest"]["files"]:
@@ -504,7 +532,7 @@ class StorageService:
                 self._quarantine_current(plan["receipt"])
                 snapshot["receipt_sha256"] = sha256(canonical(plan["receipt"]))
                 if kind == "purge" and plan["receipt"]["recovery_required"]:
-                    self._verified_recovery(backup=plan["receipt"]["recovery_backup"], restoration=plan["receipt"]["recovery_verification"])
+                    self.verified_recovery(backup=plan["receipt"]["recovery_backup"], restoration=plan["receipt"]["recovery_verification"])
                 if kind == "quarantine_restore":
                     with ExitStack() as stack:
                         sources = self._open_sources(stack, plan["receipt"]["source_roots"])
@@ -555,7 +583,7 @@ class StorageService:
                 expected = {key: value for key, value in item.items() if key not in {"root_id", "key"}}
                 if {**current, "sha256": None} != {**expected, "sha256": None}:
                     raise StorageRefusal("A duplicate candidate changed before comparison completed")
-        return {"schema_version": VERSION, "kind": "duplicates", "inventory_sha256": inventory["inventory_sha256"],
+        return {**_storage_value("duplicates"), "inventory_sha256": inventory["inventory_sha256"],
                 "groups": groups, "content_bytes_read": read_bytes,
                 "logical_byte_opportunity": sum(row["logical_byte_opportunity"] for row in groups),
                 "reclaimable_bytes": None, "removal_authorized": False,
@@ -587,6 +615,9 @@ class StorageService:
                                   if item["kind"] == "directory" else "not selected; not backed up")
                 skipped.append({"key": item["key"], "kind": item["kind"],
                                 "reason": item.get("reason") or (exclusions or {}).get(item["key"], default_reason)})
+        for row in inventory["not_included"]:
+            skipped.append({"key": "/".join(part for part in (row["root_id"], row["parent"], row["name"]) if part),
+                            "kind": "not_included", "reason": NOT_INCLUDED[row["reason"]], **({"count": row["count"]} if "count" in row else {})})
         if exclusions and any(key not in {item["key"] for item in skipped} for key in exclusions):
             raise StorageRefusal("Exclusion reasons may refer only to exact skipped inventory entries")
         return _new_plan("backup", inventory=inventory, files=rows, skipped=skipped,
@@ -603,13 +634,12 @@ class StorageService:
         return self._create_private_file(output, relative, data=canonical(value), max_bytes=MAX_ARCHIVE_BYTES)
 
     def _attempt(self, output, expected, operation, plan):
-        # Exclusive creation consumes a plan even when later validation fails.
+        # Exclusive creation consumes a plan even when later validation fails; the exact plan follows in its
+        # own hash-bound file, so the attempt record keeps only digests and counts (D-017).
         name = f"attempt-{operation}-{expected}.json"
-        self._write_json(output, name, {"schema_version": VERSION, "operation": operation,
-                                     "plan_sha256": expected, "started_utc": _now(),
-                                     "exact_plan": plan,
-                                     "status": "attempted; inspect immutable step and outcome receipts before recovery",
-                                     "automatic_retry": False})
+        plan_file = f"plan-{operation}-{expected}.json"
+        self._write_json(output, name, attempt_record(operation, expected, plan_file, plan))
+        self._write_json(output, plan_file, plan)
         return name
 
     def create_backup(self, *, plan, expected_plan_sha256):
@@ -646,7 +676,7 @@ class StorageService:
             archive_data = buffer.getvalue()
             if len(archive_data) > MAX_ARCHIVE_BYTES:
                 raise StorageRefusal("Backup archive byte cap exceeded")
-            manifest = {"schema_version": VERSION, "kind": "backup_manifest", "created_utc": _now(),
+            manifest = {**_storage_value("backup_manifest"), "created_utc": pc_records.utc_now(),
                         "plan_sha256": expected_plan_sha256, "archive_sha256": sha256(archive_data),
                         "archive_bytes": len(archive_data), "files": plan["files"], "skipped": plan["skipped"],
                         "source_roots": plan["inventory"]["roots"], "required_recovery": plan["required_recovery"],
@@ -656,7 +686,7 @@ class StorageService:
             manifest_rel = destination_rel + ".manifest.json"
             manifest_data = canonical(manifest)
             manifest_record = self._create_private_file(output, manifest_rel, data=manifest_data, max_bytes=MAX_ARCHIVE_BYTES)
-            receipt = {"schema_version": VERSION, "kind": "backup_receipt", "plan_sha256": expected_plan_sha256,
+            receipt = {**_storage_value("backup_receipt"), "plan_sha256": expected_plan_sha256,
                        "archive": str(self.output_root / destination_rel), "archive_record": archive_record,
                        "archive_sha256": sha256(archive_data), "manifest": str(self.output_root / manifest_rel),
                        "manifest_record": manifest_record, "manifest_sha256": sha256(manifest_data),
@@ -664,7 +694,7 @@ class StorageService:
                        "verified": True, "encryption": False, "actual_archive_bytes": len(archive_data),
                        "archive_and_manifest_bytes": len(archive_data) + len(manifest_data),
                        "additional_control_record_bytes": None,
-                       "source_logical_bytes": total, "finished_utc": _now()}
+                       "source_logical_bytes": total, "finished_utc": pc_records.utc_now()}
             # Verify bytes from disk, not just the buffer used to create them.
             self.verify_backup(receipt=receipt)
             self._write_json(output, f"outcome-backup-{expected_plan_sha256}.json", receipt)
@@ -672,14 +702,13 @@ class StorageService:
 
     @staticmethod
     def _verify_zip(data, manifest):
-        if manifest.get("schema_version") != VERSION or manifest.get("kind") != "backup_manifest":
-            raise StorageRefusal("Foreign backup manifest")
+        _record(manifest, "backup_manifest", "Foreign backup manifest")
         if len(data) > MAX_ARCHIVE_BYTES or sha256(data) != manifest["archive_sha256"] or len(data) != manifest["archive_bytes"]:
             raise StorageRefusal("Archive byte/hash mismatch")
         rows = manifest["files"]
         if not rows or len(rows) > MAX_ENTRIES or len({row["entry"] for row in rows}) != len(rows):
             raise StorageRefusal("Invalid manifest entry list")
-        if len({(row["root_id"], row["relative_path"].casefold()) for row in rows}) != len(rows):
+        if len({(row["root_id"], pc_paths.casefold_key(row["relative_path"])) for row in rows}) != len(rows):
             raise StorageRefusal("Case-ambiguous or duplicate restore destinations")
         limit = _limits(manifest["limits"])
         if sum(row["size"] for row in rows) > limit["max_total_bytes"]:
@@ -688,7 +717,7 @@ class StorageService:
             if not re.fullmatch(r"payload/[0-9]{6}", row["entry"]):
                 raise StorageRefusal("Unsafe ZIP entry name")
             _relative(row["relative_path"])
-            if _protected(row["relative_path"]) or not re.fullmatch(r"r[0-9]{3}", row["root_id"]):
+            if pc_paths.protected(row["relative_path"]) or not re.fullmatch(r"r[0-9]{3}", row["root_id"]):
                 raise StorageRefusal("Protected or invalid restore target")
             if type(row["size"]) is not int or not 0 <= row["size"] <= limit["max_file_bytes"] or not HASH_RE.fullmatch(row["sha256"]):
                 raise StorageRefusal("Invalid bounded archive member")
@@ -711,8 +740,7 @@ class StorageService:
         return True
 
     def verify_backup(self, *, receipt):
-        if receipt.get("schema_version") != VERSION or receipt.get("kind") != "backup_receipt":
-            raise StorageRefusal("An exact backup receipt is required")
+        _record(receipt, "backup_receipt", "An exact backup receipt is required")
         archive_rel = self._output_relative(receipt["archive"])
         manifest_rel = self._output_relative(receipt["manifest"])
         with self._scope(self.output_root) as output:
@@ -722,10 +750,7 @@ class StorageService:
             archive_data = output.read_bytes(archive_rel, expected=receipt["archive_record"], max_bytes=MAX_ARCHIVE_BYTES)
         if sha256(manifest_data) != receipt["manifest_sha256"] or sha256(archive_data) != receipt["archive_sha256"]:
             raise StorageRefusal("Stored backup or manifest changed")
-        try:
-            manifest = json.loads(manifest_data)
-        except (json.JSONDecodeError, UnicodeError, RecursionError) as exc:
-            raise StorageRefusal("Invalid bounded backup manifest") from exc
+        manifest = _record(decode_storage(manifest_data, "Invalid bounded backup manifest"), "backup_manifest", "Foreign backup manifest")
         if manifest["plan_sha256"] != receipt["plan_sha256"] or manifest["required_recovery"] != receipt["required_recovery"]:
             raise StorageRefusal("Backup receipt binding changed")
         self._verify_zip(archive_data, manifest)
@@ -747,6 +772,7 @@ class StorageService:
                     raise
             else:
                 raise StorageRefusal("Restore requires a new destination; overwrite is refused")
+        restorable(relative, manifest["files"])
         return _new_plan("restore", receipt=receipt, destination=str(_absolute(destination)),
                          destination_relative=relative, files=manifest["files"], skipped=manifest["skipped"],
                          cost={"logical_bytes_to_write": manifest["source_logical_bytes"], "duration_seconds": None,
@@ -768,6 +794,7 @@ class StorageService:
         relative = self._outside_sources(plan["destination"], verified["manifest"]["source_roots"])
         if relative != plan["destination_relative"]:
             raise StorageRefusal("Restore scope changed")
+        restorable(relative, plan["files"])
         records = []
         with self._scope(self.output_root) as output:
             attempt = self._attempt(output, expected_plan_sha256, "restore", plan)
@@ -786,20 +813,28 @@ class StorageService:
                         raise StorageRefusal("Restored file verification failed")
                     records.append(record)
                     self._write_json(output, f"step-restore-{expected_plan_sha256}-{index:06d}.json", record)
-            receipt = {"schema_version": VERSION, "kind": "restore_receipt", "plan_sha256": expected_plan_sha256,
+            receipt = {**_storage_value("restore_receipt"), "plan_sha256": expected_plan_sha256,
                        "destination": plan["destination"], "records": records, "verified": True,
                        "backup_plan_sha256": plan["receipt"]["plan_sha256"],
                        "backup_archive_sha256": plan["receipt"]["archive_sha256"],
                        "backup_manifest_sha256": plan["receipt"]["manifest_sha256"],
                        "files": plan["files"],
-                       "skipped": plan["skipped"], "attempt": attempt, "finished_utc": _now()}
+                       "skipped": plan["skipped"], "attempt": attempt, "finished_utc": pc_records.utc_now()}
             self._write_json(output, f"outcome-restore-{expected_plan_sha256}.json", receipt)
             return receipt
 
-    def _verified_recovery(self, *, backup, restoration):
+    def artifact_sha256(self, relative):
+        """SHA-256 of a private record below the output root, read through the pinned root after privacy admission."""
+        relative = _relative(relative)
+        self._private_created_file(relative)
+        with self._scope(self.output_root) as output:
+            return output.inspect(relative, hash_file=True, max_bytes=MAX_ARCHIVE_BYTES)["sha256"]
+
+    def verified_recovery(self, *, backup, restoration):
         manifest = self.verify_backup(receipt=backup)["manifest"]
-        if (not isinstance(restoration, dict) or restoration.get("schema_version") != VERSION
-                or restoration.get("kind") != "restore_receipt" or restoration.get("verified") is not True
+        required = "Required recovery needs a completed exact restoration probe and its immutable outcome"
+        _record(restoration, "restore_receipt", required)
+        if (restoration.get("verified") is not True
                 or restoration.get("backup_plan_sha256") != backup["plan_sha256"]
                 or restoration.get("backup_archive_sha256") != backup["archive_sha256"]
                 or restoration.get("backup_manifest_sha256") != backup["manifest_sha256"]
@@ -807,7 +842,7 @@ class StorageService:
                 or not HASH_RE.fullmatch(restoration["plan_sha256"])
                 or restoration.get("files") != manifest["files"]
                 or len(restoration.get("records", [])) != len(manifest["files"])):
-            raise StorageRefusal("Required recovery needs a completed exact restoration probe and its immutable outcome")
+            raise StorageRefusal(required)
         destination = self._output_relative(restoration["destination"])
         outcome = "outcome-restore-" + restoration["plan_sha256"] + ".json"
         with self._scope(self.output_root) as output:
@@ -847,7 +882,7 @@ class StorageService:
         if recovery_required:
             if recovery_backup is None:
                 raise StorageRefusal("Required recovery has not been verified; create and verify the exact backup first")
-            manifest = self._verified_recovery(backup=recovery_backup, restoration=recovery_verification)
+            manifest = self.verified_recovery(backup=recovery_backup, restoration=recovery_verification)
             backed = {(row["root_id"], row["relative_path"], row["sha256"], row["size"]) for row in manifest["files"]}
             if manifest["source_roots"] != inventory["roots"] or any((row["root_id"], row["relative_path"], row["sha256"], row["size"]) not in backed for row in rows):
                 raise StorageRefusal("Required backup does not cover the exact selected identities/content/scope")
@@ -877,7 +912,7 @@ class StorageService:
         self._fresh_inventory(plan["inventory"])
         self._cleanup_targets(plan["inventory"], plan["files"], plan["protected"])
         if plan["recovery_required"]:
-            self._verified_recovery(backup=plan["recovery_backup"], restoration=plan["recovery_verification"])
+            self.verified_recovery(backup=plan["recovery_backup"], restoration=plan["recovery_verification"])
         relative = self._outside_sources(plan["quarantine_destination"], plan["inventory"]["roots"])
         if relative != plan["quarantine_relative"] or any(row["key"] in plan["protected"] for row in plan["files"]):
             raise StorageRefusal("Quarantine scope or protected files changed")
@@ -899,17 +934,16 @@ class StorageService:
                 record = {"original": row, "quarantine_record": moved}
                 records.append(record)
                 self._write_json(output, f"step-quarantine-{expected_plan_sha256}-{index:06d}.json", record)
-            receipt = {"schema_version": VERSION, "kind": "quarantine_receipt", "plan_sha256": expected_plan_sha256,
+            receipt = {**_storage_value("quarantine_receipt"), "plan_sha256": expected_plan_sha256,
                        "source_roots": plan["inventory"]["roots"], "quarantine_destination": plan["quarantine_destination"],
                        "records": records, "recovery_required": plan["recovery_required"], "recovery_backup": plan["recovery_backup"],
                        "recovery_verification": plan["recovery_verification"],
-                       "attempt": attempt, "expected_free_space_gain_bytes": 0, "finished_utc": _now()}
+                       "attempt": attempt, "expected_free_space_gain_bytes": 0, "finished_utc": pc_records.utc_now()}
             self._write_json(output, f"outcome-quarantine-{expected_plan_sha256}.json", receipt)
             return receipt
 
     def _quarantine_provenance(self, receipt, output):
-        if receipt.get("schema_version") != VERSION or receipt.get("kind") != "quarantine_receipt":
-            raise StorageRefusal("Exact quarantine receipt required")
+        _record(receipt, "quarantine_receipt", "Exact quarantine receipt required")
         if not isinstance(receipt.get("plan_sha256"), str) or not HASH_RE.fullmatch(receipt["plan_sha256"]):
             raise StorageRefusal("Exact original quarantine plan binding required")
         relative = self._output_relative(receipt["quarantine_destination"])
@@ -923,13 +957,14 @@ class StorageService:
             raise StorageRefusal("Original quarantine attempt reference changed")
         self._private_created_file(attempt_name)
         attempt_record = output.inspect(attempt_name, hash_file=True, max_bytes=MAX_ARCHIVE_BYTES)
-        try:
-            attempt = json.loads(output.read_bytes(attempt_name, expected=attempt_record, max_bytes=MAX_ARCHIVE_BYTES))
-        except (json.JSONDecodeError, UnicodeError, RecursionError) as exc:
-            raise StorageRefusal("Invalid original quarantine attempt") from exc
-        original_plan = attempt.get("exact_plan")
-        if not isinstance(original_plan, dict):
+        attempt = _record(decode_storage(output.read_bytes(attempt_name, expected=attempt_record, max_bytes=MAX_ARCHIVE_BYTES),
+                                   "Invalid original quarantine attempt"), "attempt", "Invalid original quarantine attempt")
+        plan_file = "plan-quarantine-" + receipt["plan_sha256"] + ".json"
+        if attempt.get("plan_file") != plan_file or attempt.get("plan_sha256") != receipt["plan_sha256"]:
             raise StorageRefusal("Original exact quarantine plan is unavailable; reconcile the incomplete operation")
+        self._private_created_file(plan_file)
+        plan_record = output.inspect(plan_file, hash_file=True, max_bytes=MAX_ARCHIVE_BYTES)
+        original_plan = decode_storage(output.read_bytes(plan_file, expected=plan_record, max_bytes=MAX_ARCHIVE_BYTES), "Invalid original quarantine plan")
         _bound_plan(original_plan, receipt["plan_sha256"], "quarantine")
         if (original_plan["quarantine_relative"] != relative
                 or original_plan["quarantine_destination"] != receipt["quarantine_destination"]):
@@ -949,7 +984,11 @@ class StorageService:
         with self._scope(self.output_root) as output:
             relative = self._quarantine_provenance(receipt, output)
             self._private_directory(relative)
-            actual = sorted(output.list_directory(relative), key=lambda row: row["relative_path"])
+            left_out = []
+            actual = sorted(output.list_directory(relative, excluded=left_out), key=lambda row: row["relative_path"])
+            if left_out:
+                # PatchCairn's own quarantine folder: an unknown link, special file or name is never "not included".
+                raise StorageRefusal("Unknown, missing or changed quarantine files; recovery review is required")
             expected = sorted([row["quarantine_record"] for row in receipt["records"]], key=lambda row: row["relative_path"])
             if ([{**row, "sha256": None} for row in actual]
                     != [{**row, "sha256": None} for row in expected]):
@@ -985,15 +1024,15 @@ class StorageService:
                 self._private_windows_quarantine_file(Path(source_root) / original["relative_path"])
                 result.append(observed)
                 self._write_json(output, f"step-quarantine-restore-{expected_plan_sha256}-{index:06d}.json", observed)
-            outcome = {"schema_version": VERSION, "kind": "quarantine_restore_receipt", "plan_sha256": expected_plan_sha256,
-                       "records": result, "attempt": attempt, "finished_utc": _now()}
+            outcome = {**_storage_value("quarantine_restore_receipt"), "plan_sha256": expected_plan_sha256,
+                       "records": result, "attempt": attempt, "finished_utc": pc_records.utc_now()}
             self._write_json(output, f"outcome-quarantine-restore-{expected_plan_sha256}.json", outcome)
             return outcome
 
     def plan_purge(self, *, receipt):
         self._quarantine_current(receipt)
         if receipt["recovery_required"]:
-            self._verified_recovery(backup=receipt["recovery_backup"], restoration=receipt["recovery_verification"])
+            self.verified_recovery(backup=receipt["recovery_backup"], restoration=receipt["recovery_verification"])
         return _new_plan("purge", receipt=receipt, irreversible=True,
                          requires_separate_owner_approval=True, requires_loss_acknowledgment=True,
                          cost={"selected_logical_bytes": sum(row["original"]["size"] for row in receipt["records"]),
@@ -1012,7 +1051,7 @@ class StorageService:
         receipt = plan["receipt"]
         self._quarantine_current(receipt)
         if receipt["recovery_required"]:
-            self._verified_recovery(backup=receipt["recovery_backup"], restoration=receipt["recovery_verification"])
+            self.verified_recovery(backup=receipt["recovery_backup"], restoration=receipt["recovery_verification"])
         removed = []
         with self._scope(self.output_root) as output:
             attempt = self._attempt(output, expected_plan_sha256, "purge", plan)
@@ -1021,8 +1060,8 @@ class StorageService:
                 output.remove_file(target["relative_path"], expected=target)
                 removed.append(target["relative_path"])
                 self._write_json(output, f"step-purge-{expected_plan_sha256}-{index:06d}.json", {"removed": target})
-            outcome = {"schema_version": VERSION, "kind": "purge_receipt", "plan_sha256": expected_plan_sha256,
-                       "removed": removed, "irreversible": True, "attempt": attempt, "finished_utc": _now(),
+            outcome = {**_storage_value("purge_receipt"), "plan_sha256": expected_plan_sha256,
+                       "removed": removed, "irreversible": True, "attempt": attempt, "finished_utc": pc_records.utc_now(),
                        "physical_free_space_gain_bytes": None}
             self._write_json(output, f"outcome-purge-{expected_plan_sha256}.json", outcome)
             return outcome
@@ -1042,8 +1081,8 @@ class StorageService:
             raise StorageRefusal("Unknown fixed storage outcome kind")
         _bound_plan(plan, expected_plan_sha256, kind)
         operation, receipt_kind = operations[kind]
-        if (not isinstance(receipt, dict) or receipt.get("schema_version") != VERSION
-                or receipt.get("kind") != receipt_kind or receipt.get("plan_sha256") != expected_plan_sha256):
+        _record(receipt, receipt_kind, "An exact bound immutable operation receipt is required")
+        if receipt.get("plan_sha256") != expected_plan_sha256:
             raise StorageRefusal("An exact bound immutable operation receipt is required")
         outcome_name = f"outcome-{operation}-{expected_plan_sha256}.json"
         with self._scope(self.output_root) as output:
@@ -1057,7 +1096,7 @@ class StorageService:
                 if verified["manifest"]["files"] != plan["files"] or receipt["archive"] != plan["destination"]:
                     raise StorageRefusal("Backup outcome differs from the exact reviewed content/output")
             elif kind == "restore":
-                self._verified_recovery(backup=plan["receipt"], restoration=receipt)
+                self.verified_recovery(backup=plan["receipt"], restoration=receipt)
                 if receipt["destination"] != plan["destination"] or receipt["files"] != plan["files"]:
                     raise StorageRefusal("Restore outcome differs from the exact reviewed destination/content")
             elif kind == "quarantine":
@@ -1069,7 +1108,7 @@ class StorageService:
                     for row in plan["files"]:
                         self._require_absent(sources[row["root_id"]], row["relative_path"])
                 if plan["recovery_required"]:
-                    self._verified_recovery(backup=plan["recovery_backup"], restoration=plan["recovery_verification"])
+                    self.verified_recovery(backup=plan["recovery_backup"], restoration=plan["recovery_verification"])
             elif kind == "quarantine_restore":
                 original_receipt = plan["receipt"]
                 self._quarantine_provenance(original_receipt, output)
@@ -1096,8 +1135,8 @@ class StorageService:
                 for relative in expected_removed:
                     self._require_absent(output, relative)
                 if original_receipt["recovery_required"]:
-                    self._verified_recovery(backup=original_receipt["recovery_backup"], restoration=original_receipt["recovery_verification"])
-        return {"schema_version": VERSION, "kind": "storage_outcome_verification", "observed_utc": _now(),
+                    self.verified_recovery(backup=original_receipt["recovery_backup"], restoration=original_receipt["recovery_verification"])
+        return {**_storage_value("storage_outcome_verification"), "observed_utc": pc_records.utc_now(),
                 "storage_plan_sha256": expected_plan_sha256, "operation_kind": kind,
                 "outcome": "succeeded", "verification_passed": True, "mutation_performed": False,
                 "receipt_sha256": sha256(outcome_data), "outcome_artifact_relative": outcome_name,
@@ -1105,6 +1144,6 @@ class StorageService:
 
 
 def storage_capabilities():
-    return {"schema_version": VERSION, "filesystem": capabilities(), "cli_mutation_enabled": False,
+    return {**_storage_value("capabilities"), "filesystem": capabilities(), "cli_mutation_enabled": False,
             "requires_workflow_engine_gate": True, "quiet_exclusive_workspace_required": True,
             "not_an_os_sandbox": True, "zip_encryption": False}

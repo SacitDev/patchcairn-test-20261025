@@ -14,7 +14,8 @@ import sys
 import time
 from pathlib import Path
 
-from diagnostic_core import DiagnosticRefusal, SCHEMA, utc_now, validate_request, validate_adapter_result
+import pc_records
+from diagnostic_core import DiagnosticRefusal, validate_request, validate_adapter_result
 
 MAX_OUTPUT = 4096
 TIMEOUT = 5
@@ -129,8 +130,8 @@ def collect_recipe(request, *, runner=None, coordinator_authorized=False):
     expected_scope = ["root_capacity"] if recipe_id.endswith("root_capacity") else ["os_metadata"]
     if request["scope"] != expected_scope:
         raise DiagnosticRefusal("Recipe requires its exact selected metadata scope")
-    result = {key: request[key] for key in ("schema_version", "request_id", "platform", "recipe_id", "mode")}
-    result.update(kind="adapter_result", status="held", observed_utc=utc_now(), facts={},
+    result = {key: request[key] for key in ("schema", "schema_version", "request_id", "platform", "recipe_id", "mode")}
+    result.update(kind="adapter_result", status="held", observed_utc=pc_records.utc_now(), facts={},
                   limitations=["Metadata observation cannot establish the original cause or verify application behavior."],
                   provenance=PROVENANCE[recipe_id])
     if request["mode"] == "fixture":
@@ -155,11 +156,11 @@ def collect_recipe(request, *, runner=None, coordinator_authorized=False):
     argv = (executable, *ARGV[recipe_id][1])
     try:
         facts = _parse(recipe_id, runner(argv, timeout=TIMEOUT, max_bytes=MAX_OUTPUT))
-        result.update(status="observed", facts=facts, observed_utc=utc_now())
+        result.update(status="observed", facts=facts, observed_utc=pc_records.utc_now())
         return validate_adapter_result(request, result)
     except (DiagnosticRefusal, OSError, subprocess.SubprocessError, ValueError, TypeError):
         # Never retain exception text, stderr or malformed stdout: they may hold
         # private paths or secrets even when a selected command failed.
-        result.update(status="failed", facts={}, observed_utc=utc_now())
+        result.update(status="failed", facts={}, observed_utc=pc_records.utc_now())
         result["limitations"].append("Selected metadata was unavailable, malformed, oversized or timed out; no cause is established.")
         return validate_adapter_result(request, result)

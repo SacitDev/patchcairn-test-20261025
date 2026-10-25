@@ -8,10 +8,8 @@ from __future__ import annotations
 
 import copy
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 import hashlib
-import io
-import json
 import math
 import os
 from pathlib import Path, PurePosixPath
@@ -19,12 +17,17 @@ import re
 import stat
 import sys
 import uuid
-import zipfile
 from urllib.parse import urlsplit
 
+import diagnostic_core
+import pc_paths
+import pc_records
+from pc_records import SCHEMA_VERSION, digest, encoded
+import private_workspace
+import storage_contract
+
 sys.dont_write_bytecode = True
-VERSION = 3
-BACKEND = "patchcairn.workflow.python.v3"
+BACKEND = "patchcairn.workflow.python"
 COMMANDS = ("start", "help", "status", "options", "cost", "settings", "pause", "resume", "stop", "resolve")
 JOBS = {
     "security_updates": {"label": "Security and updates", "description": "Check agreed software, relevant security concerns and suitable official updates.", "stages": ["scope", "inventory", "research", "plan", "apply", "verify", "complete"]},
@@ -36,86 +39,171 @@ STAGE_LABELS = {"scope": "Choose and confirm the scope", "inventory": "Review th
 CHECKPOINT_LABELS = {"scope": "the agreed scope", "findings": "the assessment findings", "plan": "the proposed changes", "before_action": "before the next action", "after_action": "after the previous action", "finish": "the final result and retained evidence", "scheduled_start": "the scheduled start"}
 ACTION_LABELS = {"update": "Install the selected update", "cleanup_quarantine": "Move selected files to quarantine", "backup_create": "Create the reviewed backup", "backup_restore": "Restore the reviewed backup", "repair": "Apply the reviewed repair", "permanent_purge": "Permanently delete the selected quarantined files", "restart": "Restart", "firmware": "Review a firmware change", "os_transition": "Review a system release change", "security_policy": "Review a security setting change", "assessment": "Read-only assessment"}
 KINDS = {"update", "cleanup_quarantine", "backup_create", "backup_restore", "repair", "permanent_purge", "restart", "firmware", "os_transition", "security_policy", "assessment"}
-POLICY_KINDS = {"update", "cleanup_quarantine", "backup_create"}
+# Only the action kinds of adapters that pc_records lets a standing policy cover.
+POLICY_KINDS = frozenset(kind for facts in pc_records.ADAPTERS.values() if facts["policy_coverable"] for kind in facts["kinds"])
 ROLES = {"compatibility_data", "evidence_security"}
 OUTCOMES = {"succeeded", "failed", "partial", "unknown"}
 EVIDENCE_KINDS = {"scope_confirmation", "inventory", "research", "candidates", "symptom", "hypotheses", "recovery_plan", "precondition", "outcome", "reconciliation", "verification", "recovery", "protected_consent", "review", "fixture"}
 EVIDENCE_KINDS |= {"adapter_payload", "recovery_manifest", "restore_verification", "retention", "recovery_archive"}
-ADAPTERS = {"storage.backup_create.v3": "backup_create", "storage.backup_restore.v3": "backup_restore", "storage.cleanup_quarantine.v3": "cleanup_quarantine", "storage.quarantine_restore.v3": "backup_restore", "storage.permanent_purge.v3": "permanent_purge", "fixture.assessment.v3": "assessment", "diagnostic.read_recipe.v3": "assessment", "system.reviewed_external.v3": ("update", "repair")}
-ID = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,95}\Z")
-SHA = re.compile(r"[0-9a-f]{64}\Z")
+# Storage adapters whose plans the storage service carries out today; the other storage ids hold.
+STORAGE_ADAPTERS = frozenset({pc_records.ADAPTER_STORAGE_BACKUP_CREATE, pc_records.ADAPTER_STORAGE_RESTORE, pc_records.ADAPTER_STORAGE_QUARANTINE,
+                              pc_records.ADAPTER_STORAGE_QUARANTINE_RESTORE, pc_records.ADAPTER_STORAGE_PURGE})
+ID = pc_records.ID
+SHA = pc_records.SHA256
+SERVICE_RECORD = "patchcairn.service"
+ASSESSMENT_ACCESS, ASSESSMENT_SUMMARY, ASSESSMENT_VERIFICATION = "patchcairn.assessment.access", "patchcairn.assessment.summary", "patchcairn.assessment.verification"
+FIXTURE_ADAPTER, DIAGNOSTIC_ADAPTER, EXTERNAL_ADAPTER, STORAGE_ADAPTER = "patchcairn.fixture.adapter", "patchcairn.diagnostic.adapter", "patchcairn.external.adapter", "patchcairn.storage.adapter"
+EXTERNAL_PLAN, EXTERNAL_RECOVERY, EXTERNAL_VERIFICATION = "patchcairn.external.plan", "patchcairn.external.recovery", "patchcairn.external.verification"
+EXTERNAL_PREFLIGHT, EXTERNAL_RECEIPT = "patchcairn.external.preflight", "patchcairn.external.receipt"
+PUBLISHER_SIGNATURE, INSTALLER_METADATA = "patchcairn.publisher.signature", "patchcairn.installer.metadata"
+RECOVERY_RETENTION, RECOVERY_BINDING, QUARANTINE_RECOVERY = "patchcairn.recovery.retention", "patchcairn.recovery.binding", "patchcairn.quarantine.recovery"
+WINDOWS_BOOT, RESTART_PENDING, RESTART_VERIFICATION = "patchcairn.windows.boot.observation", "patchcairn.restart.pending", "patchcairn.restart.verification"
+_EXTERNAL_RECEIPT_FIELDS = {"operation_id", "action_id", "plan_sha256", "adapter_payload_sha256", "mode", "platform", "catalog_id", "observed_utc", "outcome", "tool_exit_code", "postcondition_state", "evidence_ids", "observed_effects", "limitations"}
+_ASSESSMENT_COMMON = {"job", "mode", "scope_sha256", "settings_revision"}
+# Exact fields of each typed record family the engine reads, besides "schema" and "schema_version":
+# (required, optional).
+RECORD_FIELDS = {
+    ASSESSMENT_ACCESS: ({"target", "operations", "local_content", "llm_content", "sensitive_exceptions"}, set()),
+    ASSESSMENT_SUMMARY: (_ASSESSMENT_COMMON | {"summary", "findings", "limitations", "assessed_evidence_ids"}, set()),
+    ASSESSMENT_VERIFICATION: (_ASSESSMENT_COMMON | {"summary_evidence_id", "summary_sha256", "assessed_evidence_ids", "coverage_checked", "limitations_checked", "observed_utc"}, set()),
+    FIXTURE_ADAPTER: ({"operation", "fixture_plan", "fixture_plan_sha256", "inventory_sha256"}, set()),
+    DIAGNOSTIC_ADAPTER: ({"operation", "request", "request_sha256", "inventory_sha256"}, set()),
+    EXTERNAL_ADAPTER: ({"operation", "external_plan", "external_plan_sha256", "inventory_sha256"}, set()),
+    STORAGE_ADAPTER: (set(storage_contract.PAYLOAD_REQUIRED), set(storage_contract.PAYLOAD_OPTIONAL)),
+    EXTERNAL_PLAN: ({"kind", "platform", "mode", "catalog_id", "official_tool", "argv", "targets", "target_versions", "target_identities", "sources", "provenance_evidence_ids", "compatibility_evidence_ids", "recovery_plan", "recovery_plan_sha256", "verification_plan", "verification_plan_sha256", "scope"}, set()),
+    EXTERNAL_RECOVERY: ({"strategy", "evidence_ids", "limits"}, set()),
+    EXTERNAL_VERIFICATION: ({"original_success_condition", "checks"}, set()),
+    EXTERNAL_PREFLIGHT: ({"action_id", "plan_sha256", "external_plan_sha256", "mode", "platform", "observed_utc", "targets"}, set()),
+    EXTERNAL_RECEIPT: (_EXTERNAL_RECEIPT_FIELDS, set()),
+    PUBLISHER_SIGNATURE: ({"mode", "platform", "artifact_sha256", "publisher", "status", "source_id", "method", "observed_utc"}, set()),
+    INSTALLER_METADATA: ({"mode", "platform", "artifact_sha256", "target_id", "version", "channel", "architecture", "installation_scope", "publisher", "source_id", "observed_utc"}, set()),
+    RECOVERY_RETENTION: ({"session_id", "required", "artifacts"}, set()),
+    RECOVERY_BINDING: ({"output_root", "backup_receipt", "restore_receipt", "retention_evidence_id"}, set()),
+    QUARANTINE_RECOVERY: ({"output_root", "quarantine_receipt", "restore_plan", "restore_plan_sha256", "retention_evidence_id"}, set()),
+    WINDOWS_BOOT: ({"mode", "platform", "observed_utc", "last_boot_utc", "source"}, set()),
+    RESTART_PENDING: ({"session_id", "operation_id", "action_id", "plan_sha256", "settings_revision", "scope_sha256", "adapter_payload_sha256", "external_plan_sha256", "mode", "platform", "catalog_id", "original_exit_code", "observed_utc", "native_receipt_relative_path", "native_receipt_sha256", "before_boot_evidence_id"}, set()),
+    RESTART_VERIFICATION: ({"session_id", "operation_id", "action_id", "plan_sha256", "settings_revision", "scope_sha256", "external_plan_sha256", "mode", "platform", "catalog_id", "original_exit_code", "pending_evidence_id", "restart_decision_message_id", "observed_utc", "before_boot_evidence_id", "after_boot_evidence_id", "targets", "checks"}, set()),
+}
+# Caps (D-017, D-040) scale with the published entry bound. Every JSON value, and every bracket the strict
+# decoder counts (also inside strings), takes at least one byte, so node caps equal to the byte caps never
+# refuse a record that the byte cap admitted when it was written. Journal events keep digests of what
+# changed, never per-file lists, so the journal grows with events and evidence rows, not with file counts.
+JOURNAL_MAX_BYTES = 64_000_000
+JOURNAL_MAX_NODES = JOURNAL_MAX_BYTES
+# Evidence content may be a storage plan with three per-file lists (inventory, files, skipped). The cap allows
+# MAX_BACKUP_ENTRIES rows averaging 512 bytes, about 90-character ASCII paths; rows reach about 700 bytes at
+# 200-unit ASCII paths and more for escaped non-ASCII names, so such plans are refused at registration, before
+# any effect. Measuring the real bound is G18's (B-BAK, MEAS).
+EVIDENCE_MAX_BYTES = 3 * 512 * pc_records.MAX_BACKUP_ENTRIES
+EVIDENCE_MAX_NODES = EVIDENCE_MAX_BYTES
+MAX_FACT_ITEMS = pc_records.MAX_BACKUP_ENTRIES
+# Facts are copied into the journal state, so they stay small; large data belongs in the evidence content.
+FACTS_MAX_BYTES = 65_536
+SERVICE_RECORD_MAX_BYTES = 8_000_000
+CREATION_KEYS = ("session_id", "engine_id", "backend", "mode", "platform", "created_utc", "creation_scope_sha256", "owner_id", "job")
 CHECKPOINTS = {"scope", "findings", "plan", "before_action", "after_action", "finish"}
 STATE_KEYS = {"schema_version", "session_id", "engine_id", "backend", "mode", "platform", "created_utc", "updated_utc", "creation_scope_sha256", "owner_id", "revision", "settings_revision", "job", "stage", "status", "settings", "scope_authorization", "evidence", "plan", "reviews", "approval", "irreversible_ack", "standing_policy", "operations", "pending", "schedule", "schedule_triggers", "last_reconciled_utc", "stop_reason"}
 
 
-class WorkflowRefusal(ValueError):
+class WorkflowRefusal(pc_records.Refusal):
     """A hold or invalid request; no operation was authorized."""
+
+    def __init__(self, message, *, code="workflow-refusal"):
+        super().__init__(code, message)
 
 
 class PrivacyCapabilityHold(WorkflowRefusal):
     """The filesystem could not establish the required POSIX private storage."""
 
+    def __init__(self, message, *, code="private-storage-unavailable"):
+        super().__init__(message, code=code)
 
-def utc_now():
-    return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
-
-def _time(value):
-    if not isinstance(value, str) or not value.endswith("Z"):
-        raise WorkflowRefusal("A UTC timestamp ending in Z is required")
+def _checked(check, *args, **kwargs):
+    """Run a shared pc_records check; its refusal becomes a WorkflowRefusal with the same code."""
     try:
-        result = datetime.fromisoformat(value[:-1] + "+00:00")
-    except ValueError as error:
-        raise WorkflowRefusal("Invalid UTC timestamp") from error
-    if result.utcoffset() != timedelta(0):
-        raise WorkflowRefusal("Timestamp must be UTC")
-    return result
+        return check(*args, **kwargs)
+    except WorkflowRefusal:
+        raise
+    except pc_records.Refusal as error:
+        raise WorkflowRefusal(str(error), code=error.code) from error
+
+
+def utc_time(value):
+    return _checked(pc_records.parse_utc, value)
 
 
 def _fresh(value, *, after=None, seconds=900):
-    observed, now = _time(value), _time(utc_now())
-    if observed > now or now - observed > timedelta(seconds=seconds):
-        raise WorkflowRefusal("Evidence is future-dated or stale; collect a fresh observation")
-    if after and observed < _time(after):
-        raise WorkflowRefusal("Evidence predates the operation or decision it must reconcile")
-
-
-def encoded(value):
-    return json.dumps(value, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-
-
-def digest(value):
-    return hashlib.sha256(value if isinstance(value, bytes) else encoded(value)).hexdigest()
+    _checked(pc_records.fresh, value, after=after, seconds=seconds)
 
 
 def _text(value, name="text", limit=4000):
-    if not isinstance(value, str) or not value.strip() or len(value) > limit or any(ord(c) < 32 and c not in "\n\t" for c in value):
-        raise WorkflowRefusal("Invalid " + name)
-    return value
+    return _checked(pc_records.bounded_text, value, name, limit)
 
 
-def _id(value, name="identifier"):
-    if not isinstance(value, str) or not ID.fullmatch(value) or value in {".", ".."}:
-        raise WorkflowRefusal("Invalid " + name + "; paths are not accepted")
-    return value
+def record_identifier(value, name="identifier"):
+    return _checked(pc_records.identifier, value, name)
+
+
+def _reader(name):
+    required, optional = RECORD_FIELDS[name]
+
+    def read(record):
+        _checked(pc_records.require_schema, record, name)
+        exact_fields(record, required | optional | {"schema", "schema_version"}, required | {"schema", "schema_version"})
+        return record
+    return read
+
+
+# One registered reader per typed record family the engine owns (pc_records.READERS).
+_READERS = {name: pc_records.register_reader(name, _reader(name)) for name in RECORD_FIELDS}
+
+
+def typed_record(value, name):
+    """Return ``value`` if it is a record of the engine family ``name`` with exactly its fields."""
+    return _READERS[name](value)
+
+
+def _storage_record(value, kind, message):
+    """Return a typed storage record of ``kind``; ``message`` explains a missing or different kind."""
+    if not isinstance(value, dict) or value.get("kind") != kind:
+        raise WorkflowRefusal(message)
+    return _checked(storage_contract.read_storage, value)
+
+
+def _facts(action):
+    """The pc_records facts of an action's adapter; an action whose OS-consent flag contradicts them is refused."""
+    return _checked(pc_records.adapter_facts, action["adapter_id"], requires_os_consent=action["requires_os_consent"])
+
+
+def _acknowledgments(action):
+    """Acknowledgments the owner gives separately for this action (pc_records facts)."""
+    return pc_records.ADAPTERS[action["adapter_id"]]["acknowledgments"]
+
+
+def _without_version(record):
+    """A copy of a validated record without its schema_version, for comparing the remaining fields."""
+    rest = dict(record)
+    rest.pop("schema_version", None)
+    return rest
 
 
 def _ids(value, name="identifiers", *, allow_empty=True):
     if not isinstance(value, list) or len(value) > 500 or (not allow_empty and not value):
         raise WorkflowRefusal("Invalid " + name)
     for item in value:
-        _id(item, name)
+        record_identifier(item, name)
     if len(set(value)) != len(value):
         raise WorkflowRefusal("Duplicate " + name)
     return value
 
 
-def _fields(value, allowed, required=()):
+def exact_fields(value, allowed, required=()):
     if not isinstance(value, dict) or set(value) - set(allowed) or set(required) - set(value):
         raise WorkflowRefusal("Unexpected or missing record fields")
 
 
-def _json_data(value, depth=0):
+def _json_shape(value, depth=0):
     if depth > 12:
         raise WorkflowRefusal("Record nesting exceeds the bounded schema")
     if value is None or isinstance(value, (str, bool)):
@@ -126,23 +214,30 @@ def _json_data(value, depth=0):
         if not math.isfinite(value):
             raise WorkflowRefusal("Nonfinite evidence value")
         return
-    if isinstance(value, list) and len(value) <= 1000:
+    if isinstance(value, list) and len(value) <= MAX_FACT_ITEMS:
         for item in value:
-            _json_data(item, depth + 1)
+            _json_shape(item, depth + 1)
         return
     if isinstance(value, dict) and len(value) <= 100:
         for key, item in value.items():
             if not isinstance(key, str) or key.lower() in {"command", "commands", "execute", "eval", "approved", "authorization"}:
                 raise WorkflowRefusal("Executable or self-authorizing evidence fields are not accepted")
-            _json_data(item, depth + 1)
+            _json_shape(item, depth + 1)
         return
     raise WorkflowRefusal("Evidence must be bounded JSON data")
+
+
+def _json_data(value):
+    """Bounded JSON evidence data that the one encoder also accepts (no lone surrogates, integers within 20
+    digits), checked before anything is written."""
+    _json_shape(value)
+    _checked(pc_records.encoded, value)
 
 
 def _assessment_source_key(source, kind):
     """Validate recorded selectors lexically; never inspect or resolve a host path."""
     if kind == "observation":
-        return _id(source, "observation source")
+        return record_identifier(source, "observation source")
     _text(source, "literal assessment source", 2000)
     if any(ord(char) < 32 or ord(char) == 127 or char in "\\*?" for char in source):
         raise WorkflowRefusal("Assessment paths require literal forward-slash spelling")
@@ -159,15 +254,14 @@ def _assessment_source_key(source, kind):
         raise WorkflowRefusal("An absolute literal assessment source is required")
     if any(part in {"", ".", ".."} for part in parts):
         raise WorkflowRefusal("Assessment paths cannot contain traversal or alternate spellings")
-    if windows and any(any(char in part for char in ':<>"|') or part.endswith((".", " ")) or re.fullmatch(r"(?i:con|prn|aux|nul|conin\$|conout\$|com[0-9]|lpt[0-9])(?:\..*)?", part) for part in parts):
+    if windows and any(not pc_paths.portable(part) for part in parts):
         raise WorkflowRefusal("Ambiguous Windows assessment path")
     return source.casefold() if windows else source
 
 
 def _assessment_access(value):
-    fields = {"schema_version", "target", "operations", "local_content", "llm_content", "sensitive_exceptions"}
-    _fields(value, fields, fields)
-    if value["schema_version"] != "patchcairn.assessment.access.v1" or value["target"] not in ("whole_device", "selected_paths", "specific_problem"):
+    typed_record(value, ASSESSMENT_ACCESS)
+    if value["target"] not in ("whole_device", "selected_paths", "specific_problem"):
         raise WorkflowRefusal("Unknown assessment access descriptor")
     operations = _ids(value["operations"], "assessment operations", allow_empty=False)
     if set(operations) - {"metadata", "diagnosis", "content_read"}:
@@ -177,8 +271,8 @@ def _assessment_access(value):
         raise WorkflowRefusal("Select at most thirty bounded local content observations")
     identifiers, identities = set(), set()
     for selection in selections:
-        _fields(selection, {"id", "kind", "source", "selection"}, {"id", "kind", "source", "selection"})
-        identifier = _id(selection["id"], "assessment selection")
+        exact_fields(selection, {"id", "kind", "source", "selection"}, {"id", "kind", "source", "selection"})
+        identifier = record_identifier(selection["id"], "assessment selection")
         if identifier in identifiers or selection["kind"] not in ("path", "observation"):
             raise WorkflowRefusal("Duplicate selection or unknown assessment source kind")
         source = _assessment_source_key(selection["source"], selection["kind"])
@@ -197,7 +291,7 @@ def _assessment_access(value):
 
 
 def _scope(scope):
-    _fields(scope, {"roots", "purpose", "assessment"}, {"roots", "purpose"})
+    exact_fields(scope, {"roots", "purpose", "assessment"}, {"roots", "purpose"})
     if not isinstance(scope["roots"], list) or len(scope["roots"]) > 30 or any(not isinstance(root, str) for root in scope["roots"]) or len(set(scope["roots"])) != len(scope["roots"]):
         raise WorkflowRefusal("Select a bounded unique list of scope roots")
     for root in scope["roots"]:
@@ -212,7 +306,7 @@ def _scope_selected(scope):
     return bool(scope["roots"]) or scope.get("assessment", {}).get("target") in ("whole_device", "specific_problem")
 
 
-def _no_links(path):
+def no_links(path):
     path = Path(path)
     if ".." in path.parts:
         raise WorkflowRefusal("Parent path traversal is not admitted")
@@ -225,173 +319,113 @@ def _no_links(path):
     return path
 
 
-def _posix_private_capability():
-    if sys.platform != "darwin" and not sys.platform.startswith("linux"):
-        raise PrivacyCapabilityHold("Native privacy admission for this POSIX platform is unavailable")
-    if not hasattr(os, "geteuid") or not hasattr(os, "O_NOFOLLOW"):
-        raise PrivacyCapabilityHold("POSIX private storage requires effective-owner and no-follow file support")
-
-
-def _linux_private_filesystem(path):
-    if os.name != "posix" or not sys.platform.startswith("linux"):
-        return
+def _admitted(admission, *args, **kwargs):
+    """Run a private_workspace admission. A platform or filesystem that cannot provide owner-only storage is a
+    PrivacyCapabilityHold; any other refusal (unsafe existing permissions, an existing name) a WorkflowRefusal."""
     try:
-        from linux_privacy import assert_native_private_filesystem, LinuxPrivacyHold
-    except ImportError as error:
-        raise PrivacyCapabilityHold("Native Linux private-filesystem admission is unavailable") from error
-    try:
-        assert_native_private_filesystem(path)
-    except LinuxPrivacyHold as error:
-        raise PrivacyCapabilityHold("Native Linux private storage is unavailable: " + error.code) from error
-
-
-def _private_info(info, *, directory, created=False, native_acl_checked=False, path=None):
-    if os.name != "posix":
-        return
-    _posix_private_capability()
-    if sys.platform == "darwin" and not native_acl_checked:
-        raise PrivacyCapabilityHold("Actual native macOS ACL admission is required; mode bits alone cannot authorize private engine storage")
-    if sys.platform.startswith("linux"):
-        if path is None:
-            raise PrivacyCapabilityHold("Actual native Linux filesystem admission is required for private engine storage")
-        _linux_private_filesystem(path)
-        named = Path(path).lstat()
-        if (named.st_dev, named.st_ino) != (info.st_dev, info.st_ino):
-            raise WorkflowRefusal("The admitted private path no longer identifies the opened inode")
-    expected = 0o700 if directory else 0o600
-    ordinary = stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode) and info.st_nlink == 1
-    if not ordinary or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != expected:
-        if created:
-            raise PrivacyCapabilityHold("POSIX private storage is unavailable: the actual filesystem/umask did not establish current-owner " + oct(expected) + " permissions; no private record was authorized")
-        raise WorkflowRefusal("Existing private engine storage must be current-owner ordinary " + ("directory 0700" if directory else "single-link file 0600") + "; unsafe permissions or ownership are held without adoption or chmod")
+        return admission(*args, **kwargs)
+    except private_workspace.PrivateWorkspaceError as error:
+        if re.search(r"unavailable|foreign-filesystem|unsupported", error.code):
+            raise PrivacyCapabilityHold("Native private storage is unavailable: " + error.code, code=error.code) from error
+        raise WorkflowRefusal("Native private engine storage admission held: " + error.code, code=error.code) from error
 
 
 def _private_directory(path, *, create=False, parents=False, exist_ok=False):
-    path = _no_links(path)
-    if os.name == "nt" or sys.platform == "darwin":
-        try:
-            from private_workspace import ensure_private_directory, PrivateWorkspaceError
-        except ImportError as error:
-            raise PrivacyCapabilityHold("The supported native private namespace adapter is unavailable") from error
-        try:
-            return ensure_private_directory(path, create=create, parents=parents, exist_ok=exist_ok)
-        except PrivateWorkspaceError as error:
-            if sys.platform == "darwin" and "unavailable" in error.code:
-                raise PrivacyCapabilityHold("Native macOS ACL private storage is unavailable: " + error.code) from error
-            raise WorkflowRefusal("Native private engine namespace admission held: " + error.code) from error
-    if os.name == "posix":
-        _posix_private_capability()
-        # Missing ordinary ancestors contain no private data. Check the exact
-        # existing allocation filesystem before creating even the namespace.
-        existing = next(item for item in (path, *path.parents) if item.exists())
-        _linux_private_filesystem(existing)
-    created = False
-    if create:
-        if parents:
-            # Ancestors contain no private records and need not be owner-only.
-            path.parent.mkdir(parents=True, exist_ok=True)
-        _linux_private_filesystem(path.parent)
-        try:
-            os.mkdir(path, 0o700 if os.name == "posix" else 0o777)
-            created = True
-        except FileExistsError:
-            if not exist_ok:
-                raise
-    try:
-        info = path.lstat()
-    except FileNotFoundError as error:
-        raise WorkflowRefusal("A private engine directory is missing; it will not be silently recreated") from error
-    if not stat.S_ISDIR(info.st_mode):
-        raise WorkflowRefusal("A private engine directory must be ordinary")
-    _private_info(info, directory=True, created=created, path=path)
-    return path
+    return _admitted(private_workspace.ensure_private_directory, no_links(path), create=create, parents=parents, exist_ok=exist_ok)
 
 
 def _private_file(path):
-    path = _no_links(path)
-    if os.name == "nt" or sys.platform == "darwin":
-        try:
-            from private_workspace import ensure_private_file, PrivateWorkspaceError
-        except ImportError as error:
-            raise PrivacyCapabilityHold("The supported native private namespace adapter is unavailable") from error
-        try:
-            return ensure_private_file(path)
-        except PrivateWorkspaceError as error:
-            if sys.platform == "darwin" and "unavailable" in error.code:
-                raise PrivacyCapabilityHold("Native macOS ACL private storage is unavailable: " + error.code) from error
-            raise WorkflowRefusal("Native private engine record admission held: " + error.code) from error
-    _private_info(path.lstat(), directory=False, path=path)
-
-
-def _private_flags(access):
-    if os.name == "posix":
-        _posix_private_capability()
-    return access | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_BINARY", 0)
+    return _admitted(private_workspace.ensure_private_file, no_links(path))
 
 
 def _write_private_new(path, data):
-    path = _no_links(path)
+    path = no_links(path)
     _private_directory(path.parent)
-    if os.name == "nt" or sys.platform == "darwin":
-        try:
-            from private_workspace import write_private_new, PrivateWorkspaceError
-        except ImportError as error:
-            raise PrivacyCapabilityHold("The supported native private namespace adapter is unavailable") from error
-        try:
-            return write_private_new(path, data)
-        except PrivateWorkspaceError as error:
-            if sys.platform == "darwin" and "unavailable" in error.code:
-                raise PrivacyCapabilityHold("Native macOS ACL private storage is unavailable: " + error.code) from error
-            raise WorkflowRefusal("Native private engine record creation held: " + error.code) from error
-    flags = _private_flags(os.O_WRONLY | os.O_CREAT | os.O_EXCL)
-    with os.fdopen(os.open(path, flags, 0o600), "wb") as handle:
-        _private_info(os.fstat(handle.fileno()), directory=False, created=True, path=path)
-        handle.write(data)
-        handle.flush()
-        os.fsync(handle.fileno())
-        _private_info(os.fstat(handle.fileno()), directory=False, path=path)
+    _admitted(private_workspace.write_private_new, path, data)
 
 
-def _read(path, max_bytes=16_000_000, *, private=False):
-    _no_links(path)
-    if private:
-        _private_directory(path.parent)
-        _private_file(path)
-        handle = os.fdopen(os.open(path, _private_flags(os.O_RDONLY)), "rb")
-    else:
-        # Separately scoped recovery/installer artifacts have their own native
-        # admission contract; engine-private modes must not be imposed on them.
-        handle = path.open("rb")
-    with handle:
+def _open_private(path):
+    """An owner-only regular file opened without following links; checked again on the open handle."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_BINARY", 0)
+    _private_directory(path.parent)
+    _private_file(path)
+    handle = os.fdopen(os.open(path, flags), "rb")
+    try:
         info = os.fstat(handle.fileno())
+        named = path.lstat()
+        if (named.st_dev, named.st_ino) != (info.st_dev, info.st_ino):
+            raise WorkflowRefusal("The admitted private path no longer identifies the opened file")
+        if os.name == "posix" and (info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600):
+            raise WorkflowRefusal("Private engine records must stay current-owner single-link files 0600")
+        _private_file(path)
+    except BaseException:
+        handle.close()
+        raise
+    return handle, info
+
+
+def read_record_bytes(path, max_bytes=16_000_000, *, private=False):
+    no_links(path)
+    if private:
+        handle, info = _open_private(path)
+    else:
+        # Separately scoped records have their own native admission contract;
+        # engine-private modes must not be imposed on them.
+        handle = path.open("rb")
+        info = os.fstat(handle.fileno())
+    with handle:
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > max_bytes:
             raise WorkflowRefusal("Owned file is not a bounded ordinary single-link file")
-        if private:
-            if os.name == "nt" or sys.platform == "darwin":
-                _private_file(path)
-            _private_info(info, directory=False, native_acl_checked=sys.platform == "darwin", path=path)
         data = handle.read(max_bytes + 1)
     if len(data) > max_bytes:
         raise WorkflowRefusal("Owned record exceeds size limit")
     return data
 
 
-def _decode(data):
-    def unique(pairs):
-        result = {}
-        for key, value in pairs:
-            if key in result:
-                raise WorkflowRefusal("Duplicate JSON keys are not accepted")
-            result[key] = value
-        return result
+def _private_digest(path, max_bytes):
+    """SHA-256 and size of a private owned file, hashed in 1 MiB chunks so large evidence is never held whole."""
+    handle, info = _open_private(no_links(path))
+    with handle:
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > max_bytes:
+            raise WorkflowRefusal("Owned file is not a bounded ordinary single-link file")
+        hasher, size = hashlib.sha256(), 0
+        while chunk := handle.read(1 << 20):
+            size += len(chunk)
+            if size > max_bytes:
+                raise WorkflowRefusal("Owned record exceeds size limit")
+            hasher.update(chunk)
+    return hasher.hexdigest(), size
+
+
+def decode_record(data, *, max_bytes=pc_records.DEFAULT_MAX_BYTES, max_nodes=pc_records.DEFAULT_MAX_NODES):
+    return _checked(pc_records.decode_strict, data, max_bytes=max_bytes, max_nodes=max_nodes)
+
+
+def _container(value, kind):
+    return _checked(pc_records.require_container, value, kind)
+
+
+def older_folder(folder, check, *args):
+    """Run a marker ``check``; an older-format marker means the whole folder is older, so the refusal names that
+    folder (relative to the repository) and the owner's next step. Records are never migrated or deleted."""
     try:
-        return json.loads(data, object_pairs_hook=unique, parse_constant=lambda value: (_ for _ in ()).throw(WorkflowRefusal("Nonfinite JSON")))
-    except (ValueError, UnicodeError, RecursionError) as error:
-        raise WorkflowRefusal("Invalid owned JSON record") from error
+        return check(*args)
+    except pc_records.Refusal as error:
+        if error.code != "older-format":
+            raise
+        raise WorkflowRefusal("The folder " + folder + " holds records in an older PatchCairn format, which cannot be read. "
+                              "PatchCairn never changes or deletes them: keep that folder unchanged, move it aside to keep "
+                              "its records, and then start a new session.", code="older-format") from error
 
 
-def _atomic(path, data):
-    _no_links(path)
+def older_format_message(error):
+    """The plain reason and next step when ``error`` refuses a record in an older format, otherwise None
+    (both command-line tools show it as it is; older records are never migrated)."""
+    return str(error) if isinstance(error, pc_records.Refusal) and error.code == "older-format" else None
+
+
+def atomic_replace(path, data):
+    no_links(path)
     _private_directory(path.parent)
     if path.exists():
         _private_file(path)
@@ -412,8 +446,8 @@ def _owner(state, owner_quote, owner_message_id, owner_id=None, source="current_
     if source not in {"current_owner_chat", "current_owner_terminal"} or (owner_id or state["owner_id"]) != state["owner_id"]:
         raise WorkflowRefusal("Only the actual current owner instruction can authorize this decision")
     _text(owner_quote, "actual owner quote")
-    _id(owner_message_id, "owner message identifier")
-    return {"owner_id": state["owner_id"], "quote": owner_quote, "message_id": owner_message_id, "source": source, "recorded_utc": utc_now(), "settings_revision": state["settings_revision"]}
+    record_identifier(owner_message_id, "owner message identifier")
+    return {"owner_id": state["owner_id"], "quote": owner_quote, "message_id": owner_message_id, "source": source, "recorded_utc": pc_records.utc_now(), "settings_revision": state["settings_revision"]}
 
 
 def decision_card(*, meaning, benefits, drawbacks, cost, reversibility, recommendation, options):
@@ -470,33 +504,40 @@ def parse_command(text):
 
 
 class WorkflowEngine:
-    def __init__(self, root=None, *, work_relative="work/sessions", backend=BACKEND):
+    def __init__(self, root=None, *, work_relative="work/sessions", backend=BACKEND, verify_artifact=None):
+        """``verify_artifact(binding) -> None`` re-reads recovery and artifact bytes from disk and raises
+        pc_records.Refusal when they changed or are missing. Only WorkflowService builds it (from storage); an
+        engine without it holds every action that depends on recovery or artifact bytes."""
         if sys.version_info < (3, 12):
             raise WorkflowRefusal("Python 3.12 or newer is required")
         if backend != BACKEND:
             raise WorkflowRefusal("Foreign backend is not supported")
-        self.root = _no_links(Path(root) if root else Path(__file__).absolute().parent.parent)
+        if verify_artifact is not None and not callable(verify_artifact):
+            raise WorkflowRefusal("The artifact verifier must be callable")
+        self.verify_artifact = verify_artifact
+        self.root = no_links(Path(root) if root else Path(__file__).absolute().parent.parent)
         rel = PurePosixPath(work_relative)
         if rel.is_absolute() or "\\" in work_relative or not rel.parts or rel.parts[0] != "work" or any(p in {".", ".."} or ":" in p for p in rel.parts) or len(rel.parts) < 2:
             raise WorkflowRefusal("Session storage must be a named child of repository work/")
-        self.work = _no_links(self.root.joinpath(*rel.parts))
+        self.work = no_links(self.root.joinpath(*rel.parts))
         _private_directory(self.work, create=True, parents=True, exist_ok=True)
         marker = self.work / "engine.json"
         if not marker.exists():
             if any(self.work.iterdir()):
                 raise WorkflowRefusal("Engine creation marker is missing from nonempty storage; do not recreate or migrate it")
             try:
-                _write_private_new(marker, encoded({"schema_version": VERSION, "backend": BACKEND, "engine_id": uuid.uuid4().hex}))
-            except FileExistsError:
-                pass
-        self.marker = _decode(self._read_owned(marker))
-        _fields(self.marker, {"schema_version", "backend", "engine_id"}, {"schema_version", "backend", "engine_id"})
-        if self.marker["schema_version"] != VERSION or self.marker["backend"] != BACKEND:
+                _write_private_new(marker, encoded({"schema_version": SCHEMA_VERSION, "backend": BACKEND, "engine_id": uuid.uuid4().hex}))
+            except WorkflowRefusal:
+                if not marker.exists():
+                    raise
+        self.marker = older_folder(rel.as_posix(), lambda: _container(decode_record(self._read_owned(marker)), "engine_marker"))
+        exact_fields(self.marker, {"schema_version", "backend", "engine_id"}, {"schema_version", "backend", "engine_id"})
+        if self.marker["backend"] != BACKEND:
             raise WorkflowRefusal("Missing or foreign engine marker; migration is not permitted")
-        _id(self.marker["engine_id"])
+        record_identifier(self.marker["engine_id"])
 
     def _private_path(self, path):
-        path = _no_links(path)
+        path = no_links(path)
         try:
             relative = path.relative_to(self.work)
         except ValueError as error:
@@ -508,13 +549,13 @@ class WorkflowEngine:
         return path
 
     def _read_owned(self, path, max_bytes=16_000_000):
-        return _read(self._private_path(path), max_bytes, private=True)
+        return read_record_bytes(self._private_path(path), max_bytes, private=True)
 
     def _directory(self, session_id):
-        _id(session_id, "session identifier")
+        record_identifier(session_id, "session identifier")
         _private_directory(self.work)
         _private_file(self.work / "engine.json")
-        path = _no_links(self.work / session_id)
+        path = no_links(self.work / session_id)
         if not path.is_dir():
             raise WorkflowRefusal("Session is not registered; it will not be recreated")
         _private_directory(path)
@@ -526,7 +567,9 @@ class WorkflowEngine:
         path = self._directory(session_id) / ".lock"
         try:
             _private_directory(path, create=True)
-        except FileExistsError as error:
+        except WorkflowRefusal as error:
+            if error.code != "private-directory-exists":
+                raise
             raise WorkflowRefusal("Session is locked by another writer or interrupted write; inspect it before recovery") from error
         try:
             yield
@@ -540,7 +583,9 @@ class WorkflowEngine:
         path = self.work / ".registry-lock"
         try:
             _private_directory(path, create=True)
-        except FileExistsError as error:
+        except WorkflowRefusal as error:
+            if error.code != "private-directory-exists":
+                raise
             raise WorkflowRefusal("Another registry action is being coordinated; no concurrent mutation ticket is issued") from error
         try:
             yield
@@ -561,11 +606,12 @@ class WorkflowEngine:
         return outstanding
 
     def _validate(self, state):
-        _fields(state, STATE_KEYS, STATE_KEYS)
-        if state["schema_version"] != VERSION or state["backend"] != BACKEND or state["engine_id"] != self.marker["engine_id"]:
+        _container(state, "session_state")
+        exact_fields(state, STATE_KEYS, STATE_KEYS)
+        if state["backend"] != BACKEND or state["engine_id"] != self.marker["engine_id"]:
             raise WorkflowRefusal("Foreign session version, backend or creation identity")
-        _id(state["session_id"])
-        _id(state["owner_id"])
+        record_identifier(state["session_id"])
+        record_identifier(state["owner_id"])
         if state["mode"] not in {"fixture", "real"} or state["platform"] not in {"unknown", "windows", "linux", "macos"}:
             raise WorkflowRefusal("Invalid immutable session mode/platform")
         if state["job"] not in JOBS or state["stage"] not in JOBS[state["job"]]["stages"] or state["status"] not in {"active", "paused", "pause_pending", "held", "stopped", "completed", "awaiting_user"}:
@@ -573,29 +619,29 @@ class WorkflowEngine:
         for key in ("revision", "settings_revision"):
             if type(state[key]) is not int or state[key] < 0:
                 raise WorkflowRefusal("Invalid revision")
-        _time(state["created_utc"])
-        _time(state["updated_utc"])
+        utc_time(state["created_utc"])
+        utc_time(state["updated_utc"])
         settings = state["settings"]
-        _fields(settings, {"scope", "control", "timing", "checkpoints"}, {"scope", "control", "timing", "checkpoints"})
+        exact_fields(settings, {"scope", "control", "timing", "checkpoints"}, {"scope", "control", "timing", "checkpoints"})
         _scope(settings["scope"])
         if settings["control"] not in {"guided", "automatic"} or settings["timing"] not in {"now", "scheduled"} or not isinstance(settings["checkpoints"], list) or set(settings["checkpoints"]) - CHECKPOINTS or len(settings["checkpoints"]) != len(set(settings["checkpoints"])):
             raise WorkflowRefusal("Invalid session settings")
         if not isinstance(state["evidence"], dict) or not isinstance(state["operations"], dict) or not isinstance(state["reviews"], list) or not isinstance(state["pending"], dict) or not isinstance(state["schedule_triggers"], list):
             raise WorkflowRefusal("Invalid state collections")
         for evidence_id, row in state["evidence"].items():
-            _id(evidence_id)
-            _fields(row, {"evidence_id", "path", "sha256", "size", "kind", "scope", "settings_revision", "observed_utc", "registered_utc", "facts"}, {"evidence_id", "path", "sha256", "size", "kind", "scope", "settings_revision", "observed_utc", "registered_utc", "facts"})
+            record_identifier(evidence_id)
+            exact_fields(row, {"evidence_id", "path", "sha256", "size", "kind", "scope", "settings_revision", "observed_utc", "registered_utc", "facts"}, {"evidence_id", "path", "sha256", "size", "kind", "scope", "settings_revision", "observed_utc", "registered_utc", "facts"})
             if row["evidence_id"] != evidence_id or row["path"] != "evidence/" + evidence_id + ".bin" or row["kind"] not in EVIDENCE_KINDS or not SHA.fullmatch(row["sha256"]) or type(row["size"]) is not int or row["size"] < 1:
                 raise WorkflowRefusal("Invalid owned evidence record")
             _scope(row["scope"])
             _json_data(row["facts"])
-            _time(row["observed_utc"])
-            _time(row["registered_utc"])
+            utc_time(row["observed_utc"])
+            utc_time(row["registered_utc"])
         active = []
         for operation_id, op in state["operations"].items():
-            _id(operation_id)
+            record_identifier(operation_id)
             fields = {"operation_id", "action_id", "plan_sha256", "settings_revision", "started_utc", "finished_utc", "outcome", "evidence_ids", "summary", "authorization", "pause_requested", "resolution", "mutating", "adapter_id"}
-            _fields(op, fields | {"restart_pending", "restart_decision", "restart_verification"}, fields)
+            exact_fields(op, fields | {"restart_pending", "restart_decision", "restart_verification"}, fields)
             for name in ("restart_pending", "restart_decision", "restart_verification"):
                 if name in op:
                     if not isinstance(op[name], dict):
@@ -603,20 +649,20 @@ class WorkflowEngine:
                     _json_data(op[name])
             if op["operation_id"] != operation_id or op["outcome"] not in OUTCOMES | {None} or not SHA.fullmatch(op["plan_sha256"]):
                 raise WorkflowRefusal("Invalid operation record")
-            if type(op["mutating"]) is not bool or op["adapter_id"] not in ADAPTERS:
+            if type(op["mutating"]) is not bool or op["adapter_id"] not in pc_records.ADAPTERS:
                 raise WorkflowRefusal("Operation must retain its exact adapter and mutation classification")
-            _id(op["action_id"])
+            record_identifier(op["action_id"])
             _ids(op["evidence_ids"])
-            _time(op["started_utc"])
+            utc_time(op["started_utc"])
             if op["finished_utc"]:
-                _time(op["finished_utc"])
+                utc_time(op["finished_utc"])
             if op["outcome"] is None:
                 active.append(operation_id)
         if len(active) > 1 or state["status"] == "pause_pending" and not active:
             raise WorkflowRefusal("Invalid active-operation invariant")
         if state["plan"]:
             plan = state["plan"]
-            _fields(plan, {"document", "sha256", "settings_revision", "registered_utc"}, {"document", "sha256", "settings_revision", "registered_utc"})
+            exact_fields(plan, {"document", "sha256", "settings_revision", "registered_utc"}, {"document", "sha256", "settings_revision", "registered_utc"})
             if digest(plan["document"]) != plan["sha256"] or plan["settings_revision"] != state["settings_revision"]:
                 raise WorkflowRefusal("Plan hash or settings binding changed")
             self._validate_plan_document(state, plan["document"])
@@ -627,30 +673,30 @@ class WorkflowEngine:
     def _load(self, session_id):
         directory = self._directory(session_id)
         try:
-            marker = _decode(self._read_owned(directory / "creation.json"))
-            bundle = _decode(self._read_owned(directory / "session.json"))
+            marker = decode_record(self._read_owned(directory / "creation.json"))
+            bundle = decode_record(self._read_owned(directory / "session.json", JOURNAL_MAX_BYTES), max_bytes=JOURNAL_MAX_BYTES, max_nodes=JOURNAL_MAX_NODES)
         except FileNotFoundError as error:
             raise WorkflowRefusal("Registered session state is missing; no silent reconstruction") from error
-        _fields(bundle, {"state", "events"}, {"state", "events"})
+        exact_fields(bundle, {"state", "events"}, {"state", "events"})
         state = self._validate(bundle["state"])
-        expected = {key: state[key] for key in ("session_id", "engine_id", "backend", "mode", "platform", "created_utc", "creation_scope_sha256", "owner_id", "job")}
-        if marker != expected or state["session_id"] != session_id:
+        _container(marker, "session_creation")
+        exact_fields(marker, {"schema_version", *CREATION_KEYS}, {"schema_version", *CREATION_KEYS})
+        if any(marker[key] != state[key] for key in CREATION_KEYS) or state["session_id"] != session_id:
             raise WorkflowRefusal("Immutable session creation binding changed")
         if not isinstance(bundle["events"], list) or len(bundle["events"]) != state["revision"] + 1:
             raise WorkflowRefusal("Session event sequence is incomplete")
         previous = None
         for revision, event in enumerate(bundle["events"]):
-            _fields(event, {"revision", "at", "type", "details", "state_sha256", "previous", "sha256"}, {"revision", "at", "type", "details", "state_sha256", "previous", "sha256"})
+            exact_fields(event, {"revision", "at", "type", "details", "state_sha256", "previous", "sha256"}, {"revision", "at", "type", "details", "state_sha256", "previous", "sha256"})
             bare = {key: value for key, value in event.items() if key != "sha256"}
             if event["revision"] != revision or event["previous"] != previous or event["sha256"] != digest(bare):
                 raise WorkflowRefusal("Session event chain changed")
-            _time(event["at"])
+            utc_time(event["at"])
             previous = event["sha256"]
         if bundle["events"][-1]["state_sha256"] != digest(state):
             raise WorkflowRefusal("State does not match its committed event")
         for row in state["evidence"].values():
-            content = self._read_owned(directory / row["path"])
-            if len(content) != row["size"] or digest(content) != row["sha256"]:
+            if _private_digest(self._private_path(directory / row["path"]), EVIDENCE_MAX_BYTES) != (row["sha256"], row["size"]):
                 raise WorkflowRefusal("Owned evidence has changed")
         return bundle
 
@@ -660,9 +706,9 @@ class WorkflowEngine:
         event["sha256"] = digest(event)
         # State and its entire chained event journal share one atomic transaction.
         data = encoded({"state": state, "events": events + [event]})
-        if len(data) > 16_000_000:
+        if len(data) > JOURNAL_MAX_BYTES:
             raise WorkflowRefusal("Session journal reached its bounded size; preserve it and start a separately scoped session")
-        _atomic(self._private_path(directory / "session.json"), data)
+        atomic_replace(self._private_path(directory / "session.json"), data)
 
     def _change(self, session_id, event_type, mutate, expected_revision=None):
         with self._lock(session_id):
@@ -673,8 +719,9 @@ class WorkflowEngine:
             candidate = copy.deepcopy(current)
             data, message = mutate(candidate)
             candidate["revision"] += 1
-            candidate["updated_utc"] = utc_now()
-            changes = {key: value for key, value in candidate.items() if key not in {"revision", "updated_utc"} and value != current[key]}
+            candidate["updated_utc"] = pc_records.utc_now()
+            # The event keeps the digest of each changed value; the state itself is bound by state_sha256.
+            changes = {key: digest(value) for key, value in candidate.items() if key not in {"revision", "updated_utc"} and value != current[key]}
             self._commit(self._directory(session_id), candidate, bundle["events"], event_type, {"settings_revision": candidate["settings_revision"], "changes": changes})
         return self._response(candidate, event_type, message, data)
 
@@ -682,23 +729,23 @@ class WorkflowEngine:
     def _response(state, code, message, data=None):
         if state and code not in {"created", "help", "status", "options"}:
             message = JOBS[state["job"]]["label"] + " · " + STAGE_LABELS[state["stage"]] + ". " + message
-        return {"schema_version": VERSION, "ok": True, "code": code, "message": message, "session_id": state["session_id"] if state else None, "revision": state["revision"] if state else None, "data": copy.deepcopy(data or {})}
+        return {"schema_version": SCHEMA_VERSION, "ok": True, "code": code, "message": message, "session_id": state["session_id"] if state else None, "revision": state["revision"] if state else None, "data": copy.deepcopy(data or {})}
 
     def create_session(self, *, job="security_updates", control="guided", timing="now", mode="fixture", platform="unknown", scope=None, checkpoints=None, owner_id="owner"):
         if job not in JOBS:
             raise WorkflowRefusal("Choose one supported job")
-        _id(owner_id)
+        record_identifier(owner_id)
         selected = _scope(scope or {"roots": [], "purpose": "Assessment; scope still needs the owner's decision"})
-        now = utc_now()
+        now = pc_records.utc_now()
         session_id = "session-" + uuid.uuid4().hex
-        state = {"schema_version": VERSION, "session_id": session_id, "engine_id": self.marker["engine_id"], "backend": BACKEND, "mode": mode, "platform": platform, "created_utc": now, "updated_utc": now, "creation_scope_sha256": digest(selected), "owner_id": owner_id, "revision": 0, "settings_revision": 0, "job": job, "stage": "scope", "status": "active" if timing == "now" else "awaiting_user", "settings": {"scope": selected, "control": control, "timing": timing, "checkpoints": list(checkpoints if checkpoints is not None else ["scope", "findings", "plan", "before_action", "finish"])}, "scope_authorization": None, "evidence": {}, "plan": None, "reviews": [], "approval": None, "irreversible_ack": None, "standing_policy": None, "operations": {}, "pending": {}, "schedule": None, "schedule_triggers": [], "last_reconciled_utc": None, "stop_reason": None}
+        state = {"schema_version": SCHEMA_VERSION, "session_id": session_id, "engine_id": self.marker["engine_id"], "backend": BACKEND, "mode": mode, "platform": platform, "created_utc": now, "updated_utc": now, "creation_scope_sha256": digest(selected), "owner_id": owner_id, "revision": 0, "settings_revision": 0, "job": job, "stage": "scope", "status": "active" if timing == "now" else "awaiting_user", "settings": {"scope": selected, "control": control, "timing": timing, "checkpoints": list(checkpoints if checkpoints is not None else ["scope", "findings", "plan", "before_action", "finish"])}, "scope_authorization": None, "evidence": {}, "plan": None, "reviews": [], "approval": None, "irreversible_ack": None, "standing_policy": None, "operations": {}, "pending": {}, "schedule": None, "schedule_triggers": [], "last_reconciled_utc": None, "stop_reason": None}
         self._validate(state)
         _private_directory(self.work)
         _private_file(self.work / "engine.json")
         directory = self.work / session_id
         _private_directory(directory, create=True)
         _private_directory(directory / "evidence", create=True)
-        marker = {key: state[key] for key in ("session_id", "engine_id", "backend", "mode", "platform", "created_utc", "creation_scope_sha256", "owner_id", "job")}
+        marker = {"schema_version": SCHEMA_VERSION, **{key: state[key] for key in CREATION_KEYS}}
         _write_private_new(directory / "creation.json", encoded(marker))
         self._commit(directory, state, [], "created", {"job": job})
         return self._response(state, "created", initial_menu() + "\n\nYour " + JOBS[job]["label"].lower() + " session is ready. Confirm the exact scope before evidence collection.", {"state": state})
@@ -756,15 +803,17 @@ class WorkflowEngine:
         return self._change(session_id, "scope_authorized", mutate, expected_revision)
 
     def register_evidence(self, session_id, *, evidence_id, content, kind, scope, facts=None, observed_utc=None, expected_revision=None):
-        _id(evidence_id, "evidence identifier")
-        if not isinstance(content, bytes) or not 0 < len(content) <= 8_000_000 or kind not in EVIDENCE_KINDS:
+        record_identifier(evidence_id, "evidence identifier")
+        if not isinstance(content, bytes) or not 0 < len(content) <= EVIDENCE_MAX_BYTES or kind not in EVIDENCE_KINDS:
             raise WorkflowRefusal("Evidence must be bounded bytes with a supported kind")
         _scope(scope)
         facts = copy.deepcopy(facts or {})
         if not isinstance(facts, dict):
             raise WorkflowRefusal("Evidence facts must be a mapping")
         _json_data(facts)
-        observed = observed_utc or utc_now()
+        if len(encoded(facts)) > FACTS_MAX_BYTES:
+            raise WorkflowRefusal("Evidence facts must stay small; put large data in the evidence content", code="facts-too-large")
+        observed = observed_utc or pc_records.utc_now()
         _fresh(observed, seconds=86400)
         def mutate(state):
             if state["status"] == "stopped":
@@ -786,7 +835,7 @@ class WorkflowEngine:
                 raise WorkflowRefusal("Evidence must match the exact current selected scope")
             if kind == "fixture" and state["mode"] != "fixture":
                 raise WorkflowRefusal("Fictional evidence cannot be promoted into a real session")
-            row = {"evidence_id": evidence_id, "path": "evidence/" + evidence_id + ".bin", "sha256": digest(content), "size": len(content), "kind": kind, "scope": copy.deepcopy(scope), "settings_revision": state["settings_revision"], "observed_utc": observed, "registered_utc": utc_now(), "facts": facts}
+            row = {"evidence_id": evidence_id, "path": "evidence/" + evidence_id + ".bin", "sha256": digest(content), "size": len(content), "kind": kind, "scope": copy.deepcopy(scope), "settings_revision": state["settings_revision"], "observed_utc": observed, "registered_utc": pc_records.utc_now(), "facts": facts}
             target = self._directory(session_id) / row["path"]
             if target.exists():
                 raise WorkflowRefusal("An unregistered file occupies the evidence name; preserve it for inspection")
@@ -795,7 +844,7 @@ class WorkflowEngine:
             return row, "Selected evidence is saved with its exact content hash, scope and observation time."
         return self._change(session_id, "evidence_registered", mutate, expected_revision)
 
-    def _evidence(self, state, evidence_ids, *, kinds=None, after=None, seconds=86400, allow_empty=False):
+    def evidence_rows(self, state, evidence_ids, *, kinds=None, after=None, seconds=86400, allow_empty=False):
         _ids(evidence_ids, "evidence identifiers", allow_empty=allow_empty)
         rows = []
         for evidence_id in evidence_ids:
@@ -811,8 +860,8 @@ class WorkflowEngine:
         return rows
 
     def _validate_plan_document(self, state, plan):
-        _fields(plan, {"plan_id", "summary", "evidence_ids", "actions"}, {"plan_id", "summary", "evidence_ids", "actions"})
-        _id(plan["plan_id"])
+        exact_fields(plan, {"plan_id", "summary", "evidence_ids", "actions"}, {"plan_id", "summary", "evidence_ids", "actions"})
+        record_identifier(plan["plan_id"])
         _text(plan["summary"], "plan explanation")
         _ids(plan["evidence_ids"], allow_empty=False)
         if not isinstance(plan["actions"], list) or not 0 < len(plan["actions"]) <= 100:
@@ -821,8 +870,8 @@ class WorkflowEngine:
         for action in plan["actions"]:
             fields = {"action_id", "kind", "target", "benefit", "risk", "reversibility", "verification", "mutating", "requires_os_consent", "requires_recovery", "recovery_evidence_ids", "estimate_evidence_id", "adapter_id", "adapter_payload_evidence_id", "adapter_payload_sha256", "adapter_plan_sha256", "target_inventory_evidence_id", "target_inventory_sha256"}
             required = fields - {"estimate_evidence_id"}
-            _fields(action, fields, required)
-            _id(action["action_id"])
+            exact_fields(action, fields, required)
+            record_identifier(action["action_id"])
             if action["action_id"] in seen or action["kind"] not in KINDS:
                 raise WorkflowRefusal("Action identifiers must be unique and kinds supported")
             seen.add(action["action_id"])
@@ -830,19 +879,19 @@ class WorkflowEngine:
                 _text(action[field], "action " + field, 2000)
             if any(type(action[key]) is not bool for key in ("mutating", "requires_os_consent", "requires_recovery")):
                 raise WorkflowRefusal("Action safety flags must be explicit booleans")
-            if action["adapter_id"] == "system.reviewed_external.v3" and action["requires_os_consent"] is not True:
+            if action["adapter_id"] == pc_records.ADAPTER_SYSTEM_REVIEWED_EXTERNAL and action["requires_os_consent"] is not True:
                 raise WorkflowRefusal("Every fixed local external installer requires actual owner-handled protected-system consent")
             if action["kind"] != "assessment" and not action["mutating"]:
                 raise WorkflowRefusal("Change kinds cannot be disguised as read-only actions")
             if not isinstance(action["adapter_id"], str):
                 raise WorkflowRefusal("Adapter identifier must name a fixed supported recipe")
-            supported = ADAPTERS.get(action["adapter_id"], ())
-            if isinstance(supported, str):
-                supported = (supported,)
-            if action["kind"] not in supported or action["adapter_id"].startswith("fixture.") and state["mode"] != "fixture":
+            facts = _facts(action)
+            if action["kind"] not in facts["kinds"] or action["adapter_id"] == pc_records.ADAPTER_FIXTURE_ASSESSMENT and state["mode"] != "fixture":
                 raise WorkflowRefusal("This action has no fixed supported adapter for this kind and mode")
+            if facts["backup_receipt"] == "required" and not action["requires_recovery"]:
+                raise WorkflowRefusal("This adapter consumes a verified backup receipt; bind its recovery evidence")
             for field in ("adapter_payload_evidence_id", "target_inventory_evidence_id"):
-                _id(action[field])
+                record_identifier(action[field])
             for field in ("adapter_payload_sha256", "adapter_plan_sha256", "target_inventory_sha256"):
                 if not isinstance(action[field], str) or not SHA.fullmatch(action[field]):
                     raise WorkflowRefusal("Exact adapter payload, lower-level plan and target inventory hashes are required")
@@ -852,70 +901,56 @@ class WorkflowEngine:
             if action["requires_recovery"] and not action["recovery_evidence_ids"]:
                 raise WorkflowRefusal("Required recovery has not been provided")
             if "estimate_evidence_id" in action:
-                _id(action["estimate_evidence_id"])
+                record_identifier(action["estimate_evidence_id"])
 
-    def _action_binding(self, state, action):
-        payload_row = self._evidence(state, [action["adapter_payload_evidence_id"]], kinds={"adapter_payload"})[0]
-        inventory_row = self._evidence(state, [action["target_inventory_evidence_id"]], kinds={"inventory"})[0]
+    def action_binding(self, state, action):
+        payload_row = self.evidence_rows(state, [action["adapter_payload_evidence_id"]], kinds={"adapter_payload"})[0]
+        inventory_row = self.evidence_rows(state, [action["target_inventory_evidence_id"]], kinds={"inventory"})[0]
         if payload_row["sha256"] != action["adapter_payload_sha256"] or inventory_row["sha256"] != action["target_inventory_sha256"]:
             raise WorkflowRefusal("Exact reviewed adapter payload or target inventory has changed")
         directory = self._directory(state["session_id"])
-        payload = _decode(self._read_owned(directory / payload_row["path"]))
-        inventory = _decode(self._read_owned(directory / inventory_row["path"]))
-        if action["adapter_id"] == "fixture.assessment.v3":
-            _fields(payload, {"schema_version", "operation", "fixture_plan", "fixture_plan_sha256", "inventory_sha256"}, {"schema_version", "operation", "fixture_plan", "fixture_plan_sha256", "inventory_sha256"})
-            if payload["schema_version"] != "patchcairn.fixture.adapter.v3" or payload["operation"] != action["adapter_id"] or digest(payload["fixture_plan"]) != action["adapter_plan_sha256"] or payload["fixture_plan_sha256"] != action["adapter_plan_sha256"] or payload["inventory_sha256"] != digest(inventory):
+        payload, inventory = (decode_record(self._read_owned(directory / row["path"], EVIDENCE_MAX_BYTES), max_bytes=EVIDENCE_MAX_BYTES,
+                                            max_nodes=EVIDENCE_MAX_NODES) for row in (payload_row, inventory_row))
+        if action["adapter_id"] == pc_records.ADAPTER_FIXTURE_ASSESSMENT:
+            typed_record(payload, FIXTURE_ADAPTER)
+            if payload["operation"] != action["adapter_id"] or digest(payload["fixture_plan"]) != action["adapter_plan_sha256"] or payload["fixture_plan_sha256"] != action["adapter_plan_sha256"] or payload["inventory_sha256"] != digest(inventory):
                 raise WorkflowRefusal("Fictional adapter payload does not bind its exact plan and inventory")
-        elif action["adapter_id"] == "diagnostic.read_recipe.v3":
-            _fields(payload, {"schema_version", "operation", "request", "request_sha256", "inventory_sha256"}, {"schema_version", "operation", "request", "request_sha256", "inventory_sha256"})
-            if payload["schema_version"] != "patchcairn.diagnostic.adapter.v3" or payload["operation"] != action["adapter_id"] or payload["request_sha256"] != action["adapter_plan_sha256"] or digest(payload["request"]) != action["adapter_plan_sha256"] or payload["inventory_sha256"] != digest(inventory) or payload["request"] != inventory:
+        elif action["adapter_id"] == pc_records.ADAPTER_DIAGNOSTIC_COLLECT:
+            typed_record(payload, DIAGNOSTIC_ADAPTER)
+            if payload["operation"] != action["adapter_id"] or payload["request_sha256"] != action["adapter_plan_sha256"] or digest(payload["request"]) != action["adapter_plan_sha256"] or payload["inventory_sha256"] != digest(inventory) or payload["request"] != inventory:
                 raise WorkflowRefusal("Diagnostic request does not match the exact reviewed selected recipe and inventory")
             _json_data(payload["request"])
             try:
-                from diagnostic_core import validate_request, DiagnosticRefusal
-                request = validate_request(payload["request"])
-            except ImportError as error:
-                raise WorkflowRefusal("The supported diagnostic validator is unavailable") from error
-            except DiagnosticRefusal as error:
+                request = diagnostic_core.validate_request(payload["request"])
+            except diagnostic_core.DiagnosticRefusal as error:
                 raise WorkflowRefusal("Diagnostic request is not a supported bounded recipe") from error
             if request["mode"] != state["mode"] or request["platform"] != state["platform"]:
                 raise WorkflowRefusal("Diagnostic request belongs to a different creation mode/platform")
-        elif action["adapter_id"] == "system.reviewed_external.v3":
-            _fields(payload, {"schema_version", "operation", "external_plan", "external_plan_sha256", "inventory_sha256"}, {"schema_version", "operation", "external_plan", "external_plan_sha256", "inventory_sha256"})
-            if payload["schema_version"] != "patchcairn.external.adapter.v3" or payload["operation"] != action["adapter_id"] or payload["external_plan_sha256"] != action["adapter_plan_sha256"] or digest(payload["external_plan"]) != action["adapter_plan_sha256"] or payload["inventory_sha256"] != digest(inventory):
+        elif action["adapter_id"] == pc_records.ADAPTER_SYSTEM_REVIEWED_EXTERNAL:
+            typed_record(payload, EXTERNAL_ADAPTER)
+            if payload["operation"] != action["adapter_id"] or payload["external_plan_sha256"] != action["adapter_plan_sha256"] or digest(payload["external_plan"]) != action["adapter_plan_sha256"] or payload["inventory_sha256"] != digest(inventory):
                 raise WorkflowRefusal("External handoff does not match its exact reviewed plan and inventory")
-            self._external_plan(state, payload["external_plan"], inventory)
+            self.validate_external_plan(state, payload["external_plan"], inventory)
             if payload["external_plan"]["kind"] != action["kind"]:
                 raise WorkflowRefusal("External handoff kind differs from the exact engine action")
             if action["requires_os_consent"] is not True:
                 raise WorkflowRefusal("A local installer handoff requires actual owner-handled protected-system consent")
-        else:
-            fields = {"schema_version", "operation", "storage_plan", "storage_plan_sha256", "output_root", "mode", "protected_roots"}
-            _fields(payload, fields | {"restore_probe_destination"}, fields)
-            if payload["schema_version"] != "patchcairn.storage.adapter.v3" or payload["operation"] != action["adapter_id"] or payload["mode"] != state["mode"] or not isinstance(payload["storage_plan"], dict) or digest(payload["storage_plan"]) != action["adapter_plan_sha256"] or payload["storage_plan_sha256"] != action["adapter_plan_sha256"]:
-                raise WorkflowRefusal("Storage adapter payload does not match the exact reviewed lower-level plan")
-            if not isinstance(payload["protected_roots"], list) or len(payload["protected_roots"]) > 30:
-                raise WorkflowRefusal("Storage adapter needs bounded explicit protected roots")
-            for protected in payload["protected_roots"]:
-                if not isinstance(protected, str) or not Path(protected).is_absolute() or ".." in Path(protected).parts:
-                    raise WorkflowRefusal("Protected roots must be exact absolute paths")
+        elif action["adapter_id"] in STORAGE_ADAPTERS:
+            _checked(storage_contract.validate_payload, payload, adapter_id=action["adapter_id"], mode=state["mode"], plan_sha256=action["adapter_plan_sha256"])
             _json_data(payload["storage_plan"])
-            expected_kind = {"storage.backup_create.v3": "backup", "storage.backup_restore.v3": "restore", "storage.cleanup_quarantine.v3": "quarantine", "storage.quarantine_restore.v3": "quarantine_restore", "storage.permanent_purge.v3": "purge"}[action["adapter_id"]]
-            if payload["storage_plan"].get("schema_version") != "patchcairn.storage.v3" or payload["storage_plan"].get("kind") != expected_kind:
-                raise WorkflowRefusal("Storage plan kind/version differs from the fixed reviewed adapter")
             output_value = Path(_text(payload["output_root"], "owned storage output root", 2000))
             if not output_value.is_absolute():
                 raise WorkflowRefusal("Storage output root must be an exact absolute owned work path")
-            output = _no_links(output_value)
+            output = no_links(output_value)
             try:
                 output.relative_to(self.root / "work")
             except ValueError as error:
                 raise WorkflowRefusal("Adapter outputs must stay inside this repository's owned work tree") from error
             probe_value = payload.get("restore_probe_destination")
             if probe_value is not None:
-                if action["adapter_id"] != "storage.backup_create.v3" or not isinstance(probe_value, str) or not Path(probe_value).is_absolute():
+                if action["adapter_id"] != pc_records.ADAPTER_STORAGE_BACKUP_CREATE or not isinstance(probe_value, str) or not Path(probe_value).is_absolute():
                     raise WorkflowRefusal("Only an explicitly reviewed backup action can include an exact owned restore-probe destination")
-                probe = _no_links(Path(probe_value))
+                probe = no_links(Path(probe_value))
                 try:
                     probe.relative_to(output)
                 except ValueError as error:
@@ -925,12 +960,14 @@ class WorkflowEngine:
             source_inventory = payload["storage_plan"].get("inventory", payload["storage_plan"].get("records", payload["storage_plan"].get("receipt")))
             if source_inventory is None or digest(source_inventory) != digest(inventory):
                 raise WorkflowRefusal("Adapter target inventory is not the exact owned inventory/receipt reviewed in the lower-level plan")
+        else:
+            # A registered adapter whose family code is not written yet: the facts allow it, nothing binds it.
+            raise WorkflowRefusal("This adapter's payload binding is not written yet; the action is held", code="adapter-held")
         return payload
 
-    def _external_plan(self, state, plan, inventory):
-        fields = {"schema_version", "kind", "platform", "mode", "catalog_id", "official_tool", "argv", "targets", "target_versions", "target_identities", "sources", "provenance_evidence_ids", "compatibility_evidence_ids", "recovery_plan", "recovery_plan_sha256", "verification_plan", "verification_plan_sha256", "scope"}
-        _fields(plan, fields, fields)
-        if plan["schema_version"] != "patchcairn.external.plan.v3" or plan["kind"] not in {"update", "repair"} or plan["platform"] != state["platform"] or plan["mode"] != state["mode"] or plan["scope"] != state["settings"]["scope"]:
+    def validate_external_plan(self, state, plan, inventory):
+        typed_record(plan, EXTERNAL_PLAN)
+        if plan["kind"] not in {"update", "repair"} or plan["platform"] != state["platform"] or plan["mode"] != state["mode"] or plan["scope"] != state["settings"]["scope"]:
             raise WorkflowRefusal("External plan must bind this exact session's kind, platform, mode and scope")
         if plan["kind"] == "repair":
             raise WorkflowRefusal("This component repair is held: no supported component-specific rollback verifier or separately authorized no-recovery-risk policy exists. An ordinary file ZIP and restore probe cannot establish operating-system or application rollback")
@@ -945,7 +982,7 @@ class WorkflowEngine:
             raise WorkflowRefusal("Every update target requires exact channel, architecture, publisher, content and source identities")
         for identity in identities.values():
             fields = {"channel", "architecture", "publisher", "content_sha256", "source_id", "installation_scope"}
-            _fields(identity, fields, fields)
+            exact_fields(identity, fields, fields)
             if any(not isinstance(identity[key], str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,95}", identity[key]) or identity[key].lower() in {"unknown", "latest", "any"} for key in ("channel", "source_id")) or identity["architecture"] not in {"x86", "x64", "arm64", "universal", "all"} or not isinstance(identity["content_sha256"], str) or not SHA.fullmatch(identity["content_sha256"]):
                 raise WorkflowRefusal("Update artifact/channel/architecture/source identities must be exact and known")
             publisher = _text(identity["publisher"], "verified publisher", 200)
@@ -984,25 +1021,23 @@ class WorkflowEngine:
             parsed = urlsplit(source)
             if parsed.scheme != "https" or not parsed.hostname or "." not in parsed.hostname or parsed.username or parsed.password or parsed.port not in {None, 443}:
                 raise WorkflowRefusal("External source must be an explicit ordinary HTTPS URL without credentials")
-        self._evidence(state, plan["provenance_evidence_ids"], kinds={"research", "review", "inventory"})
-        self._evidence(state, plan["compatibility_evidence_ids"], kinds={"research", "review", "inventory"})
-        recovery = plan["recovery_plan"]
-        _fields(recovery, {"schema_version", "strategy", "evidence_ids", "limits"}, {"schema_version", "strategy", "evidence_ids", "limits"})
-        if recovery["schema_version"] != "patchcairn.external.recovery.v3" or recovery["strategy"] not in {"verified_backup", "publisher_rollback", "no_verified_rollback"} or digest(recovery) != plan["recovery_plan_sha256"]:
+        self.evidence_rows(state, plan["provenance_evidence_ids"], kinds={"research", "review", "inventory"})
+        self.evidence_rows(state, plan["compatibility_evidence_ids"], kinds={"research", "review", "inventory"})
+        recovery = typed_record(plan["recovery_plan"], EXTERNAL_RECOVERY)
+        if recovery["strategy"] not in {"verified_backup", "publisher_rollback", "no_verified_rollback"} or digest(recovery) != plan["recovery_plan_sha256"]:
             raise WorkflowRefusal("External recovery plan and exact limits must be reviewed and hash-bound")
         _text(recovery["limits"], "recovery limits", 2000)
-        self._evidence(state, recovery["evidence_ids"], allow_empty=recovery["strategy"] == "no_verified_rollback")
+        self.evidence_rows(state, recovery["evidence_ids"], allow_empty=recovery["strategy"] == "no_verified_rollback")
         if recovery["strategy"] == "verified_backup":
-            self._recovery(state, recovery["evidence_ids"])
-        verification = plan["verification_plan"]
-        _fields(verification, {"schema_version", "original_success_condition", "checks"}, {"schema_version", "original_success_condition", "checks"})
-        if verification["schema_version"] != "patchcairn.external.verification.v3" or digest(verification) != plan["verification_plan_sha256"] or not isinstance(verification["checks"], list) or not 1 <= len(verification["checks"]) <= 20:
+            self.verify_recovery(state, recovery["evidence_ids"])
+        verification = typed_record(plan["verification_plan"], EXTERNAL_VERIFICATION)
+        if digest(verification) != plan["verification_plan_sha256"] or not isinstance(verification["checks"], list) or not 1 <= len(verification["checks"]) <= 20:
             raise WorkflowRefusal("An exact behavior verification plan is required for the external handoff")
         _text(verification["original_success_condition"], "original success condition", 2000)
         seen = set()
         for check in verification["checks"]:
-            _fields(check, {"check_id", "description", "expected_result"}, {"check_id", "description", "expected_result"})
-            _id(check["check_id"])
+            exact_fields(check, {"check_id", "description", "expected_result"}, {"check_id", "description", "expected_result"})
+            record_identifier(check["check_id"])
             if check["check_id"] in seen:
                 raise WorkflowRefusal("Verification check IDs must be unique")
             seen.add(check["check_id"])
@@ -1010,20 +1045,18 @@ class WorkflowEngine:
             _text(check["expected_result"], "expected verification result", 2000)
 
     def _external_preflight(self, state, action, rows):
-        payload = self._action_binding(state, action)
+        payload = self.action_binding(state, action)
         external = payload["external_plan"]
-        fields = {"schema_version", "action_id", "plan_sha256", "external_plan_sha256", "mode", "platform", "observed_utc", "targets"}
         for row in rows:
-            proof = _decode(self._read_owned(self._directory(state["session_id"]) / row["path"]))
-            _fields(proof, fields, fields)
-            if proof["schema_version"] != "patchcairn.external.preflight.v3" or proof["action_id"] != action["action_id"] or proof["plan_sha256"] != state["plan"]["sha256"] or proof["external_plan_sha256"] != action["adapter_plan_sha256"] or proof["mode"] != state["mode"] or proof["platform"] != state["platform"] or not isinstance(proof["targets"], dict) or set(proof["targets"]) != set(external["targets"]):
+            proof = typed_record(decode_record(self._read_owned(self._directory(state["session_id"]) / row["path"])), EXTERNAL_PREFLIGHT)
+            if proof["action_id"] != action["action_id"] or proof["plan_sha256"] != state["plan"]["sha256"] or proof["external_plan_sha256"] != action["adapter_plan_sha256"] or proof["mode"] != state["mode"] or proof["platform"] != state["platform"] or not isinstance(proof["targets"], dict) or set(proof["targets"]) != set(external["targets"]):
                 raise WorkflowRefusal("An external handoff requires an actual exact current artifact/provenance preflight before the mutation ticket")
             _fresh(proof["observed_utc"], after=state["plan"]["registered_utc"], seconds=900)
             for target, observed in proof["targets"].items():
                 identity = external["target_identities"][target]
                 expected = {**identity, "version": external["target_versions"][target]}
                 additional = {"artifact_path", "artifact_record", "signature_evidence_id", "metadata_evidence_id"}
-                _fields(observed, set(expected) | additional, set(expected) | additional)
+                exact_fields(observed, set(expected) | additional, set(expected) | additional)
                 if any(observed[key] != value for key, value in expected.items()):
                     raise WorkflowRefusal("Actual selected artifact version, variant, publisher or source differs from the reviewed offer")
                 if observed["artifact_path"] != external["argv"][1]:
@@ -1035,200 +1068,137 @@ class WorkflowEngine:
                     relative = artifact.relative_to(self.root / "work").as_posix()
                 except ValueError as error:
                     raise WorkflowRefusal("External preflight artifacts must remain in owned repository work") from error
-                try:
-                    from storage_ops import _protected
-                    from scoped_fs import ScopedRoot, ScopedFSError
-                    if _protected(relative) or artifact.suffix.casefold() not in {".msi", ".pkg", ".deb"}:
-                        raise WorkflowRefusal("Known private-store names and unsupported external artifact formats stay unopened")
-                    with ScopedRoot(str(artifact.parent), quiet_workspace=True) as pinned:
-                        actual = pinned.inspect(artifact.name, hash_file=True, max_bytes=64 * 1024 * 1024)
-                    if actual.get("kind") != "file" or actual.get("sha256") != identity["content_sha256"] or actual != observed["artifact_record"]:
-                        raise WorkflowRefusal("The actual selected official artifact bytes differ from the approved content hash")
-                except ImportError as error:
-                    raise WorkflowRefusal("The supported bounded native artifact verifier is unavailable") from error
-                except ScopedFSError as error:
-                    raise WorkflowRefusal("Actual native external artifact verification refused; no weaker fallback") from error
-                signature_row = self._evidence(state, [observed["signature_evidence_id"]], kinds={"research", "precondition"}, after=state["plan"]["registered_utc"], seconds=900)[0]
-                signature = _decode(self._read_owned(self._directory(state["session_id"]) / signature_row["path"]))
-                signature_fields = {"schema_version", "mode", "platform", "artifact_sha256", "publisher", "status", "source_id", "method", "observed_utc"}
-                _fields(signature, signature_fields, signature_fields)
+                if pc_paths.protected(relative) or artifact.suffix.casefold() not in {".msi", ".pkg", ".deb"}:
+                    raise WorkflowRefusal("Known private-store names and unsupported external artifact formats stay unopened")
+                self._verify({"kind": "installer_artifact", "path": str(artifact), "record": observed["artifact_record"],
+                              "sha256": identity["content_sha256"]})
+                signature_row = self.evidence_rows(state, [observed["signature_evidence_id"]], kinds={"research", "precondition"}, after=state["plan"]["registered_utc"], seconds=900)[0]
+                signature = typed_record(decode_record(self._read_owned(self._directory(state["session_id"]) / signature_row["path"])), PUBLISHER_SIGNATURE)
                 method = {"windows": "windows.authenticode", "macos": "apple.pkgutil_check_signature", "linux": "distribution.signed_metadata"}[state["platform"]]
-                if signature["schema_version"] != "patchcairn.publisher.signature.v3" or signature["mode"] != state["mode"] or signature["platform"] != state["platform"] or signature["artifact_sha256"] != identity["content_sha256"] or signature["publisher"] != identity["publisher"] or signature["source_id"] != identity["source_id"] or signature["method"] != method or signature["status"] != "verified":
+                if signature["mode"] != state["mode"] or signature["platform"] != state["platform"] or signature["artifact_sha256"] != identity["content_sha256"] or signature["publisher"] != identity["publisher"] or signature["source_id"] != identity["source_id"] or signature["method"] != method or signature["status"] != "verified":
                     raise WorkflowRefusal("A current actual publisher/signature verification receipt for the exact artifact and source is required")
                 _fresh(signature["observed_utc"], after=state["plan"]["registered_utc"], seconds=900)
-                metadata_row = self._evidence(state, [observed["metadata_evidence_id"]], kinds={"research", "precondition"}, after=state["plan"]["registered_utc"], seconds=900)[0]
-                metadata = _decode(self._read_owned(self._directory(state["session_id"]) / metadata_row["path"]))
-                metadata_fields = {"schema_version", "mode", "platform", "artifact_sha256", "target_id", "version", "channel", "architecture", "installation_scope", "publisher", "source_id", "observed_utc"}
-                _fields(metadata, metadata_fields, metadata_fields)
-                if metadata["schema_version"] != "patchcairn.installer.metadata.v3" or metadata["mode"] != state["mode"] or metadata["platform"] != state["platform"] or metadata["artifact_sha256"] != identity["content_sha256"] or metadata["target_id"] != target or any(metadata[key] != value for key, value in expected.items() if key != "content_sha256"):
+                metadata_row = self.evidence_rows(state, [observed["metadata_evidence_id"]], kinds={"research", "precondition"}, after=state["plan"]["registered_utc"], seconds=900)[0]
+                metadata = typed_record(decode_record(self._read_owned(self._directory(state["session_id"]) / metadata_row["path"])), INSTALLER_METADATA)
+                if metadata["mode"] != state["mode"] or metadata["platform"] != state["platform"] or metadata["artifact_sha256"] != identity["content_sha256"] or metadata["target_id"] != target or any(metadata[key] != value for key, value in expected.items() if key != "content_sha256"):
                     raise WorkflowRefusal("Actual package metadata does not establish the approved version, variant, publisher and source for this exact artifact")
                 _fresh(metadata["observed_utc"], after=state["plan"]["registered_utc"], seconds=900)
 
-    def _work_artifact(self, path, expected_sha256, *, output_root=None, record=None, quarantined_source=False, max_bytes=64 * 1024 * 1024):
-        if type(max_bytes) is not int or not 0 < max_bytes <= 64 * 1024 * 1024:
-            raise WorkflowRefusal("Owned artifact read limits cannot exceed the existing recovery cap")
-        value = Path(_text(path, "owned recovery artifact path", 2000))
-        if not value.is_absolute():
-            raise WorkflowRefusal("Recovery artifact paths must be exact absolute owned work paths")
-        value = _no_links(value)
-        if output_root is None or not Path(output_root).is_absolute():
-            raise WorkflowRefusal("Recovery bytes require their exact owned private output root")
-        output_root = _no_links(Path(output_root))
+    def _verify(self, binding):
+        """Re-read recovery or artifact bytes from disk through the injected verifier (D-018, PD-3)."""
+        if self.verify_artifact is None:
+            raise WorkflowRefusal("Recovery and artifact bytes cannot be re-checked without the service's storage verifier; the action is held", code="verifier-missing")
         try:
-            output_root.relative_to(self.root / "work")
-            relative = value.relative_to(output_root)
+            result = self.verify_artifact(copy.deepcopy(binding))
+        except WorkflowRefusal:
+            raise
+        except pc_records.Refusal as error:
+            raise WorkflowRefusal(str(error), code=error.code) from error
+        if result is not None:
+            raise WorkflowRefusal("The artifact verifier must return nothing and refuse by raising", code="verifier-contract")
+
+    def _owned_output(self, value):
+        root = Path(_text(value, "recovery output root", 2000))
+        if not root.is_absolute():
+            raise WorkflowRefusal("Recovery output root must be an exact absolute owned work path")
+        root = no_links(root)
+        try:
+            root.relative_to(self.root / "work")
         except ValueError as error:
             raise WorkflowRefusal("Recovery artifacts must remain in the exact owned work output root") from error
+        return root
+
+    def _work_artifact(self, path, expected_sha256, *, output_root, max_bytes=SERVICE_RECORD_MAX_BYTES):
+        """Bytes of a private record under an owned work root (a service receipt), admitted before they are read."""
+        value = Path(_text(path, "owned record path", 2000))
+        if not value.is_absolute() or output_root is None or not Path(output_root).is_absolute():
+            raise WorkflowRefusal("Owned records need exact absolute owned work paths")
+        value, output_root = no_links(value), self._owned_output(str(output_root))
+        try:
+            relative = value.relative_to(output_root)
+        except ValueError as error:
+            raise WorkflowRefusal("Owned records must remain in the exact owned work root") from error
         current = _private_directory(output_root)
         for part in relative.parts[:-1]:
             current = _private_directory(current / part)
-        # Quarantine preserves POSIX source modes; its checked private parents
-        # protect those source bytes. Native Windows files still require DACL
-        # admission. All created recovery records/probes require private files.
-        private_file = os.name != "posix" or not quarantined_source
-        if private_file:
-            _private_file(value)
-        else:
-            _linux_private_filesystem(value)
-        data = _read(value, max_bytes, private=private_file)
+        data = read_record_bytes(value, max_bytes, private=True)
         if not isinstance(expected_sha256, str) or digest(data) != expected_sha256:
-            raise WorkflowRefusal("Required recovery artifact bytes changed")
-        if record is not None:
-            if not isinstance(record, dict) or record.get("kind") != "file" or record.get("sha256") != expected_sha256 or output_root is not None and record.get("relative_path") != value.relative_to(output_root).as_posix():
-                raise WorkflowRefusal("Recovery native identity record is missing or mismatched")
-            if output_root is None:
-                raise WorkflowRefusal("Native recovery records require an exact owned output root")
-            try:
-                from scoped_fs import ScopedRoot, ScopedFSError
-                with ScopedRoot(str(output_root), quiet_workspace=True) as pinned:
-                    observed = pinned.inspect(record["relative_path"], hash_file=True, max_bytes=max_bytes)
-                    if observed != record:
-                        raise WorkflowRefusal("Required recovery artifact native identity or freshness changed")
-                    observed_data = pinned.read_bytes(record["relative_path"], expected=record, max_bytes=max_bytes)
-                if observed_data != data or digest(observed_data) != expected_sha256:
-                    raise WorkflowRefusal("Recovery content changed between native admission and read")
-            except ImportError as error:
-                raise WorkflowRefusal("The supported native recovery identity adapter is unavailable") from error
-            except ScopedFSError as error:
-                raise WorkflowRefusal("Native recovery identity or content reinspection refused; no weaker fallback") from error
+            raise WorkflowRefusal("Required owned record bytes changed")
         return data
 
-    def _retention(self, state, evidence_id, artifacts):
-        row = self._evidence(state, [evidence_id], kinds={"retention"})[0]
-        retention = _decode(self._read_owned(self._directory(state["session_id"]) / row["path"]))
-        _fields(retention, {"schema_version", "session_id", "required", "artifacts"}, {"schema_version", "session_id", "required", "artifacts"})
-        if retention["schema_version"] != "patchcairn.recovery.retention.v3" or retention["session_id"] != state["session_id"] or retention["required"] is not True or retention["artifacts"] != artifacts:
+    def _retention(self, state, evidence_id):
+        row = self.evidence_rows(state, [evidence_id], kinds={"retention"})[0]
+        data = self._read_owned(self._directory(state["session_id"]) / row["path"], EVIDENCE_MAX_BYTES)
+        retention = typed_record(decode_record(data, max_bytes=EVIDENCE_MAX_BYTES, max_nodes=EVIDENCE_MAX_NODES), RECOVERY_RETENTION)
+        if retention["session_id"] != state["session_id"] or retention["required"] is not True or not isinstance(retention["artifacts"], dict):
             raise WorkflowRefusal("A current exact retention record must protect every actual required recovery artifact")
+        return retention["artifacts"]
 
     def _quarantine_recovery(self, state, binding, action):
-        fields = {"schema_version", "output_root", "quarantine_receipt", "restore_plan", "restore_plan_sha256", "retention_evidence_id"}
-        _fields(binding, fields, fields)
-        if not action or action["adapter_id"] != "storage.quarantine_restore.v3" or binding["restore_plan_sha256"] != action["adapter_plan_sha256"] or digest(binding["restore_plan"]) != action["adapter_plan_sha256"]:
+        typed_record(binding, QUARANTINE_RECOVERY)
+        if not action or action["adapter_id"] != pc_records.ADAPTER_STORAGE_QUARANTINE_RESTORE or binding["restore_plan_sha256"] != action["adapter_plan_sha256"] or digest(binding["restore_plan"]) != action["adapter_plan_sha256"]:
             raise WorkflowRefusal("Quarantine recovery applies only to its exact reviewed quarantine-restore action, never to a generic repair or purge")
-        payload = self._action_binding(state, action)
+        payload = self.action_binding(state, action)
         if payload["output_root"] != binding["output_root"] or payload["storage_plan"] != binding["restore_plan"] or payload["storage_plan"].get("receipt") != binding["quarantine_receipt"]:
             raise WorkflowRefusal("Quarantine recovery differs from the exact approved native restore mapping")
-        output = _no_links(Path(binding["output_root"]))
+        output, receipt = self._owned_output(binding["output_root"]), binding["quarantine_receipt"]
         try:
-            from storage_ops import StorageService, StorageRefusal
-            from scoped_fs import ScopedFSError
-            storage = StorageService(output_root=str(output), quiet_workspace=True, protected_roots=payload["protected_roots"])
-            storage.check_preconditions(plan=binding["restore_plan"], expected_plan_sha256=action["adapter_plan_sha256"])
-        except ImportError as error:
-            raise WorkflowRefusal("The supported native quarantine-restore verifier is unavailable") from error
-        except (StorageRefusal, ScopedFSError) as error:
-            raise WorkflowRefusal("Native quarantine recovery identity, provenance, original mapping or no-overwrite preconditions refused") from error
-        receipt = binding["quarantine_receipt"]
-        attempt_path = output / receipt["attempt"]
-        outcome_path = output / ("outcome-quarantine-" + receipt["plan_sha256"] + ".json")
-        attempt_bytes = _read(attempt_path, 64 * 1024 * 1024, private=True)
-        retained = {str(attempt_path): digest(attempt_bytes), str(outcome_path): digest(receipt)}
-        self._work_artifact(str(outcome_path), digest(receipt), output_root=output)
-        for row in receipt["records"]:
-            record = row["quarantine_record"]
-            target = output / record["relative_path"]
-            self._work_artifact(str(target), record["sha256"], output_root=output, record=record, quarantined_source=True)
-            retained[str(target)] = record["sha256"]
-        self._retention(state, binding["retention_evidence_id"], retained)
+            attempt_path = output / receipt["attempt"]
+            retained = {str(output / ("outcome-quarantine-" + receipt["plan_sha256"] + ".json")): digest(receipt)}
+            retained.update({str(output / row["quarantine_record"]["relative_path"]): row["quarantine_record"]["sha256"] for row in receipt["records"]})
+        except (KeyError, TypeError) as error:
+            raise WorkflowRefusal("Quarantine recovery needs the exact typed original quarantine receipt") from error
+        artifacts = self._retention(state, binding["retention_evidence_id"])
+        # The attempt record's digest is checked against its bytes by the verifier.
+        retained[str(attempt_path)] = artifacts.get(str(attempt_path))
+        if not isinstance(retained[str(attempt_path)], str) or artifacts != retained:
+            raise WorkflowRefusal("A current exact retention record must protect every actual required recovery artifact")
+        self._verify({"kind": "quarantine_recovery", "output_root": str(output), "protected_roots": payload["protected_roots"],
+                      "restore_plan": binding["restore_plan"], "restore_plan_sha256": action["adapter_plan_sha256"],
+                      "attempt": receipt["attempt"], "attempt_sha256": retained[str(attempt_path)]})
 
-    def _recovery(self, state, evidence_ids, *, action=None):
-        purge_payload = None
-        if action and action["adapter_id"] == "storage.permanent_purge.v3":
-            purge_payload = self._action_binding(state, action)
-            original = purge_payload["storage_plan"].get("receipt")
-            if not isinstance(original, dict) or original.get("schema_version") != "patchcairn.storage.v3" or original.get("kind") != "quarantine_receipt":
-                raise WorkflowRefusal("Purge recovery requires the exact original typed quarantine receipt")
+    def verify_recovery(self, state, evidence_ids, *, action=None):
+        purge_payload = original = None
+        if action and action["adapter_id"] == pc_records.ADAPTER_STORAGE_PURGE:
+            purge_payload = self.action_binding(state, action)
+            original = _storage_record(purge_payload["storage_plan"].get("receipt"), "quarantine_receipt", "Purge recovery requires the exact original typed quarantine receipt")
             if original.get("recovery_required") is not True or not isinstance(original.get("recovery_backup"), dict) or not isinstance(original.get("recovery_verification"), dict):
                 raise WorkflowRefusal("Integrated purge of originally unbacked quarantine is held; an unrelated backup cannot supply its recovery proof")
-        for row in self._evidence(state, evidence_ids, kinds={"recovery"}):
-            binding = _decode(self._read_owned(self._directory(state["session_id"]) / row["path"]))
-            if isinstance(binding, dict) and binding.get("schema_version") == "patchcairn.quarantine.recovery.v3":
+        for row in self.evidence_rows(state, evidence_ids, kinds={"recovery"}):
+            binding = decode_record(self._read_owned(self._directory(state["session_id"]) / row["path"], EVIDENCE_MAX_BYTES), max_bytes=EVIDENCE_MAX_BYTES, max_nodes=EVIDENCE_MAX_NODES)
+            if isinstance(binding, dict) and binding.get("schema") == QUARANTINE_RECOVERY:
                 self._quarantine_recovery(state, binding, action)
                 continue
-            _fields(binding, {"schema_version", "output_root", "backup_receipt", "restore_receipt", "retention_evidence_id"}, {"schema_version", "output_root", "backup_receipt", "restore_receipt", "retention_evidence_id"})
-            if binding["schema_version"] != "patchcairn.recovery.binding.v3":
-                raise WorkflowRefusal("An exact backup/restore/retention recovery binding is required")
+            typed_record(binding, RECOVERY_BINDING)
             backup, restore = binding["backup_receipt"], binding["restore_receipt"]
             if purge_payload and (binding["output_root"] != purge_payload["output_root"] or backup != original["recovery_backup"] or restore != original["recovery_verification"]):
                 raise WorkflowRefusal("Purge recovery must match the exact original quarantine backup, restore verification and output root")
-            if not isinstance(backup, dict) or not isinstance(restore, dict) or backup.get("schema_version") != "patchcairn.storage.v3" or backup.get("kind") != "backup_receipt" or backup.get("required_recovery") is not True or restore.get("kind") != "restore_receipt" or restore.get("schema_version") != "patchcairn.storage.v3":
-                raise WorkflowRefusal("Required recovery needs actual typed backup and completed restoration receipts")
-            root_value = Path(_text(binding["output_root"], "recovery output root", 2000))
-            if not root_value.is_absolute():
-                raise WorkflowRefusal("Recovery output root must be an exact absolute owned work path")
-            output_root = _no_links(root_value)
-            archive = self._work_artifact(backup.get("archive"), backup.get("archive_sha256"), output_root=output_root, record=backup.get("archive_record"))
-            manifest_data = self._work_artifact(backup.get("manifest"), backup.get("manifest_sha256"), output_root=output_root, record=backup.get("manifest_record"))
-            manifest = _decode(manifest_data)
-            if manifest.get("schema_version") != "patchcairn.storage.v3" or manifest.get("kind") != "backup_manifest" or manifest.get("required_recovery") is not True or manifest.get("archive_sha256") != digest(archive) or manifest.get("archive_bytes") != len(archive) or manifest.get("plan_sha256") != backup.get("plan_sha256"):
-                raise WorkflowRefusal("Recovery manifest does not bind the actual archive and original backup plan")
-            if purge_payload:
-                originals, backed_files = original.get("records"), manifest.get("files")
-                if not isinstance(manifest.get("source_roots"), list) or not manifest["source_roots"] or manifest["source_roots"] != original.get("source_roots") or not isinstance(originals, list) or not originals or not isinstance(backed_files, list) or not backed_files:
-                    raise WorkflowRefusal("Recovery must cover the exact quarantined originals and selected source roots")
-                def covered_key(file):
-                    if not isinstance(file, dict) or any(not isinstance(file.get(key), str) or not file[key] for key in ("root_id", "relative_path", "sha256")) or not SHA.fullmatch(file["sha256"]) or type(file.get("size")) is not int or file["size"] < 0:
-                        raise WorkflowRefusal("Purge recovery requires exact bounded original/manifest content mappings")
-                    return file["root_id"], file["relative_path"], file["sha256"], file["size"]
-                backed = {covered_key(file) for file in backed_files}
-                if any(not isinstance(record, dict) or covered_key(record.get("original")) not in backed for record in originals):
-                    raise WorkflowRefusal("Recovery must cover the exact quarantined originals by source, path, content and size")
-            if restore.get("backup_plan_sha256") != backup.get("plan_sha256") or restore.get("backup_archive_sha256") != digest(archive) or restore.get("backup_manifest_sha256") != digest(manifest_data) or restore.get("files") != manifest.get("files") or not SHA.fullmatch(str(restore.get("plan_sha256", ""))):
+            message = "Required recovery needs actual typed backup and completed restoration receipts"
+            _storage_record(backup, "backup_receipt", message)
+            _storage_record(restore, "restore_receipt", message)
+            if backup.get("required_recovery") is not True:
+                raise WorkflowRefusal(message)
+            output_root = self._owned_output(binding["output_root"])
+            if restore.get("backup_plan_sha256") != backup.get("plan_sha256") or restore.get("backup_archive_sha256") != backup.get("archive_sha256") or restore.get("backup_manifest_sha256") != backup.get("manifest_sha256") or not SHA.fullmatch(str(restore.get("plan_sha256", ""))):
                 raise WorkflowRefusal("Restoration receipt does not bind this exact verified backup")
-            outcome_path = output_root / ("outcome-restore-" + restore["plan_sha256"] + ".json")
-            self._work_artifact(str(outcome_path), digest(restore), output_root=output_root)
-            files, records = manifest.get("files"), restore.get("records")
-            if not isinstance(files, list) or not isinstance(records, list) or len(files) != len(records) or not 0 < len(files) <= 10000:
+            files = restore.get("files")
+            if not isinstance(files, list) or not 0 < len(files) <= pc_records.MAX_BACKUP_ENTRIES:
                 raise WorkflowRefusal("Restoration must account for every bounded archived file")
-            total, retained = 0, {backup["archive"]: digest(archive), backup["manifest"]: digest(manifest_data), str(outcome_path): digest(restore)}
-            try:
-                with zipfile.ZipFile(io.BytesIO(archive), "r") as zipped:
-                    if zipped.namelist() != [file["entry"] for file in files] or len(set(zipped.namelist())) != len(files):
-                        raise WorkflowRefusal("Recovery ZIP entry mapping differs from the exact manifest")
-                    for file, record in zip(files, records):
-                        info = zipped.getinfo(file["entry"])
-                        entry_type = stat.S_IFMT(info.external_attr >> 16)
-                        if info.flag_bits & 1 or info.compress_type not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED} or entry_type not in {0, stat.S_IFREG}:
-                            raise WorkflowRefusal("Required recovery entries must be ordinary unencrypted files in the supported ZIP formats")
-                        if type(file.get("size")) is not int or not 0 <= file["size"] <= 16 * 1024 * 1024 or info.file_size != file["size"]:
-                            raise WorkflowRefusal("Recovery entry size exceeds the verified bounded contents")
-                        total += file["size"]
-                        if total > 48 * 1024 * 1024:
-                            raise WorkflowRefusal("Recovery total byte cap exceeded")
-                        if digest(zipped.read(file["entry"])) != file.get("sha256"):
-                            raise WorkflowRefusal("Recovery ZIP entry hash differs from its manifest")
-                        expected = Path(restore["destination"]) / file["root_id"] / file["relative_path"]
-                        try:
-                            relative = expected.relative_to(output_root).as_posix()
-                        except ValueError as error:
-                            raise WorkflowRefusal("Restoration probe escapes its owned work output root") from error
-                        if record.get("relative_path") != relative:
-                            raise WorkflowRefusal("Restoration native record does not map the exact original entry")
-                        self._work_artifact(str(expected), file["sha256"], output_root=output_root, record=record)
-                        retained[str(expected)] = file["sha256"]
-            except (zipfile.BadZipFile, KeyError, RuntimeError) as error:
-                raise WorkflowRefusal("Required recovery ZIP or restoration mapping is invalid") from error
-            self._retention(state, binding["retention_evidence_id"], retained)
+            outcome_path = output_root / ("outcome-restore-" + restore["plan_sha256"] + ".json")
+            retained = {backup.get("archive"): backup.get("archive_sha256"), backup.get("manifest"): backup.get("manifest_sha256"), str(outcome_path): digest(restore)}
+            for file in files:
+                try:
+                    expected = Path(restore["destination"]) / file["root_id"] / file["relative_path"]
+                    expected.relative_to(output_root)
+                except (KeyError, TypeError, ValueError) as error:
+                    raise WorkflowRefusal("Restoration probe escapes its owned work output root") from error
+                retained[str(expected)] = file.get("sha256")
+            if self._retention(state, binding["retention_evidence_id"]) != retained:
+                raise WorkflowRefusal("A current exact retention record must protect every actual required recovery artifact")
+            # The archive, manifest, restored files and outcome receipt are re-read from disk by the verifier,
+            # which also checks that the backup covers every quarantined original of a purge.
+            self._verify({"kind": "backup_recovery", "output_root": str(output_root), "backup_receipt": backup,
+                          "restore_receipt": restore, "purge_receipt": original})
 
     def register_plan(self, session_id, *, plan, expected_revision=None):
         document = copy.deepcopy(plan)
@@ -1240,21 +1210,21 @@ class WorkflowEngine:
             if any(op["outcome"] is None for op in state["operations"].values()):
                 raise WorkflowRefusal("Reconcile the active operation before replacing its plan")
             self._validate_plan_document(state, document)
-            self._evidence(state, document["evidence_ids"])
+            self.evidence_rows(state, document["evidence_ids"])
             if not state["scope_authorization"]:
                 raise WorkflowRefusal("The current owner has not authorized this scope")
             consumed = {op["action_id"] for op in state["operations"].values()}
             for action in document["actions"]:
-                self._action_binding(state, action)
+                self.action_binding(state, action)
                 if action["action_id"] in consumed:
                     raise WorkflowRefusal("A consumed action identifier cannot be reused or retried")
                 if action["requires_recovery"] or action["recovery_evidence_ids"]:
-                    self._recovery(state, action["recovery_evidence_ids"], action=action)
+                    self.verify_recovery(state, action["recovery_evidence_ids"], action=action)
                 if action.get("estimate_evidence_id"):
-                    estimate = self._evidence(state, [action["estimate_evidence_id"]], kinds={"inventory"})[0]
+                    estimate = self.evidence_rows(state, [action["estimate_evidence_id"]], kinds={"inventory"})[0]
                     if estimate["facts"].get("action_id") != action["action_id"]:
                         raise WorkflowRefusal("A cost fact must identify this exact action to prevent unrelated or duplicate workload estimates")
-            state["plan"] = {"document": document, "sha256": digest(document), "settings_revision": state["settings_revision"], "registered_utc": utc_now()}
+            state["plan"] = {"document": document, "sha256": digest(document), "settings_revision": state["settings_revision"], "registered_utc": pc_records.utc_now()}
             state["reviews"] = []
             state["approval"] = None
             state["irreversible_ack"] = None
@@ -1262,23 +1232,23 @@ class WorkflowEngine:
         return self._change(session_id, "plan_registered", mutate, expected_revision)
 
     @staticmethod
-    def _plan(state, plan_sha256):
+    def current_plan(state, plan_sha256):
         if not state["plan"] or state["plan"]["sha256"] != plan_sha256 or state["plan"]["settings_revision"] != state["settings_revision"]:
             raise WorkflowRefusal("The exact current plan hash is required")
         return state["plan"]["document"]
 
     def record_review(self, session_id, *, plan_sha256, reviewer_id, role, verdict, evidence_ids, notes, expected_revision=None):
-        _id(reviewer_id, "reviewer identifier")
+        record_identifier(reviewer_id, "reviewer identifier")
         _text(notes, "review notes")
         if role not in ROLES or verdict not in {"approved", "hold"}:
             raise WorkflowRefusal("A supported review role and approved/hold verdict are required")
         def mutate(state):
             self._writable(state)
-            self._plan(state, plan_sha256)
-            self._evidence(state, evidence_ids, kinds={"review"}, after=state["plan"]["registered_utc"])
+            self.current_plan(state, plan_sha256)
+            self.evidence_rows(state, evidence_ids, kinds={"review"}, after=state["plan"]["registered_utc"])
             if reviewer_id == state["owner_id"] or any(row["reviewer_id"] == reviewer_id or row["role"] == role for row in state["reviews"]):
                 raise WorkflowRefusal("Reviews need two distinct independent reviewers, separate from the owner")
-            record = {"reviewer_id": reviewer_id, "role": role, "verdict": verdict, "evidence_ids": list(evidence_ids), "notes": notes, "plan_sha256": plan_sha256, "settings_revision": state["settings_revision"], "recorded_utc": utc_now()}
+            record = {"reviewer_id": reviewer_id, "role": role, "verdict": verdict, "evidence_ids": list(evidence_ids), "notes": notes, "plan_sha256": plan_sha256, "settings_revision": state["settings_revision"], "recorded_utc": pc_records.utc_now()}
             state["reviews"].append(record)
             state["approval"] = None
             return record, "The independent review is recorded against the exact current plan. A held review prevents changes."
@@ -1290,18 +1260,18 @@ class WorkflowEngine:
         for row in state["reviews"]:
             if row["verdict"] != "approved" or row["plan_sha256"] != state["plan"]["sha256"] or row["settings_revision"] != state["settings_revision"]:
                 raise WorkflowRefusal("A review holds this plan or belongs to an earlier plan")
-            self._evidence(state, row["evidence_ids"], kinds={"review"}, after=state["plan"]["registered_utc"])
+            self.evidence_rows(state, row["evidence_ids"], kinds={"review"}, after=state["plan"]["registered_utc"])
 
     def approve_plan(self, session_id, *, plan_sha256, action_ids, owner_quote, owner_message_id, owner_id="owner", source="current_owner_chat", acknowledge_permanent_loss=False, expected_revision=None):
         _ids(action_ids, "approved action identifiers", allow_empty=False)
         def mutate(state):
             self._writable(state)
-            document = self._plan(state, plan_sha256)
+            document = self.current_plan(state, plan_sha256)
             self._reviewed(state)
-            self._evidence(state, document["evidence_ids"])
+            self.evidence_rows(state, document["evidence_ids"])
             if set(action_ids) - {a["action_id"] for a in document["actions"]}:
                 raise WorkflowRefusal("Approval cannot include actions outside the concrete plan")
-            purge_ids = [a["action_id"] for a in document["actions"] if a["kind"] == "permanent_purge" and a["action_id"] in action_ids]
+            purge_ids = [a["action_id"] for a in document["actions"] if "permanent_data_loss" in _acknowledgments(a) and a["action_id"] in action_ids]
             if purge_ids and acknowledge_permanent_loss is not True:
                 raise WorkflowRefusal("Permanent purge needs separate actual-owner acknowledgement of irreversible loss bound to these exact purge actions")
             record = _owner(state, owner_quote, owner_message_id, owner_id, source)
@@ -1316,8 +1286,8 @@ class WorkflowEngine:
             raise WorkflowRefusal("An explicit separate acknowledgement of permanent data loss is required")
         def mutate(state):
             self._writable(state)
-            plan = self._plan(state, plan_sha256)
-            purge = {a["action_id"] for a in plan["actions"] if a["kind"] == "permanent_purge"}
+            plan = self.current_plan(state, plan_sha256)
+            purge = {a["action_id"] for a in plan["actions"] if "permanent_data_loss" in _acknowledgments(a)}
             if set(action_ids) - purge:
                 raise WorkflowRefusal("Irreversible-loss acknowledgement binds only exact current permanent-purge actions")
             record = _owner(state, owner_quote, owner_message_id, owner_id, source)
@@ -1336,13 +1306,12 @@ class WorkflowEngine:
         if not isinstance(action_bindings, list) or not action_bindings or len(action_bindings) > 20:
             raise WorkflowRefusal("Standing policy needs exact adapter payload/plan/inventory hash bindings")
         for binding in action_bindings:
-            _fields(binding, {"adapter_id", "adapter_payload_sha256", "adapter_plan_sha256", "target_inventory_sha256"}, {"adapter_id", "adapter_payload_sha256", "adapter_plan_sha256", "target_inventory_sha256"})
-            supported = ADAPTERS.get(binding["adapter_id"])
-            allowed = set(supported) & POLICY_KINDS if isinstance(supported, tuple) else {supported} & POLICY_KINDS
-            if not allowed or any(not isinstance(binding[key], str) or not SHA.fullmatch(binding[key]) for key in binding if key != "adapter_id"):
+            exact_fields(binding, {"adapter_id", "adapter_payload_sha256", "adapter_plan_sha256", "target_inventory_sha256"}, {"adapter_id", "adapter_payload_sha256", "adapter_plan_sha256", "target_inventory_sha256"})
+            facts = pc_records.ADAPTERS.get(binding["adapter_id"]) if isinstance(binding["adapter_id"], str) else None
+            if not facts or not facts["policy_coverable"] or not set(facts["kinds"]) & set(action_kinds) or any(not isinstance(binding[key], str) or not SHA.fullmatch(binding[key]) for key in binding if key != "adapter_id"):
                 raise WorkflowRefusal("Standing policy binding has unsupported adapter or missing exact hashes")
-        expiry = _time(expires_utc)
-        if not _time(utc_now()) < expiry <= _time(utc_now()) + timedelta(days=7):
+        expiry = utc_time(expires_utc)
+        if not utc_time(pc_records.utc_now()) < expiry <= utc_time(pc_records.utc_now()) + timedelta(days=7):
             raise WorkflowRefusal("Policy expiry must be in the next seven days")
         def mutate(state):
             self._writable(state)
@@ -1359,12 +1328,12 @@ class WorkflowEngine:
         if approval and action["action_id"] in approval["action_ids"] and approval["plan_sha256"] == state["plan"]["sha256"]:
             return {"kind": "exact_plan", "message_id": approval["message_id"], "plan_sha256": state["plan"]["sha256"], "action_id": action["action_id"]}
         policy = state["standing_policy"]
-        if policy and state["settings"]["control"] == "automatic" and policy["settings_revision"] == state["settings_revision"] and policy["scope_sha256"] == digest(state["settings"]["scope"]) and _time(policy["expires_utc"]) > _time(utc_now()) and policy["used_actions"] < policy["max_actions"] and action["kind"] in policy["action_kinds"] and action["target"] in policy["targets"] and {key: action[key] for key in ("adapter_id", "adapter_payload_sha256", "adapter_plan_sha256", "target_inventory_sha256")} in policy["action_bindings"] and not action["requires_os_consent"]:
+        if policy and state["settings"]["control"] == "automatic" and policy["settings_revision"] == state["settings_revision"] and policy["scope_sha256"] == digest(state["settings"]["scope"]) and utc_time(policy["expires_utc"]) > utc_time(pc_records.utc_now()) and policy["used_actions"] < policy["max_actions"] and action["kind"] in policy["action_kinds"] and action["target"] in policy["targets"] and {key: action[key] for key in ("adapter_id", "adapter_payload_sha256", "adapter_plan_sha256", "target_inventory_sha256")} in policy["action_bindings"] and not action["requires_os_consent"] and pc_records.ADAPTERS[action["adapter_id"]]["policy_coverable"] and not pc_records.ADAPTERS[action["adapter_id"]]["irreversible"]:
             return {"kind": "standing_policy", "message_id": policy["message_id"], "plan_sha256": state["plan"]["sha256"], "action_id": action["action_id"]}
         raise WorkflowRefusal("This exact action lacks current owner authority; control style alone never authorizes a change")
 
     @staticmethod
-    def _pending(state):
+    def pending_items(state):
         return [item for item in state["pending"].values() if not item["resolved"]]
 
     def _checkpoint(self, state, name, action_id=None):
@@ -1372,7 +1341,7 @@ class WorkflowEngine:
             return
         token = "checkpoint-" + name + "-" + digest({"stage": state["stage"], "action": action_id, "settings": state["settings_revision"], "plan": state["plan"]["sha256"] if state["plan"] else None})[:20]
         if token not in state["pending"]:
-            state["pending"][token] = {"pending_id": token, "kind": "checkpoint", "checkpoint": name, "action_id": action_id, "created_utc": utc_now(), "resolved": False, "settings_revision": state["settings_revision"]}
+            state["pending"][token] = {"pending_id": token, "kind": "checkpoint", "checkpoint": name, "action_id": action_id, "created_utc": pc_records.utc_now(), "resolved": False, "settings_revision": state["settings_revision"]}
             if state["status"] == "active":
                 state["status"] = "awaiting_user"
 
@@ -1388,10 +1357,10 @@ class WorkflowEngine:
     def record_protected_consent(self, session_id, *, action_id, plan_sha256, evidence_id, owner_quote, owner_message_id, owner_id=None, source="current_owner_chat", expected_revision=None):
         def mutate(state):
             self._writable(state)
-            document = self._plan(state, plan_sha256)
+            document = self.current_plan(state, plan_sha256)
             if action_id not in {a["action_id"] for a in document["actions"] if a["requires_os_consent"]}:
                 raise WorkflowRefusal("This is not a protected-consent action in the current plan")
-            rows = self._evidence(state, [evidence_id], kinds={"protected_consent"}, after=state["plan"]["registered_utc"], seconds=900)
+            rows = self.evidence_rows(state, [evidence_id], kinds={"protected_consent"}, after=state["plan"]["registered_utc"], seconds=900)
             facts = rows[0]["facts"]
             if facts.get("plan_sha256") != plan_sha256 or facts.get("action_id") != action_id or facts.get("actual_os_consent") is not True:
                 raise WorkflowRefusal("Record the actual protected consent result for this exact action")
@@ -1403,51 +1372,51 @@ class WorkflowEngine:
         return self._change(session_id, "protected_consent_recorded", mutate, expected_revision)
 
     def begin_operation(self, session_id, *, action_id, plan_sha256, precondition_evidence_ids, owner_consent_evidence_id=None, expected_revision=None):
-        _id(action_id)
+        record_identifier(action_id)
         def mutate(state):
-            if state["status"] != "active" or state["stage"] != "apply" or self._pending(state):
+            if state["status"] != "active" or state["stage"] != "apply" or self.pending_items(state):
                 raise WorkflowRefusal("New actions wait until the apply stage is active and every hold/checkpoint is resolved")
-            activation = self._require_schedule_activation(state)
+            activation = self.require_schedule_activation(state)
             if self._outstanding_effects():
                 raise WorkflowRefusal("An outstanding mutating operation in this engine registry still needs an actual receipt or effects reconciliation")
-            document = self._plan(state, plan_sha256)
+            document = self.current_plan(state, plan_sha256)
             self._reviewed(state)
-            self._evidence(state, document["evidence_ids"])
+            self.evidence_rows(state, document["evidence_ids"])
             actions = [a for a in document["actions"] if a["action_id"] == action_id]
             if not actions:
                 raise WorkflowRefusal("Action is absent from the exact plan")
             action = actions[0]
-            self._action_binding(state, action)
+            self.action_binding(state, action)
             unconsumed = [a["action_id"] for a in document["actions"] if not any(op["action_id"] == a["action_id"] for op in state["operations"].values())]
             if not unconsumed or action_id != unconsumed[0]:
                 raise WorkflowRefusal("Actions follow the exact reviewed order and their individual checkpoints")
             if any(op["action_id"] == action_id or op["outcome"] is None for op in state["operations"].values()):
                 raise WorkflowRefusal("An action is already active or consumed; no automatic retry")
             authorization = self._authorization(state, action)
-            if action["kind"] == "permanent_purge":
+            for acknowledgment in _acknowledgments(action):
                 ack = state["irreversible_ack"]
-                if not ack or ack["type"] != "permanent_data_loss" or ack["plan_sha256"] != plan_sha256 or action_id not in ack["action_ids"] or ack["settings_revision"] != state["settings_revision"] or ack["scope_sha256"] != digest(state["settings"]["scope"]):
-                    raise WorkflowRefusal("This exact purge still needs a separate actual-owner acknowledgement of irreversible data loss")
-            after = max((state["plan"]["registered_utc"], activation["activated_utc"]), key=_time) if activation else state["plan"]["registered_utc"]
-            rows = self._evidence(state, precondition_evidence_ids, kinds={"precondition"}, after=after, seconds=900)
+                if not ack or ack["type"] != acknowledgment or ack["plan_sha256"] != plan_sha256 or action_id not in ack["action_ids"] or ack["settings_revision"] != state["settings_revision"] or ack["scope_sha256"] != digest(state["settings"]["scope"]):
+                    raise WorkflowRefusal("This exact action still needs the owner's separate acknowledgment: " + acknowledgment.replace("_", " "))
+            after = max((state["plan"]["registered_utc"], activation["activated_utc"]), key=utc_time) if activation else state["plan"]["registered_utc"]
+            rows = self.evidence_rows(state, precondition_evidence_ids, kinds={"precondition"}, after=after, seconds=900)
             required = {"identity_matches", "scope_matches", "content_matches", "compatibility_checked", "provenance_checked"}
             if action["requires_recovery"]:
                 required.add("recovery_verified")
-                self._recovery(state, action["recovery_evidence_ids"], action=action)
+                self.verify_recovery(state, action["recovery_evidence_ids"], action=action)
             for row in rows:
                 facts = row["facts"]
                 binding = {key: action[key] for key in ("adapter_id", "adapter_payload_sha256", "adapter_plan_sha256", "target_inventory_sha256")}
                 if facts.get("plan_sha256") != plan_sha256 or facts.get("action_id") != action_id or any(facts.get(key) != value for key, value in binding.items()) or any(facts.get(flag) is not True for flag in required):
                     raise WorkflowRefusal("Fresh preconditions must confirm this exact action's identity, scope, content, compatibility, provenance and recovery")
-            if action["adapter_id"] == "system.reviewed_external.v3":
+            if action["adapter_id"] == pc_records.ADAPTER_SYSTEM_REVIEWED_EXTERNAL:
                 self._external_preflight(state, action, rows)
             if action["requires_os_consent"]:
                 record = state["pending"].get("consent-" + action_id, {}).get("record")
                 if not record or record["plan_sha256"] != plan_sha256 or record["evidence_id"] != owner_consent_evidence_id:
                     raise WorkflowRefusal("The actual owner must handle and record protected OS consent")
-                self._evidence(state, [owner_consent_evidence_id], kinds={"protected_consent"}, after=state["plan"]["registered_utc"], seconds=900)
+                self.evidence_rows(state, [owner_consent_evidence_id], kinds={"protected_consent"}, after=state["plan"]["registered_utc"], seconds=900)
             operation_id = "operation-" + uuid.uuid4().hex
-            operation = {"operation_id": operation_id, "action_id": action_id, "plan_sha256": plan_sha256, "settings_revision": state["settings_revision"], "started_utc": utc_now(), "finished_utc": None, "outcome": None, "evidence_ids": [], "summary": "Waiting for an actual operation outcome", "authorization": authorization, "pause_requested": False, "resolution": None, "mutating": action["mutating"], "adapter_id": action["adapter_id"]}
+            operation = {"operation_id": operation_id, "action_id": action_id, "plan_sha256": plan_sha256, "settings_revision": state["settings_revision"], "started_utc": pc_records.utc_now(), "finished_utc": None, "outcome": None, "evidence_ids": [], "summary": "Waiting for an actual operation outcome", "authorization": authorization, "pause_requested": False, "resolution": None, "mutating": action["mutating"], "adapter_id": action["adapter_id"]}
             state["operations"][operation_id] = operation
             if authorization["kind"] == "standing_policy":
                 state["standing_policy"]["used_actions"] += 1
@@ -1456,17 +1425,17 @@ class WorkflowEngine:
             return self._change(session_id, "operation_started", mutate, expected_revision)
 
     def _restart_evidence(self, state, evidence_id, kinds):
-        _id(evidence_id)
+        record_identifier(evidence_id)
         row = state["evidence"].get(evidence_id)
         if not row or row["kind"] not in kinds or row["scope"] != state["settings"]["scope"] or row["settings_revision"] != state["settings_revision"]:
             raise WorkflowRefusal("Restart evidence must retain this operation's original current scope and settings")
         data = self._read_owned(self._directory(state["session_id"]) / row["path"])
         if digest(data) != row["sha256"] or len(data) != row["size"]:
             raise WorkflowRefusal("Original restart evidence bytes changed")
-        return row, _decode(data)
+        return row, decode_record(data)
 
     def _restart_context(self, state, operation):
-        if operation["adapter_id"] != "system.reviewed_external.v3" or operation["settings_revision"] != state["settings_revision"] or not state["plan"] or operation["plan_sha256"] != state["plan"]["sha256"] or state["platform"] != "windows":
+        if operation["adapter_id"] != pc_records.ADAPTER_SYSTEM_REVIEWED_EXTERNAL or operation["settings_revision"] != state["settings_revision"] or not state["plan"] or operation["plan_sha256"] != state["plan"]["sha256"] or state["platform"] != "windows":
             raise WorkflowRefusal("A restart continuation must retain the exact original Windows MSI operation, plan and scope")
         action = next((item for item in state["plan"]["document"]["actions"] if item["action_id"] == operation["action_id"]), None)
         if not action or action["adapter_id"] != operation["adapter_id"]:
@@ -1481,18 +1450,16 @@ class WorkflowEngine:
 
     def _restart_boot(self, state, evidence_id):
         row, boot = self._restart_evidence(state, evidence_id, {"precondition", "outcome"})
-        fields = {"schema_version", "mode", "platform", "observed_utc", "last_boot_utc", "source"}
-        _fields(boot, fields, fields)
-        if boot["schema_version"] != "patchcairn.windows.boot.observation.v3" or boot["mode"] != state["mode"] or boot["platform"] != "windows" or boot["source"] != "windows.cim_last_boot_up_time" or boot["observed_utc"] != row["observed_utc"] or _time(boot["last_boot_utc"]) > _time(boot["observed_utc"]):
+        typed_record(boot, WINDOWS_BOOT)
+        if boot["mode"] != state["mode"] or boot["platform"] != "windows" or boot["source"] != "windows.cim_last_boot_up_time" or boot["observed_utc"] != row["observed_utc"] or utc_time(boot["last_boot_utc"]) > utc_time(boot["observed_utc"]):
             raise WorkflowRefusal("Restart checks require an exact owned actual Windows boot observation")
         return row, boot
 
     def _restart_pending(self, state, operation, evidence_id):
         action, external = self._restart_context(state, operation)
         row, proof = self._restart_evidence(state, evidence_id, {"outcome"})
-        fields = {"schema_version", "session_id", "operation_id", "action_id", "plan_sha256", "settings_revision", "scope_sha256", "adapter_payload_sha256", "external_plan_sha256", "mode", "platform", "catalog_id", "original_exit_code", "observed_utc", "native_receipt_relative_path", "native_receipt_sha256", "before_boot_evidence_id"}
-        _fields(proof, fields, fields)
-        expected = {"schema_version": "patchcairn.restart.pending.v3", "session_id": state["session_id"], "operation_id": operation["operation_id"], "action_id": operation["action_id"], "plan_sha256": operation["plan_sha256"], "settings_revision": state["settings_revision"], "scope_sha256": digest(state["settings"]["scope"]), "adapter_payload_sha256": action["adapter_payload_sha256"], "external_plan_sha256": action["adapter_plan_sha256"], "mode": state["mode"], "platform": "windows", "catalog_id": "windows.msiexec.install", "original_exit_code": 3010}
+        typed_record(proof, RESTART_PENDING)
+        expected = {"session_id": state["session_id"], "operation_id": operation["operation_id"], "action_id": operation["action_id"], "plan_sha256": operation["plan_sha256"], "settings_revision": state["settings_revision"], "scope_sha256": digest(state["settings"]["scope"]), "adapter_payload_sha256": action["adapter_payload_sha256"], "external_plan_sha256": action["adapter_plan_sha256"], "mode": state["mode"], "platform": "windows", "catalog_id": "windows.msiexec.install", "original_exit_code": 3010}
         if any(proof[key] != value for key, value in expected.items()) or type(proof["original_exit_code"]) is not int or proof["observed_utc"] != row["observed_utc"]:
             raise WorkflowRefusal("The restart-pending receipt must bind the exact original 3010 operation")
         relative = PurePosixPath(_text(proof["native_receipt_relative_path"], "owned original MSI receipt", 2000))
@@ -1500,21 +1467,19 @@ class WorkflowEngine:
         if relative.is_absolute() or "\\" in str(relative) or any(part in {".", ".."} or ":" in part for part in relative.parts) or len(relative.parts) < 6 or relative.parts[0] != "work" or tuple(relative.parts[-4:]) != tail:
             raise WorkflowRefusal("The original restart receipt must stay in its exact private service operation")
         service_root = self.root.joinpath(*relative.parts[:-4])
-        marker = _decode(_read(service_root / "service.json", 10000, private=True))
-        if marker != {"schema_version": "patchcairn.service.v3", "engine_id": state["engine_id"], "backend": BACKEND}:
+        marker = _checked(pc_records.require_schema, decode_record(read_record_bytes(service_root / "service.json", 10000, private=True)), SERVICE_RECORD)
+        if _without_version(marker) != {"schema": SERVICE_RECORD, "kind": "service_marker", "engine_id": state["engine_id"], "backend": BACKEND}:
             raise WorkflowRefusal("The restart receipt belongs to a foreign service or engine")
-        native = _decode(self._work_artifact(str(self.root.joinpath(*relative.parts)), proof["native_receipt_sha256"], output_root=service_root, max_bytes=8_000_000))
-        native_fields = {"schema_version", "operation_id", "action_id", "plan_sha256", "adapter_payload_sha256", "mode", "platform", "catalog_id", "observed_utc", "outcome", "tool_exit_code", "postcondition_state", "evidence_ids", "observed_effects", "limitations"}
-        _fields(native, native_fields, native_fields)
-        if native["schema_version"] != "patchcairn.external.receipt.v3" or any(native[key] != expected[key] for key in ("operation_id", "action_id", "plan_sha256", "adapter_payload_sha256", "mode", "platform", "catalog_id")) or type(native["tool_exit_code"]) is not int or native["tool_exit_code"] != 3010 or native["outcome"] != "installed_restart_pending" or native["postcondition_state"] not in {"not_verified", "unknown"} or not _time(operation["started_utc"]) <= _time(native["observed_utc"]) <= _time(proof["observed_utc"]):
+        native = typed_record(decode_record(self._work_artifact(str(self.root.joinpath(*relative.parts)), proof["native_receipt_sha256"], output_root=service_root, max_bytes=8_000_000)), EXTERNAL_RECEIPT)
+        if any(native[key] != expected[key] for key in ("operation_id", "action_id", "plan_sha256", "adapter_payload_sha256", "mode", "platform", "catalog_id")) or type(native["tool_exit_code"]) is not int or native["tool_exit_code"] != 3010 or native["outcome"] != "installed_restart_pending" or native["postcondition_state"] not in {"not_verified", "unknown"} or not utc_time(operation["started_utc"]) <= utc_time(native["observed_utc"]) <= utc_time(proof["observed_utc"]):
             raise WorkflowRefusal("An actual original MSI 3010 receipt is required; another exit code cannot be translated into success")
         before_row, before = self._restart_boot(state, proof["before_boot_evidence_id"])
-        if not _time(native["observed_utc"]) <= _time(before["observed_utc"]) <= _time(proof["observed_utc"]) or _time(before["last_boot_utc"]) > _time(native["observed_utc"]):
+        if not utc_time(native["observed_utc"]) <= utc_time(before["observed_utc"]) <= utc_time(proof["observed_utc"]) or utc_time(before["last_boot_utc"]) > utc_time(native["observed_utc"]):
             raise WorkflowRefusal("The actual pre-restart boot observation does not bind the original tool receipt")
         return row, proof, before_row, before, action, external
 
     def record_restart_pending(self, session_id, *, operation_id, evidence_id, expected_revision=None):
-        _id(operation_id)
+        record_identifier(operation_id)
         def mutate(state):
             if state["status"] != "stopped":
                 self._writable(state)
@@ -1529,10 +1494,10 @@ class WorkflowEngine:
                 if existing["evidence_id"] != evidence_id or existing["sha256"] != row["sha256"]:
                     raise WorkflowRefusal("The original restart-pending receipt cannot be replaced")
                 return existing, "The exact restart-pending receipt is already retained; no action was retried."
-            record = {"evidence_id": evidence_id, "sha256": row["sha256"], "before_boot_evidence_id": proof["before_boot_evidence_id"], "before_boot_sha256": before_row["sha256"], "original_exit_code": 3010, "recorded_utc": utc_now(), "decision_ids": []}
+            record = {"evidence_id": evidence_id, "sha256": row["sha256"], "before_boot_evidence_id": proof["before_boot_evidence_id"], "before_boot_sha256": before_row["sha256"], "original_exit_code": 3010, "recorded_utc": pc_records.utc_now(), "decision_ids": []}
             operation["restart_pending"] = record
             key = "restart-" + operation_id
-            state["pending"][key] = {"pending_id": key, "kind": "restart", "operation_id": operation_id, "resolved": False, "created_utc": utc_now()}
+            state["pending"][key] = {"pending_id": key, "kind": "restart", "operation_id": operation_id, "resolved": False, "created_utc": pc_records.utc_now()}
             return record, "The installer reported that a restart is needed. Its original 3010 receipt is retained and this same operation is unfinished. Choose whether to defer or authorize an owner-handled restart; no restart or installer retry was performed."
         return self._change(session_id, "restart_pending", mutate, expected_revision)
 
@@ -1563,7 +1528,7 @@ class WorkflowEngine:
             if len(pending["decision_ids"]) >= 100:
                 raise WorkflowRefusal("The bounded restart-decision history is full; preserve this held operation")
             record = owner
-            not_before = max((record["recorded_utc"], proposal["proposal"]["when_utc"]), key=_time) if proposal else record["recorded_utc"]
+            not_before = max((record["recorded_utc"], proposal["proposal"]["when_utc"]), key=utc_time) if proposal else record["recorded_utc"]
             record.update(choice=choice, operation_id=operation_id, action_id=operation["action_id"], plan_sha256=operation["plan_sha256"], scope_sha256=digest(state["settings"]["scope"]), pending_evidence_id=pending["evidence_id"], schedule_id=proposal["schedule_id"] if proposal else None, not_before_utc=not_before)
             pending["decision_ids"].append(owner_message_id)
             operation["restart_decision"] = record
@@ -1587,15 +1552,14 @@ class WorkflowEngine:
         if decision["schedule_id"] != (current_schedule["schedule_id"] if current_schedule else None):
             raise WorkflowRefusal("The restart choice belongs to an earlier schedule; obtain a fresh owner decision")
         row, proof = self._restart_evidence(state, evidence_id, {"outcome"})
-        fields = {"schema_version", "session_id", "operation_id", "action_id", "plan_sha256", "settings_revision", "scope_sha256", "external_plan_sha256", "mode", "platform", "catalog_id", "original_exit_code", "pending_evidence_id", "restart_decision_message_id", "observed_utc", "before_boot_evidence_id", "after_boot_evidence_id", "targets", "checks"}
-        _fields(proof, fields, fields)
-        expected = {"schema_version": "patchcairn.restart.verification.v3", "session_id": state["session_id"], "operation_id": operation["operation_id"], "action_id": operation["action_id"], "plan_sha256": operation["plan_sha256"], "settings_revision": state["settings_revision"], "scope_sha256": digest(state["settings"]["scope"]), "external_plan_sha256": action["adapter_plan_sha256"], "mode": state["mode"], "platform": "windows", "catalog_id": "windows.msiexec.install", "original_exit_code": 3010, "pending_evidence_id": pending["evidence_id"], "restart_decision_message_id": decision["message_id"], "before_boot_evidence_id": pending["before_boot_evidence_id"]}
+        typed_record(proof, RESTART_VERIFICATION)
+        expected = {"session_id": state["session_id"], "operation_id": operation["operation_id"], "action_id": operation["action_id"], "plan_sha256": operation["plan_sha256"], "settings_revision": state["settings_revision"], "scope_sha256": digest(state["settings"]["scope"]), "external_plan_sha256": action["adapter_plan_sha256"], "mode": state["mode"], "platform": "windows", "catalog_id": "windows.msiexec.install", "original_exit_code": 3010, "pending_evidence_id": pending["evidence_id"], "restart_decision_message_id": decision["message_id"], "before_boot_evidence_id": pending["before_boot_evidence_id"]}
         if any(proof[key] != value for key, value in expected.items()) or type(proof["original_exit_code"]) is not int or proof["observed_utc"] != row["observed_utc"]:
             raise WorkflowRefusal("Post-restart verification must bind the exact original 3010 receipt and owner decision")
         _fresh(proof["observed_utc"], after=decision["recorded_utc"], seconds=900)
         _, after = self._restart_boot(state, proof["after_boot_evidence_id"])
         _fresh(after["observed_utc"], after=decision["recorded_utc"], seconds=900)
-        if not _time(before["last_boot_utc"]) < _time(after["last_boot_utc"]) or not _time(pending_proof["observed_utc"]) <= _time(decision["recorded_utc"]) < _time(after["last_boot_utc"]) <= _time(after["observed_utc"]) <= _time(proof["observed_utc"]) or _time(after["last_boot_utc"]) < _time(decision["not_before_utc"]):
+        if not utc_time(before["last_boot_utc"]) < utc_time(after["last_boot_utc"]) or not utc_time(pending_proof["observed_utc"]) <= utc_time(decision["recorded_utc"]) < utc_time(after["last_boot_utc"]) <= utc_time(after["observed_utc"]) <= utc_time(proof["observed_utc"]) or utc_time(after["last_boot_utc"]) < utc_time(decision["not_before_utc"]):
             raise WorkflowRefusal("An actual boot transition after the owner decision and agreed time is required")
         if not isinstance(proof["targets"], dict) or set(proof["targets"]) != set(external["targets"]):
             raise WorkflowRefusal("Post-restart checks must account for every exact selected target")
@@ -1604,7 +1568,7 @@ class WorkflowEngine:
             expected_target = {key: external["target_identities"][target][key] for key in ("architecture", "installation_scope", "publisher")}
             expected_target["version"] = external["target_versions"][target]
             actual_target = proof["targets"][target]
-            _fields(actual_target, set(expected_target), set(expected_target))
+            exact_fields(actual_target, set(expected_target), set(expected_target))
             for value in actual_target.values():
                 _text(value, "selected actual target observation", 512)
             if actual_target != expected_target:
@@ -1613,7 +1577,7 @@ class WorkflowEngine:
         if not isinstance(proof["checks"], list) or len(proof["checks"]) != len(checks):
             raise WorkflowRefusal("Post-restart behavior must cover the original verification plan")
         for actual, expected_check in zip(proof["checks"], checks):
-            _fields(actual, {"check_id", "outcome", "observation"}, {"check_id", "outcome", "observation"})
+            exact_fields(actual, {"check_id", "outcome", "observation"}, {"check_id", "outcome", "observation"})
             if actual["check_id"] != expected_check["check_id"] or actual["outcome"] not in {"passed", "failed", "unknown"}:
                 raise WorkflowRefusal("The observations must identify every original behavior check and its actual result")
             if actual["outcome"] != "passed":
@@ -1629,7 +1593,7 @@ class WorkflowEngine:
             if not operation or operation["outcome"] not in {None, "unknown"}:
                 raise WorkflowRefusal("Only the exact unfinished restart operation accepts this observation")
             row, all_passed = self._validate_restart_verification(state, operation, evidence_id)
-            record = {"evidence_id": evidence_id, "sha256": row["sha256"], "recorded_utc": utc_now(), "boot_observed": True, "behavior_passed": all_passed}
+            record = {"evidence_id": evidence_id, "sha256": row["sha256"], "recorded_utc": pc_records.utc_now(), "boot_observed": True, "behavior_passed": all_passed}
             operation["restart_verification"] = record
             state["pending"]["restart-" + operation_id]["resolved"] = True
             return record, "Actual boot, target and original behavior observations are recorded for the same operation. " + ("The exact target and original behavior checks passed. " if all_passed else "Some target or behavior results failed or remain unknown; record the actual failed/partial result and review recovery. ") + "The original 3010 code is preserved; this record does not itself finish or retry the installer."
@@ -1645,7 +1609,7 @@ class WorkflowEngine:
             row, all_passed = self._validate_restart_verification(state, operation, proof["evidence_id"])
             if row["sha256"] != proof["sha256"] or not all_passed:
                 raise WorkflowRefusal("The restart occurred but exact target/original behavior checks have not all passed; success cannot be recorded")
-        rows = self._evidence(state, evidence_ids, kinds={"outcome", "reconciliation"}, after=operation["started_utc"], seconds=900, allow_empty=outcome == "unknown")
+        rows = self.evidence_rows(state, evidence_ids, kinds={"outcome", "reconciliation"}, after=operation["started_utc"], seconds=900, allow_empty=outcome == "unknown")
         for row in rows:
             facts = row["facts"]
             if any(facts.get(key) != operation[key] for key in ("operation_id", "action_id", "plan_sha256")) or facts.get("outcome") != outcome:
@@ -1653,7 +1617,7 @@ class WorkflowEngine:
         return rows
 
     def finish_operation(self, session_id, *, operation_id, outcome, evidence_ids, summary, expected_revision=None):
-        _id(operation_id)
+        record_identifier(operation_id)
         _text(summary, "outcome summary")
         if outcome not in OUTCOMES:
             raise WorkflowRefusal("Choose an explicit actual operation outcome")
@@ -1664,11 +1628,11 @@ class WorkflowEngine:
             if operation["outcome"] is not None:
                 raise WorkflowRefusal("Operation receipt is already consumed; use bounded reconciliation for unknown outcomes")
             self._outcome_rows(state, operation, evidence_ids, outcome)
-            operation.update(outcome=outcome, finished_utc=utc_now(), evidence_ids=list(evidence_ids), summary=summary)
+            operation.update(outcome=outcome, finished_utc=pc_records.utc_now(), evidence_ids=list(evidence_ids), summary=summary)
             was_stopped = state["status"] == "stopped"
             if outcome != "succeeded":
                 key = "reconcile-" + operation_id
-                state["pending"][key] = {"pending_id": key, "kind": "reconciliation", "operation_id": operation_id, "created_utc": utc_now(), "resolved": False, "settings_revision": state["settings_revision"]}
+                state["pending"][key] = {"pending_id": key, "kind": "reconciliation", "operation_id": operation_id, "created_utc": pc_records.utc_now(), "resolved": False, "settings_revision": state["settings_revision"]}
                 state["status"] = "stopped" if was_stopped else "paused" if operation["pause_requested"] else "held"
             elif operation["pause_requested"] or state["status"] == "pause_pending":
                 state["status"] = "stopped" if was_stopped else "paused"
@@ -1693,22 +1657,22 @@ class WorkflowEngine:
         def mutate(state):
             if state["status"] not in {"paused", "pause_pending", "held"}:
                 raise WorkflowRefusal("Only held or paused sessions can be reconciled for resume")
-            if any(op["outcome"] in {None, "unknown"} or op["outcome"] in {"failed", "partial"} and not op["resolution"] for op in state["operations"].values()) or any(p["kind"] == "reconciliation" for p in self._pending(state)):
+            if any(op["outcome"] in {None, "unknown"} or op["outcome"] in {"failed", "partial"} and not op["resolution"] for op in state["operations"].values()) or any(p["kind"] == "reconciliation" for p in self.pending_items(state)):
                 raise WorkflowRefusal("Uncertain or unsuccessful operations require an evidence-backed resolution and possibly a new plan")
             pause_time = max((e["at"] for e in self._load(session_id)["events"] if e["type"] in {"paused", "operation_finished", "resolved"}), default=state["updated_utc"])
-            rows = self._evidence(state, reconciliation_evidence_ids, kinds={"reconciliation"}, after=pause_time, seconds=900)
+            rows = self.evidence_rows(state, reconciliation_evidence_ids, kinds={"reconciliation"}, after=pause_time, seconds=900)
             expected_outcomes = {key: op["outcome"] for key, op in state["operations"].items()}
             for row in rows:
                 facts = row["facts"]
                 if facts.get("scope_matches") is not True or facts.get("no_changes_detected") is not True or facts.get("operation_outcomes") != expected_outcomes or facts.get("plan_sha256") != (state["plan"]["sha256"] if state["plan"] else None):
                     raise WorkflowRefusal("Resume needs a fresh current-scope check and actual outcomes for every operation")
-            state["last_reconciled_utc"] = utc_now()
-            if state["settings"]["timing"] == "scheduled" and self._require_schedule_activation(state, allow_waiting=True) is None:
+            state["last_reconciled_utc"] = pc_records.utc_now()
+            if state["settings"]["timing"] == "scheduled" and self.require_schedule_activation(state, allow_waiting=True) is None:
                 if state["schedule"]:
                     state["schedule"]["ready_for_trigger"] = True
                 state["status"] = "held"
             else:
-                state["status"] = "awaiting_user" if self._pending(state) else "completed" if state["stage"] == "complete" else "active"
+                state["status"] = "awaiting_user" if self.pending_items(state) else "completed" if state["stage"] == "complete" else "active"
             return {}, "Fresh evidence reconciles the current scope and actual outcomes. Existing plan/action approvals still apply only to their unchanged exact scope."
         return self._change(session_id, "resumed", mutate, expected_revision)
 
@@ -1722,7 +1686,7 @@ class WorkflowEngine:
                 return self.decide_restart(session_id, operation_id=item["operation_id"], choice=choice, owner_quote=owner_quote, owner_message_id=owner_message_id, expected_revision=expected_revision)
         if choice is None and not evidence_ids:
             state = self.read_session(session_id)
-            items = self._pending(state)
+            items = self.pending_items(state)
             if pending_id:
                 items = [p for p in items if p["pending_id"] == pending_id]
                 if not items:
@@ -1750,14 +1714,14 @@ class WorkflowEngine:
                     raise WorkflowRefusal("A checkpoint needs the owner's actual continue decision")
                 item["owner_instruction"] = _owner(state, owner_quote, owner_message_id)
                 item["resolved"] = True
-                if state["status"] == "awaiting_user" and not self._pending(state):
+                if state["status"] == "awaiting_user" and not self.pending_items(state):
                     state["status"] = "completed" if state["stage"] == "complete" else "active"
             elif item["kind"] == "reconciliation":
                 operation = state["operations"][item["operation_id"]]
                 if operation["outcome"] is None:
                     raise WorkflowRefusal("An active operation must first reach its safe receipt checkpoint")
                 if operation["outcome"] == "unknown":
-                    rows = self._evidence(state, evidence_ids or [], kinds={"reconciliation", "outcome"}, after=operation["finished_utc"], seconds=900)
+                    rows = self.evidence_rows(state, evidence_ids or [], kinds={"reconciliation", "outcome"}, after=operation["finished_utc"], seconds=900)
                     outcomes = {row["facts"].get("outcome") for row in rows}
                     if len(outcomes) != 1 or not outcomes <= {"succeeded", "failed", "partial"}:
                         raise WorkflowRefusal("A fresh actual observed outcome is required; unknown cannot be marked resolved")
@@ -1776,11 +1740,11 @@ class WorkflowEngine:
                     if was_stopped != (choice == "keep_stopped"):
                         raise WorkflowRefusal("A stopped session may account for actual effects while staying stopped; it cannot request or resume a replacement plan")
                     rows = self._outcome_rows(state, operation, evidence_ids or [], operation["outcome"])
-                    if any(row["kind"] != "reconciliation" or _time(row["observed_utc"]) < _time(operation["finished_utc"]) or any(row["facts"].get(flag) is not True for flag in ("actual_effects_recorded", "no_active_effects", "recovery_retained")) for row in rows):
+                    if any(row["kind"] != "reconciliation" or utc_time(row["observed_utc"]) < utc_time(operation["finished_utc"]) or any(row["facts"].get(flag) is not True for flag in ("actual_effects_recorded", "no_active_effects", "recovery_retained")) for row in rows):
                         raise WorkflowRefusal("Replanning needs fresh actual-effects reconciliation, no ongoing operation and retained recovery; the historical failure remains unchanged")
                     item["owner_instruction"] = _owner(state, owner_quote, owner_message_id)
                     item["resolved"] = True
-                    operation["resolution"] = {"kind": "effects_accounted" if was_stopped else "replan_required", "evidence_ids": list(evidence_ids), "recorded_utc": utc_now(), "owner_message_id": owner_message_id}
+                    operation["resolution"] = {"kind": "effects_accounted" if was_stopped else "replan_required", "evidence_ids": list(evidence_ids), "recorded_utc": pc_records.utc_now(), "owner_message_id": owner_message_id}
                     if not was_stopped:
                         state["plan"] = None
                         state["approval"] = None
@@ -1798,11 +1762,11 @@ class WorkflowEngine:
 
     def advance_stage(self, session_id, *, evidence_ids, expected_revision=None):
         def mutate(state):
-            if state["status"] != "active" or self._pending(state):
+            if state["status"] != "active" or self.pending_items(state):
                 raise WorkflowRefusal("Stage advancement waits for an active session and resolved checkpoints")
-            self._require_schedule_activation(state)
+            self.require_schedule_activation(state)
             stage = state["stage"]
-            rows = self._evidence(state, evidence_ids, allow_empty=stage in {"plan", "apply"})
+            rows = self.evidence_rows(state, evidence_ids, allow_empty=stage in {"plan", "apply"})
             required = {"scope": ("scope_confirmation", {"scope_confirmed"}), "inventory": ("inventory", {"complete"}), "research": ("research", {"applicability_checked", "official_sources_checked"}), "candidates": ("candidates", {"candidates_reviewed", "excluded_private"}), "symptom": ("symptom", {"symptom_recorded", "relevant_scope"}), "hypotheses": ("hypotheses", {"alternatives_considered", "distinguishing_checks"}), "recovery_plan": ("recovery_plan", {"contents_reviewed", "restore_check_planned", "exclusions_explicit"})}
             if stage in required:
                 kind, flags = required[stage]
@@ -1829,7 +1793,7 @@ class WorkflowEngine:
                     raise WorkflowRefusal("Verification needs the exact current plan")
                 planned = {a["action_id"] for a in state["plan"]["document"]["actions"]}
                 latest = max(op["finished_utc"] for op in state["operations"].values() if op["plan_sha256"] == state["plan"]["sha256"])
-                verified = [row for row in rows if row["kind"] == "verification" and row["facts"].get("verification_passed") is True and row["facts"].get("plan_sha256") == state["plan"]["sha256"] and set(row["facts"].get("checked_action_ids", [])) == planned and _time(row["observed_utc"]) >= _time(latest)]
+                verified = [row for row in rows if row["kind"] == "verification" and row["facts"].get("verification_passed") is True and row["facts"].get("plan_sha256") == state["plan"]["sha256"] and set(row["facts"].get("checked_action_ids", [])) == planned and utc_time(row["observed_utc"]) >= utc_time(latest)]
                 if not verified:
                     raise WorkflowRefusal("Actual behavior verification for every exact planned action is required after its outcome")
             else:
@@ -1839,7 +1803,7 @@ class WorkflowEngine:
             checkpoint = "findings" if state["stage"] == "plan" else "plan" if state["stage"] == "apply" else "finish" if state["stage"] == "complete" else None
             if checkpoint:
                 self._checkpoint(state, checkpoint)
-            if state["stage"] == "complete" and not self._pending(state):
+            if state["stage"] == "complete" and not self.pending_items(state):
                 state["status"] = "completed"
             if state["stage"] == "apply":
                 self._next_action_checkpoint(state)
@@ -1847,25 +1811,22 @@ class WorkflowEngine:
         return self._change(session_id, "stage_advanced", mutate, expected_revision)
 
     def complete_assessment(self, session_id, *, summary_evidence_id, verification_evidence_ids, owner_quote, owner_message_id, owner_id=None, source="current_owner_chat", expected_revision=None):
-        _id(summary_evidence_id)
+        record_identifier(summary_evidence_id)
         def mutate(state):
             self._writable(state)
-            if state["status"] != "active" or state["stage"] != "plan" or self._pending(state):
+            if state["status"] != "active" or state["stage"] != "plan" or self.pending_items(state):
                 raise WorkflowRefusal("Finish the assessment stages and selected checkpoints before closing an assessment")
-            activation = self._require_schedule_activation(state)
+            activation = self.require_schedule_activation(state)
             if state["operations"] or state["plan"] is not None or state["approval"] is not None or state["reviews"] or state["standing_policy"] is not None:
                 raise WorkflowRefusal("Assessment-only completion cannot close a session with any operation history, plan, approval, reviews or standing policy")
             authorization = state["scope_authorization"]
             scope_sha = digest(state["settings"]["scope"])
             if not authorization or authorization.get("owner_id") != state["owner_id"] or authorization.get("settings_revision") != state["settings_revision"] or authorization.get("scope_sha256") != scope_sha:
                 raise WorkflowRefusal("Assessment completion requires the actual current owner's exact authorized scope")
-            after = max((authorization["recorded_utc"], activation["activated_utc"]), key=_time) if activation else authorization["recorded_utc"]
-            summary_row = self._evidence(state, [summary_evidence_id], kinds={"research"}, after=after, seconds=900)[0]
-            summary = _decode(self._read_owned(self._directory(session_id) / summary_row["path"]))
-            common = {"schema_version", "job", "mode", "scope_sha256", "settings_revision"}
-            summary_fields = common | {"summary", "findings", "limitations", "assessed_evidence_ids"}
-            _fields(summary, summary_fields, summary_fields)
-            if summary["schema_version"] != "patchcairn.assessment.summary.v3" or summary["job"] != state["job"] or summary["mode"] != state["mode"] or summary["scope_sha256"] != scope_sha or summary["settings_revision"] != state["settings_revision"]:
+            after = max((authorization["recorded_utc"], activation["activated_utc"]), key=utc_time) if activation else authorization["recorded_utc"]
+            summary_row = self.evidence_rows(state, [summary_evidence_id], kinds={"research"}, after=after, seconds=900)[0]
+            summary = typed_record(decode_record(self._read_owned(self._directory(session_id) / summary_row["path"])), ASSESSMENT_SUMMARY)
+            if summary["job"] != state["job"] or summary["mode"] != state["mode"] or summary["scope_sha256"] != scope_sha or summary["settings_revision"] != state["settings_revision"]:
                 raise WorkflowRefusal("The assessment summary must bind this exact current job, mode and scope")
             _text(summary["summary"], "assessment summary", 4000)
             for label in ("findings", "limitations"):
@@ -1876,18 +1837,16 @@ class WorkflowEngine:
             _ids(summary["assessed_evidence_ids"], "assessed evidence identifiers", allow_empty=False)
             if summary_evidence_id in summary["assessed_evidence_ids"]:
                 raise WorkflowRefusal("An assessment summary cannot stand in for its underlying assessment evidence")
-            assessed = self._evidence(state, summary["assessed_evidence_ids"], kinds={"scope_confirmation", "inventory", "research", "candidates", "symptom", "hypotheses", "recovery_plan"}, after=authorization["recorded_utc"])
+            assessed = self.evidence_rows(state, summary["assessed_evidence_ids"], kinds={"scope_confirmation", "inventory", "research", "candidates", "symptom", "hypotheses", "recovery_plan"}, after=authorization["recorded_utc"])
             requirements = {"scope": ("scope_confirmation", {"scope_confirmed"}), "inventory": ("inventory", {"complete"}), "research": ("research", {"applicability_checked", "official_sources_checked"}), "candidates": ("candidates", {"candidates_reviewed", "excluded_private"}), "symptom": ("symptom", {"symptom_recorded", "relevant_scope"}), "hypotheses": ("hypotheses", {"alternatives_considered", "distinguishing_checks"}), "recovery_plan": ("recovery_plan", {"contents_reviewed", "restore_check_planned", "exclusions_explicit"})}
             for stage in JOBS[state["job"]]["stages"][:JOBS[state["job"]]["stages"].index("plan")]:
                 kind, flags = requirements[stage]
                 if not any(row["kind"] == kind and all(row["facts"].get(flag) is True for flag in flags) for row in assessed):
                     raise WorkflowRefusal("The summary must cover the actual current evidence for every agreed assessment step")
-            rows = self._evidence(state, verification_evidence_ids, kinds={"verification"}, after=summary_row["registered_utc"], seconds=900)
+            rows = self.evidence_rows(state, verification_evidence_ids, kinds={"verification"}, after=summary_row["registered_utc"], seconds=900)
             for row in rows:
-                verification = _decode(self._read_owned(self._directory(session_id) / row["path"]))
-                fields = common | {"summary_evidence_id", "summary_sha256", "assessed_evidence_ids", "coverage_checked", "limitations_checked", "observed_utc"}
-                _fields(verification, fields, fields)
-                if verification["schema_version"] != "patchcairn.assessment.verification.v3" or any(verification[key] != summary[key] for key in ("job", "mode", "scope_sha256", "settings_revision", "assessed_evidence_ids")) or verification["summary_evidence_id"] != summary_evidence_id or verification["summary_sha256"] != summary_row["sha256"] or verification["coverage_checked"] is not True or verification["limitations_checked"] is not True or verification["observed_utc"] != row["observed_utc"]:
+                verification = typed_record(decode_record(self._read_owned(self._directory(session_id) / row["path"])), ASSESSMENT_VERIFICATION)
+                if any(verification[key] != summary[key] for key in ("job", "mode", "scope_sha256", "settings_revision", "assessed_evidence_ids")) or verification["summary_evidence_id"] != summary_evidence_id or verification["summary_sha256"] != summary_row["sha256"] or verification["coverage_checked"] is not True or verification["limitations_checked"] is not True or verification["observed_utc"] != row["observed_utc"]:
                     raise WorkflowRefusal("Assessment verification must check the exact current summary, evidence coverage and recorded limitations")
                 _fresh(verification["observed_utc"], after=summary_row["registered_utc"], seconds=900)
             record = {"summary_evidence_id": summary_evidence_id, "summary_sha256": summary_row["sha256"], "verification_evidence_ids": list(verification_evidence_ids), "owner_instruction": _owner(state, owner_quote, owner_message_id, owner_id, source)}
@@ -1895,7 +1854,7 @@ class WorkflowEngine:
             state["pending"][key] = {"pending_id": key, "kind": "assessment_finish", "resolved": True, "record": record}
             state["stage"] = "complete"
             self._checkpoint(state, "finish")
-            if not self._pending(state):
+            if not self.pending_items(state):
                 state["status"] = "completed"
             return record, "The assessment and its findings are recorded, including what remains uncertain. This session recorded no maintenance action. " + ("Review the selected finish checkpoint before closing." if state["status"] != "completed" else "The assessment session is complete; any computer change needs a separate reviewed plan.")
         return self._change(session_id, "assessment_completed", mutate, expected_revision)
@@ -1907,7 +1866,7 @@ class WorkflowEngine:
         except KeyError as error:
             raise WorkflowRefusal("An incomplete schedule record cannot authorize work") from error
 
-    def _require_schedule_activation(self, state, *, allow_waiting=False):
+    def require_schedule_activation(self, state, *, allow_waiting=False):
         if state["settings"]["timing"] != "scheduled":
             return None
         record = state["schedule"]
@@ -1921,21 +1880,21 @@ class WorkflowEngine:
         if not isinstance(activation, dict):
             raise WorkflowRefusal("This schedule has not been activated by its matching due trigger")
         fields = {"schedule_id", "trigger_id", "activated_utc", "settings_revision"}
-        _fields(activation, fields, fields)
+        exact_fields(activation, fields, fields)
         proposal = record["proposal"]
-        if activation["schedule_id"] != record["schedule_id"] or activation["settings_revision"] != state["settings_revision"] or activation["trigger_id"] not in state["schedule_triggers"] or record.get("ready_for_trigger") is not False or not _time(proposal["when_utc"]) <= _time(activation["activated_utc"]) <= _time(proposal["expires_utc"]) or _time(activation["activated_utc"]) - _time(proposal["when_utc"]) > timedelta(seconds=proposal["max_lateness_seconds"]) or _time(utc_now()) < _time(activation["activated_utc"]):
+        if activation["schedule_id"] != record["schedule_id"] or activation["settings_revision"] != state["settings_revision"] or activation["trigger_id"] not in state["schedule_triggers"] or record.get("ready_for_trigger") is not False or not utc_time(proposal["when_utc"]) <= utc_time(activation["activated_utc"]) <= utc_time(proposal["expires_utc"]) or utc_time(activation["activated_utc"]) - utc_time(proposal["when_utc"]) > timedelta(seconds=proposal["max_lateness_seconds"]) or utc_time(pc_records.utc_now()) < utc_time(activation["activated_utc"]):
             raise WorkflowRefusal("The recorded activation does not authorize this exact current schedule")
         return activation
 
     def configure_schedule(self, session_id, *, schedule, owner_quote, owner_message_id, expected_revision=None):
-        _fields(schedule, {"when_utc", "description", "expires_utc", "max_lateness_seconds"}, {"when_utc", "description"})
-        if _time(schedule["when_utc"]) <= _time(utc_now()):
+        exact_fields(schedule, {"when_utc", "description", "expires_utc", "max_lateness_seconds"}, {"when_utc", "description"})
+        if utc_time(schedule["when_utc"]) <= utc_time(pc_records.utc_now()):
             raise WorkflowRefusal("The proposed schedule time must be in the future")
         _text(schedule["description"], "schedule explanation")
         proposal = copy.deepcopy(schedule)
         proposal.setdefault("max_lateness_seconds", 300)
-        proposal.setdefault("expires_utc", (_time(schedule["when_utc"]) + timedelta(hours=1)).isoformat().replace("+00:00", "Z"))
-        if type(proposal["max_lateness_seconds"]) is not int or not 0 <= proposal["max_lateness_seconds"] <= 3600 or not _time(proposal["when_utc"]) <= _time(proposal["expires_utc"]) <= _time(proposal["when_utc"]) + timedelta(hours=24):
+        proposal.setdefault("expires_utc", (utc_time(schedule["when_utc"]) + timedelta(hours=1)).isoformat().replace("+00:00", "Z"))
+        if type(proposal["max_lateness_seconds"]) is not int or not 0 <= proposal["max_lateness_seconds"] <= 3600 or not utc_time(proposal["when_utc"]) <= utc_time(proposal["expires_utc"]) <= utc_time(proposal["when_utc"]) + timedelta(hours=24):
             raise WorkflowRefusal("Schedule needs an explicit bounded catch-up window and expiry within 24 hours of its due time")
         def mutate(state):
             self._writable(state)
@@ -1972,7 +1931,7 @@ class WorkflowEngine:
         return self._change(session_id, "schedule_configured", mutate, expected_revision)
 
     def trigger_schedule(self, session_id, *, schedule_id, trigger_id, expected_revision=None):
-        _id(trigger_id)
+        record_identifier(trigger_id)
         if not isinstance(schedule_id, str) or not SHA.fullmatch(schedule_id):
             raise WorkflowRefusal("A trigger must bind the exact current schedule identifier")
         def mutate(state):
@@ -1990,10 +1949,10 @@ class WorkflowEngine:
                 raise WorkflowRefusal("This exact schedule is already activated; a new trigger cannot restart it")
             if self._outstanding_effects():
                 raise WorkflowRefusal("An outstanding mutating operation in this engine registry blocks schedule dispatch until actual reconciliation")
-            if _time(utc_now()) < _time(state["schedule"]["proposal"]["when_utc"]):
+            if utc_time(pc_records.utc_now()) < utc_time(state["schedule"]["proposal"]["when_utc"]):
                 raise WorkflowRefusal("The proposed schedule time has not arrived")
             proposal = state["schedule"]["proposal"]
-            if _time(utc_now()) > _time(proposal["expires_utc"]) or _time(utc_now()) - _time(proposal["when_utc"]) > timedelta(seconds=proposal["max_lateness_seconds"]):
+            if utc_time(pc_records.utc_now()) > utc_time(proposal["expires_utc"]) or utc_time(pc_records.utc_now()) - utc_time(proposal["when_utc"]) > timedelta(seconds=proposal["max_lateness_seconds"]):
                 raise WorkflowRefusal("The bounded schedule catch-up window or expiry has passed; a new owner decision is required")
             for directory in self.work.iterdir():
                 if directory.is_dir() and directory.name.startswith("session-") and directory.name != session_id:
@@ -2001,12 +1960,12 @@ class WorkflowEngine:
                     if other["job"] == state["job"] and (other["status"] == "active" or other["status"] == "awaiting_user" and other["schedule_triggers"]):
                         raise WorkflowRefusal("Another active session already owns this job; the trigger cannot duplicate it")
             state["schedule_triggers"].append(trigger_id)
-            record["activation"] = {"schedule_id": schedule_id, "trigger_id": trigger_id, "activated_utc": utc_now(), "settings_revision": state["settings_revision"]}
+            record["activation"] = {"schedule_id": schedule_id, "trigger_id": trigger_id, "activated_utc": pc_records.utc_now(), "settings_revision": state["settings_revision"]}
             record["ready_for_trigger"] = False
             if state["settings"]["control"] == "guided":
                 state["status"] = "awaiting_user"
                 key = "schedule-start-" + digest(trigger_id)[:24]
-                state["pending"][key] = {"pending_id": key, "kind": "checkpoint", "checkpoint": "scheduled_start", "action_id": None, "created_utc": utc_now(), "resolved": False, "settings_revision": state["settings_revision"]}
+                state["pending"][key] = {"pending_id": key, "kind": "checkpoint", "checkpoint": "scheduled_start", "action_id": None, "created_utc": pc_records.utc_now(), "resolved": False, "settings_revision": state["settings_revision"]}
                 message = "The scheduled guided session is waiting for you. Review the current scope and checkpoint before continuing."
             else:
                 state["status"] = "active"
@@ -2024,7 +1983,7 @@ class WorkflowEngine:
             for operation in state["operations"].values():
                 if operation["outcome"] is None:
                     operation["pause_requested"] = True
-            return {"unresolved": self._pending(state)}, "This session is stopped. Evidence, recovery files and unfinished outcomes are preserved. An active operation still needs its actual safe-checkpoint receipt; no new action is allowed."
+            return {"unresolved": self.pending_items(state)}, "This session is stopped. Evidence, recovery files and unfinished outcomes are preserved. An active operation still needs its actual safe-checkpoint receipt; no new action is allowed."
         return self._change(session_id, "stopped", mutate, expected_revision)
 
     def status(self, session_id):
@@ -2051,7 +2010,7 @@ class WorkflowEngine:
             explanations["stopped"] += " For this retained 3010 operation only, you may explicitly defer or authorize the owner-handled restart needed to account for its unfinished effect. The session stays stopped and no new job action is created."
         mode = "Live-work session: selecting this mode does not collect evidence or approve computer changes. " if state["mode"] == "real" else "Practice session: its records do not establish that your computer was checked or changed. "
         message = JOBS[state["job"]]["label"] + " · " + STAGE_LABELS[state["stage"]] + ". " + mode + explanations[state["status"]]
-        return self._response(state, "status", message, {"job": state["job"], "stage": state["stage"], "status": state["status"], "control": state["settings"]["control"], "timing": state["settings"]["timing"], "pending": self._pending(state), "operations": list(state["operations"].values())})
+        return self._response(state, "status", message, {"job": state["job"], "stage": state["stage"], "status": state["status"], "control": state["settings"]["control"], "timing": state["settings"]["timing"], "pending": self.pending_items(state), "operations": list(state["operations"].values())})
 
     def cost(self, session_id):
         state = self.read_session(session_id)
@@ -2064,7 +2023,7 @@ class WorkflowEngine:
                 evidence_id = action.get("estimate_evidence_id")
                 facts = {}
                 if evidence_id:
-                    row = self._evidence(state, [evidence_id], kinds={"inventory"})[0]
+                    row = self.evidence_rows(state, [evidence_id], kinds={"inventory"})[0]
                     facts = row["facts"]
                     if evidence_id not in sources:
                         sources.append(evidence_id)
@@ -2098,7 +2057,7 @@ class WorkflowEngine:
 
     def options(self, session_id):
         state = self.read_session(session_id)
-        pending = self._pending(state)
+        pending = self.pending_items(state)
         checkpoint = next((item for item in pending if item["kind"] == "checkpoint"), None)
         restart = next((item for item in pending if item["kind"] == "restart"), None)
         meaning = "Current job: " + JOBS[state["job"]]["label"] + ". Current step: " + STAGE_LABELS[state["stage"]].lower() + "."
@@ -2149,12 +2108,12 @@ class WorkflowEngine:
             for action_card in actions:
                 message += "\n\n" + "\n".join(label.capitalize() + ": " + action_card[label] for label in ("meaning", "benefits", "drawbacks", "cost", "reversibility", "recommendation"))
                 message += "\nChoices:\n" + "\n".join("- " + choice for choice in action_card["options"])
-        return self._response(state, "options", message, {"decision": card, "action_decisions": actions, "pending": self._pending(state), "commands": ["PatchCairn: " + c for c in COMMANDS]})
+        return self._response(state, "options", message, {"decision": card, "action_decisions": actions, "pending": self.pending_items(state), "commands": ["PatchCairn: " + c for c in COMMANDS]})
 
     def dispatch(self, session_id, command, *, expected_revision=None):
         parsed = parse_command(command)
         if not parsed["ok"]:
-            return {"schema_version": VERSION, "ok": False, "code": parsed["code"], "message": parsed["message"], "session_id": session_id, "revision": None, "data": {}}
+            return {"schema_version": SCHEMA_VERSION, "ok": False, "code": parsed["code"], "message": parsed["message"], "session_id": session_id, "revision": None, "data": {}}
         name, args = parsed["command"], parsed["arguments"]
         if name == "help":
             return self._response(self.read_session(session_id) if session_id else None, "help", initial_menu())

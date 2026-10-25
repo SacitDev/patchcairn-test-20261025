@@ -47,7 +47,7 @@ OpenCode's [rules documentation](https://docs.opencode.ai/docs/rules/), [skill d
 
 ## Check capabilities before work
 
-The portable [adapter descriptor](../templates/host-adapters.json) is advisory metadata. It is not a launcher, a saved approval, an executable command list, or evidence that a host is installed. Detect capabilities again in each actual session without reading credentials or dumping configuration.
+PatchCairn ships no host adapter descriptor, and nothing it saves is a launcher, a saved approval, an executable command list, or evidence that a host is installed. Detect capabilities again in each actual session without reading credentials or dumping configuration.
 
 | Capability | Required check and fallback |
 | --- | --- |

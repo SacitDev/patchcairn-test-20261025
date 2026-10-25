@@ -7,9 +7,8 @@ import sys
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).absolute().parent))
-from workflow_core import WorkflowEngine, WorkflowRefusal
-from workflow_service import WorkflowService, ServiceRefusal, STORAGE, OFFICIAL_DOMAINS, ARTIFACT_EXTENSIONS
-from diagnostic_core import DiagnosticRefusal
+from workflow_core import WorkflowEngine, WorkflowRefusal, older_format_message
+from workflow_service import WorkflowService, ServiceRefusal, DiagnosticRefusal, STORAGE, OFFICIAL_DOMAINS, ARTIFACT_EXTENSIONS, DIAGNOSTIC_ADAPTER_ID
 
 
 def main(argv=None):
@@ -27,7 +26,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         if args.operation == "catalog":
-            data = {"storage_adapters": list(STORAGE), "diagnostic_adapter": "diagnostic.read_recipe.v3",
+            data = {"storage_adapters": list(STORAGE), "diagnostic_adapter": DIAGNOSTIC_ADAPTER_ID,
                     "external_handoff_catalog": list(ARTIFACT_EXTENSIONS), "held_external_catalog": sorted(set(OFFICIAL_DOMAINS) - set(ARTIFACT_EXTENSIONS)),
                     "external_execution": False, "external_repair_enabled": False}
             print(json.dumps(data, sort_keys=True) if args.json else "PatchCairn — Developed by Michael\n\nFixed storage and selected diagnostic adapters are available through the reviewed workflow. Official update operations are exact assistant handoffs; this service does not execute them. OS/app repair stays held while required component recovery is unsupported. Use chat to establish scope, review the plan and record your decision.")
@@ -40,8 +39,9 @@ def main(argv=None):
             result = WorkflowService(engine, work_relative=args.service_work).inspect_operation(args.session_id, operation_id=args.operation_id)
             print(json.dumps(result, sort_keys=True) if args.json else "Operation outcome: " + str(result["operation"]["outcome"] or "awaiting actual evidence") + ". Preserve the reviewed intent and existing native receipts. A missing receipt does not permit retry or establish success.")
         return 0
-    except (WorkflowRefusal, ServiceRefusal, DiagnosticRefusal, OSError, ValueError):
-        print("Service hold: the exact owned state, selected scope or supported capability could not be verified. Preserve the operation and review its bounded evidence; no new host action was started.", file=sys.stderr)
+    except (WorkflowRefusal, ServiceRefusal, DiagnosticRefusal, OSError, ValueError) as error:
+        # Records in an older format are never migrated; the person reads the plain reason and next step.
+        print(older_format_message(error) or "Service hold: the exact owned state, selected scope or supported capability could not be verified. Preserve the operation and review its bounded evidence; no new host action was started.", file=sys.stderr)
         return 2
 
 
