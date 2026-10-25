@@ -1,5 +1,5 @@
-"""Assessment family: the diagnostic record store (PD-12), the diagnostic action and its completion, and the
-assessment dispatch (PLAN 3.3). The fictional fixture assessment holds here until its family code is written.
+"""Assessment family: the diagnostic record store (PD-12), the diagnostic action, its effect and its completion, and
+the assessment dispatch (PLAN 3.3). The fictional fixture assessment holds here until its family code is written.
 """
 from __future__ import annotations
 
@@ -17,8 +17,9 @@ from workflow_core import digest, DIAGNOSTIC_ADAPTER
 from diagnostic_core import (DiagnosticRefusal, MAX_RECORD, after_now, RECORD_RE, REQUEST_RE, SCHEMA as DIAGNOSTIC_RECORD, TOKEN_RE,
                              exact_keys, parse_time, read_diagnostic, sanitize_text, scope_tokens, validate_adapter_result,
                              validate_request)
+from diagnostic_posix import collect_recipe
 from private_workspace import PrivateWorkspaceError, ensure_private_directory, ensure_private_file, write_private_new
-from service_state import DEFAULT_ROOT, ServiceRefusal
+from service_state import DEFAULT_ROOT, ServiceRefusal, service_value
 
 DIAGNOSTIC_ADAPTER_ID = pc_records.ADAPTER_DIAGNOSTIC_COLLECT
 
@@ -254,7 +255,8 @@ class DiagnosticsMixin:
             payload = {"schema": DIAGNOSTIC_ADAPTER, "schema_version": pc_records.SCHEMA_VERSION, "operation": DIAGNOSTIC_ADAPTER_ID,
                        "request": request, "request_sha256": digest(request), "inventory_sha256": digest(request)}
             return self._action(state, action_id=action_id, adapter_id=payload["operation"], kind="assessment", payload=payload,
-                    inventory=request, target=target, benefit=benefit, risk=risk, reversibility=reversibility, verification=verification)
+                    native_plan=payload["request"], inventory=request, target=target, benefit=benefit, risk=risk, reversibility=reversibility,
+                    verification=verification)
 
     def complete_diagnostic(self, session_id, *, operation_id, adapter_result, coordinator_observed=False):
         with self._lock():
@@ -270,10 +272,30 @@ class DiagnosticsMixin:
                                 outcome="succeeded" if observed["status"] == "observed" else "failed", receipt=record)
 
     # Dispatch targets (service_execute.EXECUTE, service_reconcile.RECONCILE; reached only through execute_action and
-    # reconcile_operation): a diagnostic completes through its own callback, so neither assessment adapter reconciles;
-    # the fictional fixture assessment is not written yet.
+    # reconcile_operation): the diagnostic runs its effect through the shared steps of service_execute and completes
+    # through its own callback, so neither assessment adapter reconciles; the fictional fixture assessment is not
+    # written yet.
     def _execute_diagnostic_collect(self, session_id, state, action, payload, **arguments):
-        return self._run_fixed_adapter(session_id, state, action, payload, **arguments)
+        if state["mode"] != "fixture" and (arguments["diagnostic_fixture_runner"] is not None or arguments["diagnostic_fixture_result"] is not None):
+            raise ServiceRefusal("Fictional diagnostic output cannot enter a real operation")
+        return self._run_adapter(session_id, state, action, payload, self._effect_diagnostic_collect, **arguments)
+
+    def _effect_diagnostic_collect(self, session_id, state, operation, action, payload, path, intent, *, diagnostic_fixture_runner,
+                                   diagnostic_fixture_result):
+        """The fixed recipe or the Windows helper handoff, after the effect boundary (service_execute._run_effect)."""
+        request = payload["request"]
+        if request["platform"] == "windows" and diagnostic_fixture_result is None:
+            handoff = {**service_value("windows_diagnostic_handoff"), "operation_id": operation["operation_id"],
+                       "request": request, "helper": "diagnostic_windows.ps1:Invoke-WindowsDiagnostic",
+                       "instruction": "Use this fixed native helper in the matching host; return its selected actual adapter result. "
+                                      "No generic command is accepted."}
+            self._immutable(path / "handoff.json", handoff)
+            return handoff
+        observed = (validate_adapter_result(request, diagnostic_fixture_result) if diagnostic_fixture_result is not None
+                    else collect_recipe(request, runner=diagnostic_fixture_runner, coordinator_authorized=state["mode"] == "real"))
+        record = self.diagnostics.record_result(request["request_id"], adapter_result=observed)
+        return self._finish(self.engine.read_session(session_id), operation,
+                            outcome="succeeded" if observed["status"] == "observed" else "failed", receipt=record)
 
     def _execute_fixture_assessment(self, session_id, state, action, payload, **arguments):
         return self._execute_held(session_id, state, action, payload, **arguments)

@@ -1,4 +1,5 @@
-"""Backup family: the storage verifier the service injects into the engine (D-018, RR2-7) and the backup dispatch.
+"""Backup family: the storage verifier the service injects into the engine (D-018, RR2-7), the backup dispatch and
+the backup effect.
 
 B-BAK delivers the receipts the engine re-checks through ``verify_storage_artifact``.
 """
@@ -7,6 +8,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pc_records
+from workflow_core import digest
 from storage_ops import StorageService
 from scoped_fs import ScopedRoot
 
@@ -81,10 +83,34 @@ def verify_storage_artifact(binding):
 
 class BackupMixin:
     """The backup adapter's dispatch targets (service_execute.EXECUTE, service_reconcile.RECONCILE), reached only
-    through execute_action and reconcile_operation after their lock, session and binding checks."""
+    through execute_action and reconcile_operation after their lock, session and binding checks, and its effect."""
 
     def _execute_storage_backup_create(self, session_id, state, action, payload, **arguments):
-        return self._run_fixed_adapter(session_id, state, action, payload, **arguments)
+        storage = self._storage_preconditions(state, action, payload, diagnostic_fixture_runner=arguments.pop("diagnostic_fixture_runner"),
+                                              diagnostic_fixture_result=arguments.pop("diagnostic_fixture_result"))
+        return self._run_adapter(session_id, state, action, payload, self._effect_storage_backup_create, storage=storage, **arguments)
+
+    def _effect_storage_backup_create(self, session_id, state, operation, action, payload, path, intent, *, storage):
+        """The backup and its optional restoration probe, after the effect boundary (service_execute._run_effect)."""
+        plan, expected = payload["storage_plan"], payload["storage_plan_sha256"]
+        self._native_origin(state, operation, plan)
+        if plan["required_recovery"]:
+            self._retain(session_id, {plan["destination"]: None, plan["destination"] + ".manifest.json": None},
+                         reason="Required backup reserved before effect; incomplete/unknown artifacts remain protected")
+        receipt = storage.create_backup(plan=plan, expected_plan_sha256=expected)
+        verified = storage.verify_outcome(plan=plan, expected_plan_sha256=expected, receipt=receipt)
+        result = {"native_receipt": receipt, "verification": verified}
+        if "restore_probe_destination" in payload:
+            probe = storage.plan_restore(receipt=receipt, destination=payload["restore_probe_destination"])
+            self._immutable(path / "restore-probe-plan.json", probe)
+            self._native_origin(state, operation, probe, substep=True)
+            self._retain(session_id, {str(Path(probe["destination"]) / f["root_id"] / f["relative_path"]): f["sha256"] for f in probe["files"]},
+                         reason="Exact restoration-probe files reserved before their reviewed verification write")
+            restoration = storage.restore_backup(plan=probe, expected_plan_sha256=digest(probe))
+            result["restore_probe_receipt"] = restoration
+            result["restore_probe_verification"] = storage.verify_outcome(plan=probe, expected_plan_sha256=digest(probe), receipt=restoration)
+            result["recovery_evidence"] = self._register_recovery(session_id, payload["output_root"], receipt, restoration, completing=True)
+        return self._finish(self.engine.read_session(session_id), operation, outcome="succeeded", receipt=result)
 
     def _reconcile_storage_backup_create(self, session_id, operation, intent, payload, **arguments):
         return self._reconcile_storage(session_id, operation, intent, payload, **arguments)

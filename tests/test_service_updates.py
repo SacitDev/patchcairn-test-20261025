@@ -46,6 +46,32 @@ class ExternalHandoffOrderTests(ServiceFixtures):
                 service._finish.assert_not_called()
 
 
+class ReviewedExternalHandoffOrderTests(ServiceFixtures):
+    """Fictional service ordering only; no files, child process or installer."""
+    def test_owner_pause_after_intent_records_consumed_failure_without_handoff(self):
+        service, state, operation, events, written, arguments = self.prepared()
+        def paused(*args):
+            events.append("status-" + str(service.engine.read_session.call_count))
+            state["status"] = "paused"
+            return state
+        service.engine.read_session.side_effect = paused
+        result = service.execute_action(state["session_id"], **arguments)
+        self.assertEqual(events, ["sources", "service-preflight", "begin-operation", "engine-preflight", "intent", "status-1", "finish"])
+        self.assertEqual(result["outcome"], "failed")
+        self.assertFalse(result["receipt"]["adapter_invoked"])
+        self.assertEqual(set(written), {"intent.json"})
+
+    def test_nonordinary_interruption_keeps_intent_and_creates_no_handoff(self):
+        service, state, operation, events, written, arguments = self.prepared()
+        service.engine.read_session.side_effect = KeyboardInterrupt
+        with self.assertRaises(KeyboardInterrupt):
+            service.execute_action(state["session_id"], **arguments)
+        self.assertEqual(set(written), {"intent.json"})
+        self.assertIsNone(operation["outcome"])
+        service._finish.assert_not_called()
+        service.engine.begin_operation.assert_called_once()
+
+
 class WorkflowServiceTests(SessionFixtures):
     def test_external_receipt_before_the_start_is_a_clock_step_or_stale(self):
         # D-056: ordering keeps no tolerance; a gap within pc_records' future-skew bound is reported as a clock step.

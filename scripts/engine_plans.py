@@ -13,7 +13,7 @@ import uuid
 
 import diagnostic_core
 from engine_journal import (ASSESSMENT_ACCESS, ASSESSMENT_SUMMARY, ASSESSMENT_VERIFICATION, BACKEND, CREATION_KEYS, DIAGNOSTIC_ADAPTER, EVIDENCE_MAX_BYTES,
-                            EVIDENCE_MAX_NODES, EXTERNAL_ADAPTER, FIXTURE_ADAPTER, OUTCOMES, SHA, STATE_KEYS, WorkflowRefusal, bounded_text, checked, container,
+                            EVIDENCE_MAX_NODES, FIXTURE_ADAPTER, OUTCOMES, SHA, STATE_KEYS, WorkflowRefusal, bounded_text, checked, container,
                             decode_record, exact_fields, fresh, ids, invalidate, no_links, private_directory, private_file, record_identifier, require_writable,
                             typed_record, utc_time, write_private_new)
 from engine_text import CHECKPOINTS, JOBS, STAGE_LABELS, initial_menu, response
@@ -73,7 +73,7 @@ def _json_shape(value, depth=0):
     raise WorkflowRefusal("Evidence must be bounded JSON data")
 
 
-def _json_data(value):
+def json_data(value):
     """Bounded JSON evidence data that the one encoder also accepts (no lone surrogates, integers within 20
     digits), checked before anything is written."""
     _json_shape(value)
@@ -211,7 +211,7 @@ def validate_state(engine, state):
                 or not SHA.fullmatch(row["sha256"]) or type(row["size"]) is not int or row["size"] < 1):
             raise WorkflowRefusal("Invalid owned evidence record")
         _scope(row["scope"])
-        _json_data(row["facts"])
+        json_data(row["facts"])
         utc_time(row["observed_utc"])
         utc_time(row["registered_utc"])
     active = []
@@ -224,7 +224,7 @@ def validate_state(engine, state):
             if name in op:
                 if not isinstance(op[name], dict):
                     raise WorkflowRefusal("Restart lifecycle metadata must be a typed record")
-                _json_data(op[name])
+                json_data(op[name])
         if op["operation_id"] != operation_id or op["outcome"] not in OUTCOMES | {None} or not SHA.fullmatch(op["plan_sha256"]):
             raise WorkflowRefusal("Invalid operation record")
         if type(op["mutating"]) is not bool or op["adapter_id"] not in pc_records.ADAPTERS:
@@ -323,7 +323,7 @@ def register_evidence(engine, session_id, *, evidence_id, content, kind, scope, 
     facts = copy.deepcopy(facts or {})
     if not isinstance(facts, dict):
         raise WorkflowRefusal("Evidence facts must be a mapping")
-    _json_data(facts)
+    json_data(facts)
     if len(encoded(facts)) > FACTS_MAX_BYTES:
         raise WorkflowRefusal("Evidence facts must stay small; put large data in the evidence content", code="facts-too-large")
     observed = observed_utc or pc_records.utc_now()
@@ -458,26 +458,19 @@ def action_binding(engine, state, action):
                 or digest(payload["request"]) != action["adapter_plan_sha256"] or payload["inventory_sha256"] != digest(inventory)
                 or payload["request"] != inventory):
             raise WorkflowRefusal("Diagnostic request does not match the exact reviewed selected recipe and inventory")
-        _json_data(payload["request"])
+        json_data(payload["request"])
         try:
             request = diagnostic_core.validate_request(payload["request"])
         except diagnostic_core.DiagnosticRefusal as error:
             raise WorkflowRefusal("Diagnostic request is not a supported bounded recipe") from error
         if request["mode"] != state["mode"] or request["platform"] != state["platform"]:
             raise WorkflowRefusal("Diagnostic request belongs to a different creation mode/platform")
-    elif action["adapter_id"] == pc_records.ADAPTER_SYSTEM_REVIEWED_EXTERNAL:
-        typed_record(payload, EXTERNAL_ADAPTER)
-        if (payload["operation"] != action["adapter_id"] or payload["external_plan_sha256"] != action["adapter_plan_sha256"]
-                or digest(payload["external_plan"]) != action["adapter_plan_sha256"] or payload["inventory_sha256"] != digest(inventory)):
-            raise WorkflowRefusal("External handoff does not match its exact reviewed plan and inventory")
-        engine.validate_external_plan(state, payload["external_plan"], inventory)
-        if payload["external_plan"]["kind"] != action["kind"]:
-            raise WorkflowRefusal("External handoff kind differs from the exact engine action")
-        if action["requires_os_consent"] is not True:
-            raise WorkflowRefusal("A local installer handoff requires actual owner-handled protected-system consent")
+    elif action["adapter_id"] in pc_records.ADAPTERS and pc_records.ADAPTERS[action["adapter_id"]]["family"] in {"update", "repair"}:
+        # The update and repair families bind in engine_updates, reached through the engine (no import of it here).
+        engine.update_binding(state, action, payload, inventory)
     elif action["adapter_id"] in STORAGE_ADAPTERS:
         checked(storage_contract.validate_payload, payload, adapter_id=action["adapter_id"], mode=state["mode"], plan_sha256=action["adapter_plan_sha256"])
-        _json_data(payload["storage_plan"])
+        json_data(payload["storage_plan"])
         output_value = Path(bounded_text(payload["output_root"], "owned storage output root", 2000))
         if not output_value.is_absolute():
             raise WorkflowRefusal("Storage output root must be an exact absolute owned work path")

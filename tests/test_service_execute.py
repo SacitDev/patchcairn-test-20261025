@@ -25,35 +25,55 @@ from workflow_service import WorkflowService, ServiceRefusal, verify_storage_art
 from storage_ops import StorageRefusal
 from scoped_fs import ScopedFSError
 from private_workspace import PrivateWorkspaceError, ensure_private_directory, write_private_new
-from service_execute import EXECUTE
+from service_execute import EXECUTE, STORAGE
 from service_reconcile import RECONCILE
 from test_service_state import ServiceFixtures, SessionFixtures, PROSE, PRIVATE_CAPABILITY_HOLDS, broad_namespace_fixture
 
 
-class ExternalHandoffOrderTests(ServiceFixtures):
-    """Fictional service ordering only; no files, child process or installer."""
-    def test_owner_pause_after_intent_records_consumed_failure_without_handoff(self):
-        service, state, operation, events, written, arguments = self.prepared()
-        def paused(*args):
-            events.append("status-" + str(service.engine.read_session.call_count))
-            state["status"] = "paused"
-            return state
-        service.engine.read_session.side_effect = paused
-        result = service.execute_action(state["session_id"], **arguments)
-        self.assertEqual(events, ["sources", "service-preflight", "begin-operation", "engine-preflight", "intent", "status-1", "finish"])
-        self.assertEqual(result["outcome"], "failed")
-        self.assertFalse(result["receipt"]["adapter_invoked"])
-        self.assertEqual(set(written), {"intent.json"})
-
-    def test_nonordinary_interruption_keeps_intent_and_creates_no_handoff(self):
-        service, state, operation, events, written, arguments = self.prepared()
-        service.engine.read_session.side_effect = KeyboardInterrupt
-        with self.assertRaises(KeyboardInterrupt):
-            service.execute_action(state["session_id"], **arguments)
-        self.assertEqual(set(written), {"intent.json"})
-        self.assertIsNone(operation["outcome"])
-        service._finish.assert_not_called()
-        service.engine.begin_operation.assert_called_once()
+class PauseBeforeEffectTests(ServiceFixtures):
+    """Fictional service ordering only; no files, child process or adapter effect."""
+    def test_pause_or_stop_after_intent_finishes_failed_before_any_storage_or_diagnostic_effect(self):
+        # An owner pause or stop that lands between begin and the first effect finishes the consumed operation "failed":
+        # _begin_adapter's stop response, never None, is what _run_adapter returns, with no effect boundary and no effect.
+        for adapter_id in [*STORAGE, pc_records.ADAPTER_DIAGNOSTIC_COLLECT]:
+            for status in ("paused", "stopped"):
+                with self.subTest(adapter_id=adapter_id, status=status):
+                    service, state, operation, events, written, arguments = self.prepared()
+                    action, payload = service._binding.return_value
+                    action["adapter_id"] = adapter_id
+                    payload.clear()
+                    payload.update(operation=adapter_id, fictional=True)
+                    storage = mock.Mock(name="storage")
+                    service._storage_preconditions = mock.Mock(return_value=storage)
+                    effect_name = "_effect_" + EXECUTE[adapter_id].removeprefix("_execute_")
+                    effect = mock.Mock(name=effect_name)
+                    setattr(service, effect_name, effect)
+                    responses, begin = [], service._begin_adapter
+                    def recorded_begin(*args, **kwargs):
+                        responses.append(begin(*args, **kwargs))
+                        return responses[-1]
+                    service._begin_adapter = recorded_begin
+                    def reread(*args, status=status):
+                        events.append("status-" + str(service.engine.read_session.call_count))
+                        state["status"] = status
+                        return state
+                    service.engine.read_session.side_effect = reread
+                    result = service.execute_action(state["session_id"], **arguments)
+                    self.assertEqual(events, ["begin-operation", "engine-preflight", "intent", "status-1", "finish"])
+                    self.assertEqual(result, {"operation_id": operation["operation_id"], "outcome": "failed", "receipt": {
+                        "adapter_invoked": False, "reason": "Owner pause/stop reached before the first adapter effect"}})
+                    self.assertEqual(len(responses), 1)
+                    self.assertIsNotNone(responses[0][3])
+                    self.assertIs(result, responses[0][3])
+                    effect.assert_not_called()
+                    self.assertEqual(storage.mock_calls, [])
+                    self.assertEqual(set(written), {"intent.json"})
+                    self.assertEqual(operation["outcome"], "failed")
+                    if adapter_id in STORAGE:
+                        service._storage_preconditions.assert_called_once_with(state, action, payload, diagnostic_fixture_runner=None,
+                                                                               diagnostic_fixture_result=None)
+                    else:
+                        service._storage_preconditions.assert_not_called()
 
 
 class WorkflowServiceTests(SessionFixtures):
@@ -298,9 +318,13 @@ class CompositionTests(unittest.TestCase):
 
     def test_only_the_dispatch_reaches_the_targets(self):
         # D-071: G11 refuses service._x, not self._x inside a mixin. So no function names a target except through the tables,
-        # and only a target calls the shared paths that rely on execute_action's and reconcile_operation's checks.
+        # only a target calls the shared steps that rely on execute_action's and reconcile_operation's checks (_run_adapter is
+        # the begin step followed by the effect step), and each adapter's _effect_<id> is named only by its own target.
         targets = set(EXECUTE.values()) | set(RECONCILE.values())
-        callers = {"_run_fixed_adapter": set(EXECUTE.values()), "_reconcile_storage": set(RECONCILE.values())}
+        execute = set(EXECUTE.values())
+        callers = {"_storage_preconditions": execute, "_run_adapter": execute, "_begin_adapter": execute | {"_run_adapter"},
+                   "_run_effect": execute | {"_run_adapter"}, "_reconcile_storage": set(RECONCILE.values())}
+        callers.update({"_effect_" + name.removeprefix("_execute_"): {name} for name in execute})
         found = []
         for path in sorted((ROOT / "scripts").glob("*.py")):
             for function in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
@@ -308,8 +332,50 @@ class CompositionTests(unittest.TestCase):
                     for node in ast.walk(function):
                         if isinstance(node, ast.Attribute) and (node.attr in targets or function.name not in callers.get(node.attr, {function.name})):
                             found.append((path.name, node.lineno, function.name, node.attr))
-                        elif isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value in targets:
+                        elif (isinstance(node, ast.Constant) and isinstance(node.value, str)
+                              and (node.value in targets or function.name not in callers.get(node.value, {function.name}))):
                             found.append((path.name, node.lineno, function.name, node.value))
+        self.assertEqual(found, [])
+
+    def test_storage_targets_run_their_preconditions_before_they_begin(self):
+        # Each STORAGE target calls the storage preconditions itself (the exact storage binding, its live native content and a
+        # purge's recovery), so a target that begins an operation, through _run_adapter or _begin_adapter, must first call
+        # _storage_preconditions unconditionally: as the value of a statement of its own body, before any statement that begins.
+        names = {EXECUTE[adapter_id] for adapter_id in STORAGE}
+        definitions = {}
+        for path in sorted((ROOT / "scripts").glob("*.py")):
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names:
+                    definitions.setdefault(node.name, []).append(node)
+        self.assertEqual({name: len(nodes) for name, nodes in definitions.items()}, dict.fromkeys(names, 1))
+
+        def calls(node, name):
+            return any(isinstance(item, ast.Call) and isinstance(item.func, ast.Attribute) and item.func.attr == name for item in ast.walk(node))
+        missing = []
+        for name, (target,) in sorted(definitions.items()):
+            begins = [index for index, statement in enumerate(target.body) if calls(statement, "_run_adapter") or calls(statement, "_begin_adapter")]
+            checked = [index for index, statement in enumerate(target.body)
+                       if isinstance(statement, (ast.Assign, ast.Expr)) and isinstance(statement.value, ast.Call)
+                       and isinstance(statement.value.func, ast.Attribute) and statement.value.func.attr == "_storage_preconditions"]
+            if begins and not (checked and checked[0] < begins[0]):
+                missing.append(name)
+        self.assertEqual(missing, [])
+
+    def test_effects_are_only_passed_to_the_shared_steps(self):
+        # An effect runs only inside _run_effect, after the effect boundary (entered.json) and inside its failure mapping. So,
+        # apart from its definition, an _effect_<id> appears only as the effect argument of a _run_adapter or _run_effect call:
+        # never called directly, aliased or named by a string.
+        found = []
+        for path in sorted((ROOT / "scripts").glob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            passed = {id(argument) for node in ast.walk(tree)
+                      if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in {"_run_adapter", "_run_effect"}
+                      for argument in [*node.args, *(keyword.value for keyword in node.keywords if keyword.arg == "effect")]}
+            for node in ast.walk(tree):
+                name = (node.attr if isinstance(node, ast.Attribute) else node.id if isinstance(node, ast.Name)
+                        else node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else "")
+                if name.startswith("_effect_") and id(node) not in passed:
+                    found.append((path.name, node.lineno, name))
         self.assertEqual(found, [])
 
 

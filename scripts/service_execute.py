@@ -3,8 +3,10 @@ dispatch over every adapter id (PLAN 3.3, RR4, D-071).
 
 ``execute_action`` takes the lock, checks the session and the exact approved binding, then calls the adapter's
 private ``_execute_<id>`` method named in EXECUTE, looked up on the object. Each one is defined in its family's
-module; an id whose family code is not written yet holds there. The targets and ``_run_fixed_adapter`` rely on
-execute_action's checks: only execute_action reaches a target and only a target calls ``_run_fixed_adapter``
+module, next to the adapter's ``_effect_<id>``; an id whose family code is not written yet holds there. The targets
+and the shared steps defined here (``_storage_preconditions``, ``_begin_adapter``, ``_run_effect`` and
+``_run_adapter``) rely on execute_action's checks: only execute_action reaches a target, only a target calls a shared
+step (``_run_adapter`` calls the begin and effect steps), and each ``_effect_<id>`` is named only by its own target
 (CompositionTests). G11 refuses ``service._x`` from another object, not ``self._x`` in a mixin.
 """
 from __future__ import annotations
@@ -17,8 +19,7 @@ import storage_contract
 from workflow_core import WorkflowEngine, digest, older_folder, no_links, STORAGE_ADAPTER
 from storage_ops import StorageService, StorageRefusal, plan_sha256, restorable
 from scoped_fs import ScopedFSError
-from diagnostic_core import DiagnosticRefusal, validate_adapter_result
-from diagnostic_posix import collect_recipe
+from diagnostic_core import DiagnosticRefusal
 from private_workspace import ensure_private_directory
 from service_state import DEFAULT_ROOT, ServiceRefusal, decoded, private_read, read_service, service_value, within, without_version
 from service_backup import verify_storage_artifact
@@ -155,7 +156,7 @@ class ExecuteMixin:
             kind = STORAGE[adapter_id][0]
             required = kind in {"backup_restore", "permanent_purge"} or storage_plan.get("recovery_required") is True
             action = self._action(state, action_id=action_id, adapter_id=adapter_id, kind=kind, payload=payload,
-                    inventory=inventory, target=target, benefit=benefit, risk=risk, reversibility=reversibility,
+                    native_plan=payload["storage_plan"], inventory=inventory, target=target, benefit=benefit, risk=risk, reversibility=reversibility,
                     verification=verification, requires_recovery=required,
                     recovery_evidence_ids=recovery_evidence_ids, requires_os_consent=requires_os_consent)
             if adapter_id == pc_records.ADAPTER_STORAGE_PURGE:
@@ -187,88 +188,39 @@ class ExecuteMixin:
                 precondition_evidence_ids=precondition_evidence_ids, owner_consent_evidence_id=owner_consent_evidence_id,
                 diagnostic_fixture_runner=diagnostic_fixture_runner, diagnostic_fixture_result=diagnostic_fixture_result)
 
-    def _run_fixed_adapter(self, session_id, state, action, payload, *, action_id, plan_sha256, precondition_evidence_ids,
-                           owner_consent_evidence_id, diagnostic_fixture_runner, diagnostic_fixture_result):
-        """The fixed storage, diagnostic and reviewed-handoff path, called with execute_action's lock held, after its
-        session and binding checks: preconditions, begin, intent, then the adapter effect and its outcome."""
-        storage = None
-        if action["adapter_id"] in STORAGE:
-            if diagnostic_fixture_runner is not None or diagnostic_fixture_result is not None:
-                raise ServiceRefusal("Diagnostic injection is not a storage adapter input")
-            storage = self._storage(state, payload)
-            storage.check_preconditions(plan=payload["storage_plan"], expected_plan_sha256=payload["storage_plan_sha256"])
-            if action["adapter_id"] == pc_records.ADAPTER_STORAGE_PURGE:
-                self.engine.verify_recovery(state, action["recovery_evidence_ids"], action=action)
-        elif action["adapter_id"] == pc_records.ADAPTER_SYSTEM_REVIEWED_EXTERNAL:
-            if action["requires_os_consent"] is not True:
-                raise ServiceRefusal("Fixed local installer dispatch requires actual protected OS consent for this exact action")
-            self._external_sources(payload["external_plan"])
-            self._external_preflight(state, action, payload, precondition_evidence_ids)
-            if diagnostic_fixture_runner is not None or diagnostic_fixture_result is not None:
-                raise ServiceRefusal("External handoff cannot accept injected adapter output")
-        elif state["mode"] != "fixture" and (diagnostic_fixture_runner is not None or diagnostic_fixture_result is not None):
-            raise ServiceRefusal("Fictional diagnostic output cannot enter a real operation")
+    # The shared steps of the fixed adapters. Each is called with execute_action's lock held, after its session and
+    # binding checks: a target runs its own preconditions, then _run_adapter (or, for the reviewed handoff,
+    # _begin_adapter alone), and _run_effect runs the target's _effect_<id> after the effect boundary.
+    def _storage_preconditions(self, state, action, payload, *, diagnostic_fixture_runner, diagnostic_fixture_result):
+        """A storage target's preconditions before begin; returns the storage service its effect uses."""
+        if diagnostic_fixture_runner is not None or diagnostic_fixture_result is not None:
+            raise ServiceRefusal("Diagnostic injection is not a storage adapter input")
+        storage = self._storage(state, payload)
+        storage.check_preconditions(plan=payload["storage_plan"], expected_plan_sha256=payload["storage_plan_sha256"])
+        if action["adapter_id"] == pc_records.ADAPTER_STORAGE_PURGE:
+            self.engine.verify_recovery(state, action["recovery_evidence_ids"], action=action)
+        return storage
+
+    def _begin_adapter(self, session_id, state, action, payload, *, action_id, plan_sha256, precondition_evidence_ids,
+                       owner_consent_evidence_id):
+        """Begin, intent, then the session re-read: (operation, path, intent, stopped). ``stopped`` is the consumed "failed"
+        response when the owner paused or stopped before the first effect, otherwise None."""
         operation = self.engine.begin_operation(session_id, action_id=action_id, plan_sha256=plan_sha256,
                     precondition_evidence_ids=precondition_evidence_ids, owner_consent_evidence_id=owner_consent_evidence_id)["data"]
         path, intent = self._intent(state, operation, action, payload)
         current = self.engine.read_session(session_id)
         if current["status"] != "active":
-            return self._finish(current, operation, outcome="failed",
+            return operation, path, intent, self._finish(current, operation, outcome="failed",
                                 receipt={"adapter_invoked": False, "reason": "Owner pause/stop reached before the first adapter effect"})
-        if action["adapter_id"] == pc_records.ADAPTER_SYSTEM_REVIEWED_EXTERNAL:
-            handoff = {**service_value("reviewed_external_handoff"), "operation_id": operation["operation_id"],
-                       "action_id": action_id, "plan_sha256": plan_sha256, "adapter_payload_sha256": action["adapter_payload_sha256"],
-                       "mode": state["mode"], "external_plan": payload["external_plan"],
-                       "instruction": "Trusted coordinator performs only this exact reviewed official-tool operation through normal host "
-                                      "permissions; report actual evidence. This helper executes nothing."}
-            self._immutable(path / "handoff.json", handoff)
-            return handoff
+        return operation, path, intent, None
+
+    def _run_effect(self, session_id, state, operation, action, payload, path, intent, effect, **effect_arguments):
+        """Write the effect boundary (entered.json), then run ``effect``, an ``_effect_<id>`` method, with the effect
+        arguments. Its listed failures finish the operation as "unknown" with a categorical receipt; others propagate."""
         self._immutable(path / "entered.json", service_value("effect_boundary", observed_utc=pc_records.utc_now(),
                                                              operation_id=operation["operation_id"], adapter_id=action["adapter_id"]))
         try:
-            if storage is not None:
-                plan, expected = payload["storage_plan"], payload["storage_plan_sha256"]
-                self._native_origin(state, operation, plan)
-                if payload["operation"] == pc_records.ADAPTER_STORAGE_BACKUP_CREATE:
-                    if plan["required_recovery"]:
-                        self._retain(session_id, {plan["destination"]: None, plan["destination"] + ".manifest.json": None},
-                                     reason="Required backup reserved before effect; incomplete/unknown artifacts remain protected")
-                    receipt = storage.create_backup(plan=plan, expected_plan_sha256=expected)
-                elif payload["operation"] == pc_records.ADAPTER_STORAGE_RESTORE:
-                    receipt = storage.restore_backup(plan=plan, expected_plan_sha256=expected)
-                elif payload["operation"] == pc_records.ADAPTER_STORAGE_QUARANTINE:
-                    self._reserve_quarantine(state, operation, action, payload, intent)
-                    receipt = storage.quarantine(plan=plan, expected_plan_sha256=expected)
-                elif payload["operation"] == pc_records.ADAPTER_STORAGE_QUARANTINE_RESTORE:
-                    receipt = storage.restore_quarantine(plan=plan, expected_plan_sha256=expected)
-                else:
-                    receipt = storage.purge_quarantine(plan=plan, expected_plan_sha256=expected)
-                verified = storage.verify_outcome(plan=plan, expected_plan_sha256=expected, receipt=receipt)
-                result = {"native_receipt": receipt, "verification": verified}
-                if "restore_probe_destination" in payload:
-                    probe = storage.plan_restore(receipt=receipt, destination=payload["restore_probe_destination"])
-                    self._immutable(path / "restore-probe-plan.json", probe)
-                    self._native_origin(state, operation, probe, substep=True)
-                    self._retain(session_id, {str(Path(probe["destination"]) / f["root_id"] / f["relative_path"]): f["sha256"] for f in probe["files"]},
-                                 reason="Exact restoration-probe files reserved before their reviewed verification write")
-                    restoration = storage.restore_backup(plan=probe, expected_plan_sha256=digest(probe))
-                    result["restore_probe_receipt"] = restoration
-                    result["restore_probe_verification"] = storage.verify_outcome(plan=probe, expected_plan_sha256=digest(probe), receipt=restoration)
-                    result["recovery_evidence"] = self._register_recovery(session_id, payload["output_root"], receipt, restoration, completing=True)
-                return self._finish(self.engine.read_session(session_id), operation, outcome="succeeded", receipt=result)
-            request = payload["request"]
-            if request["platform"] == "windows" and diagnostic_fixture_result is None:
-                handoff = {**service_value("windows_diagnostic_handoff"), "operation_id": operation["operation_id"],
-                           "request": request, "helper": "diagnostic_windows.ps1:Invoke-WindowsDiagnostic",
-                           "instruction": "Use this fixed native helper in the matching host; return its selected actual adapter result. "
-                                          "No generic command is accepted."}
-                self._immutable(path / "handoff.json", handoff)
-                return handoff
-            observed = (validate_adapter_result(request, diagnostic_fixture_result) if diagnostic_fixture_result is not None
-                        else collect_recipe(request, runner=diagnostic_fixture_runner, coordinator_authorized=state["mode"] == "real"))
-            record = self.diagnostics.record_result(request["request_id"], adapter_result=observed)
-            return self._finish(self.engine.read_session(session_id), operation,
-                                outcome="succeeded" if observed["status"] == "observed" else "failed", receipt=record)
+            return effect(session_id, state, operation, action, payload, path, intent, **effect_arguments)
         except (StorageRefusal, ScopedFSError, DiagnosticRefusal, OSError, ValueError) as exc:
             # A move/write can finish before its receipt. Error text may
             # contain private paths. Preserve only a categorical failure.
@@ -276,3 +228,13 @@ class ExecuteMixin:
                     receipt={"adapter_invoked": True, "failure_class": type(exc).__name__, "possible_partial_effects": True,
                              "failure_code": getattr(exc, "code", None),
                              "instruction": "Preserve exact intent, native attempt/mapping and outputs; inspect actual state before any new plan."})
+
+    def _run_adapter(self, session_id, state, action, payload, effect, *, action_id, plan_sha256, precondition_evidence_ids,
+                     owner_consent_evidence_id, **effect_arguments):
+        """_begin_adapter, then its paused response if the owner paused, otherwise _run_effect with ``effect``."""
+        operation, path, intent, stopped = self._begin_adapter(session_id, state, action, payload, action_id=action_id, plan_sha256=plan_sha256,
+                                                               precondition_evidence_ids=precondition_evidence_ids,
+                                                               owner_consent_evidence_id=owner_consent_evidence_id)
+        if stopped is not None:
+            return stopped
+        return self._run_effect(session_id, state, operation, action, payload, path, intent, effect, **effect_arguments)

@@ -16,7 +16,7 @@ from workflow_core import (typed_record, read_record_bytes, exact_fields, utc_ti
                            RESTART_PENDING, RESTART_VERIFICATION, WINDOWS_BOOT)
 from scoped_fs import ScopedRoot
 from diagnostic_core import CLOCK_STEP_MESSAGE, after_now, stepped_back, SENSITIVE, sanitize_text
-from service_state import ServiceRefusal, decoded, private_read, selected_text, without_version
+from service_state import ServiceRefusal, decoded, private_read, selected_text, service_value, without_version
 
 OFFICIAL_DOMAINS = {
     "windows.msiexec.install": {"learn.microsoft.com", "support.microsoft.com"},
@@ -63,7 +63,7 @@ class UpdatesMixin:
                        "external_plan": copy.deepcopy(external_plan), "external_plan_sha256": digest(external_plan),
                        "inventory_sha256": digest(inventory)}
             return self._action(state, action_id=action_id, adapter_id=payload["operation"], kind=external_plan["kind"],
-                    payload=payload, inventory=inventory, target=target, benefit=benefit, risk=risk,
+                    payload=payload, native_plan=payload["external_plan"], inventory=inventory, target=target, benefit=benefit, risk=risk,
                     reversibility=reversibility, verification=verification,
                     requires_recovery=requires_recovery or external_plan["kind"] == "repair",
                     recovery_evidence_ids=recovery_evidence_ids, requires_os_consent=requires_os_consent)
@@ -319,8 +319,9 @@ class UpdatesMixin:
                 kind="reconciliation" if operation["outcome"] == "unknown" else "outcome")
 
     # Dispatch targets (service_execute.EXECUTE, service_reconcile.RECONCILE; reached only through execute_action and
-    # reconcile_operation): the reviewed handoff uses the shared path and completes through complete_external; the
-    # package and repair adapters are not written yet.
+    # reconcile_operation): the reviewed handoff keeps its own preconditions, begins through service_execute's shared
+    # begin step, writes its handoff without an effect boundary and completes through complete_external; the package and
+    # repair adapters are not written yet.
     def _execute_package_upgrade(self, session_id, state, action, payload, **arguments):
         return self._execute_held(session_id, state, action, payload, **arguments)
 
@@ -331,7 +332,25 @@ class UpdatesMixin:
         return self._execute_held(session_id, state, action, payload, **arguments)
 
     def _execute_system_reviewed_external(self, session_id, state, action, payload, **arguments):
-        return self._run_fixed_adapter(session_id, state, action, payload, **arguments)
+        if action["requires_os_consent"] is not True:
+            raise ServiceRefusal("Fixed local installer dispatch requires actual protected OS consent for this exact action")
+        self._external_sources(payload["external_plan"])
+        self._external_preflight(state, action, payload, arguments["precondition_evidence_ids"])
+        if arguments["diagnostic_fixture_runner"] is not None or arguments["diagnostic_fixture_result"] is not None:
+            raise ServiceRefusal("External handoff cannot accept injected adapter output")
+        operation, path, intent, stopped = self._begin_adapter(session_id, state, action, payload, action_id=arguments["action_id"],
+                                                               plan_sha256=arguments["plan_sha256"],
+                                                               precondition_evidence_ids=arguments["precondition_evidence_ids"],
+                                                               owner_consent_evidence_id=arguments["owner_consent_evidence_id"])
+        if stopped is not None:
+            return stopped
+        handoff = {**service_value("reviewed_external_handoff"), "operation_id": operation["operation_id"],
+                   "action_id": arguments["action_id"], "plan_sha256": arguments["plan_sha256"],
+                   "adapter_payload_sha256": action["adapter_payload_sha256"], "mode": state["mode"], "external_plan": payload["external_plan"],
+                   "instruction": "Trusted coordinator performs only this exact reviewed official-tool operation through normal host "
+                                  "permissions; report actual evidence. This helper executes nothing."}
+        self._immutable(path / "handoff.json", handoff)
+        return handoff
 
     def _reconcile_package_upgrade(self, session_id, operation, intent, payload, **arguments):
         return self._reconcile_held(session_id, operation, intent, payload, **arguments)

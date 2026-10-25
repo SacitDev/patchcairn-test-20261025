@@ -162,15 +162,16 @@ class StateMixin:
         return self.engine.register_evidence(state["session_id"], evidence_id=evidence_id, content=encoded(value),
                 kind=kind, scope=state["settings"]["scope"], facts=facts or {}, observed_utc=observed_utc)["data"]
 
-    def _action(self, state, *, action_id, adapter_id, kind, payload, inventory, target, benefit, risk,
+    def _action(self, state, *, action_id, adapter_id, kind, payload, native_plan, inventory, target, benefit, risk,
                 reversibility, verification, requires_recovery=False, recovery_evidence_ids=None, requires_os_consent=False):
+        """The engine action for ``payload``; ``native_plan`` is the lower-level plan inside it that the action's
+        adapter_plan_sha256 binds (each caller names its own)."""
         record_identifier(action_id)
         prose = {key: selected_text(value) for key, value in (("target", target), ("benefit", benefit), ("risk", risk),
                                                               ("reversibility", reversibility), ("verification", verification))}
         inventory_row = self._register(state, kind="inventory", value=inventory, facts={
             "complete": True, "item_count": len(inventory.get("entries", inventory.get("records", []))) if isinstance(inventory, dict) else 1})
         payload_row = self._register(state, kind="adapter_payload", value=payload)
-        native_plan = payload.get("storage_plan", payload.get("request", payload.get("external_plan")))
         return {"action_id": action_id, "kind": kind, **prose, "mutating": kind != "assessment",
                 "requires_os_consent": requires_os_consent, "requires_recovery": requires_recovery,
                 "recovery_evidence_ids": recovery_evidence_ids or [], "adapter_id": adapter_id,

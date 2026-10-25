@@ -1,5 +1,5 @@
-"""The reviewed local-installer handoff: its exact plan, its artifact and signature preflight, and the recorded
-protected-system consent. Nothing is installed here.
+"""The update and repair families' payload binding, and the reviewed local-installer handoff: its exact plan, its
+artifact and signature preflight, and the recorded protected-system consent. Nothing is installed here.
 Functions that need the engine take it as ``engine`` (workflow_core.WorkflowEngine), the context described there.
 """
 from __future__ import annotations
@@ -8,11 +8,32 @@ from pathlib import Path
 import re
 from urllib.parse import urlsplit
 
-from engine_journal import (EXTERNAL_PLAN, EXTERNAL_PREFLIGHT, EXTERNAL_RECOVERY, EXTERNAL_VERIFICATION, INSTALLER_METADATA, PUBLISHER_SIGNATURE, SHA,
-                            WorkflowRefusal, bounded_text, decode_record, exact_fields, fresh, record_identifier, require_writable, typed_record)
+from engine_journal import (EXTERNAL_ADAPTER, EXTERNAL_PLAN, EXTERNAL_PREFLIGHT, EXTERNAL_RECOVERY, EXTERNAL_VERIFICATION, INSTALLER_METADATA,
+                            PUBLISHER_SIGNATURE, SHA, WorkflowRefusal, bounded_text, decode_record, exact_fields, fresh, record_identifier,
+                            require_writable, typed_record)
 from engine_plans import action_binding, current_plan, owner_record
 import pc_paths
+import pc_records
 from pc_records import digest
+
+
+def update_binding(engine, state, action, payload, inventory):
+    """The payload binding of an update or repair family action (pc_records.ADAPTERS), reached from
+    engine_plans.action_binding through the engine after its payload and inventory hash checks: today's reviewed
+    local-installer handoff. The package and repair adapters hold until their family code is written."""
+    if action["adapter_id"] == pc_records.ADAPTER_SYSTEM_REVIEWED_EXTERNAL:
+        typed_record(payload, EXTERNAL_ADAPTER)
+        if (payload["operation"] != action["adapter_id"] or payload["external_plan_sha256"] != action["adapter_plan_sha256"]
+                or digest(payload["external_plan"]) != action["adapter_plan_sha256"] or payload["inventory_sha256"] != digest(inventory)):
+            raise WorkflowRefusal("External handoff does not match its exact reviewed plan and inventory")
+        engine.validate_external_plan(state, payload["external_plan"], inventory)
+        if payload["external_plan"]["kind"] != action["kind"]:
+            raise WorkflowRefusal("External handoff kind differs from the exact engine action")
+        if action["requires_os_consent"] is not True:
+            raise WorkflowRefusal("A local installer handoff requires actual owner-handled protected-system consent")
+        return
+    # A registered adapter whose family code is not written yet: the facts allow it, nothing binds it.
+    raise WorkflowRefusal("This adapter's payload binding is not written yet; the action is held", code="adapter-held")
 
 
 def validate_external_plan(engine, state, plan, inventory):

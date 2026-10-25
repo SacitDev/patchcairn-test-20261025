@@ -151,6 +151,7 @@ class WorkflowEngine:
     record_restart_verification = _forward(engine_restart.record_restart_verification)
 
     # engine_updates
+    update_binding = _forward(engine_updates.update_binding)
     validate_external_plan = _forward(engine_updates.validate_external_plan)
     external_preflight = _external_preflight = _forward(engine_updates.external_preflight)
     record_protected_consent = _forward(engine_updates.record_protected_consent)

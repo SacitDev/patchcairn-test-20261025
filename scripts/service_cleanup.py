@@ -98,15 +98,39 @@ class CleanupMixin:
                 raise ServiceRefusal("Integrated permanent purge requires the original quarantine's exact verified backup and restoration probe")
 
     # Dispatch targets (service_execute.EXECUTE, service_reconcile.RECONCILE; reached only through execute_action and
-    # reconcile_operation): quarantine and purge use the shared storage path; removing originals is not written yet.
+    # reconcile_operation): quarantine and purge run their effects through the shared steps of service_execute and
+    # reconcile through the shared storage reconciliation; removing originals is not written yet.
     def _execute_storage_quarantine(self, session_id, state, action, payload, **arguments):
-        return self._run_fixed_adapter(session_id, state, action, payload, **arguments)
+        storage = self._storage_preconditions(state, action, payload, diagnostic_fixture_runner=arguments.pop("diagnostic_fixture_runner"),
+                                              diagnostic_fixture_result=arguments.pop("diagnostic_fixture_result"))
+        return self._run_adapter(session_id, state, action, payload, self._effect_storage_quarantine, storage=storage, **arguments)
 
     def _execute_storage_purge(self, session_id, state, action, payload, **arguments):
-        return self._run_fixed_adapter(session_id, state, action, payload, **arguments)
+        storage = self._storage_preconditions(state, action, payload, diagnostic_fixture_runner=arguments.pop("diagnostic_fixture_runner"),
+                                              diagnostic_fixture_result=arguments.pop("diagnostic_fixture_result"))
+        return self._run_adapter(session_id, state, action, payload, self._effect_storage_purge, storage=storage, **arguments)
 
     def _execute_storage_remove_originals(self, session_id, state, action, payload, **arguments):
         return self._execute_held(session_id, state, action, payload, **arguments)
+
+    def _effect_storage_quarantine(self, session_id, state, operation, action, payload, path, intent, *, storage):
+        """The quarantine, reserved before its first move, after the effect boundary (service_execute._run_effect)."""
+        plan, expected = payload["storage_plan"], payload["storage_plan_sha256"]
+        self._native_origin(state, operation, plan)
+        self._reserve_quarantine(state, operation, action, payload, intent)
+        receipt = storage.quarantine(plan=plan, expected_plan_sha256=expected)
+        verified = storage.verify_outcome(plan=plan, expected_plan_sha256=expected, receipt=receipt)
+        result = {"native_receipt": receipt, "verification": verified}
+        return self._finish(self.engine.read_session(session_id), operation, outcome="succeeded", receipt=result)
+
+    def _effect_storage_purge(self, session_id, state, operation, action, payload, path, intent, *, storage):
+        """The backed purge, after the effect boundary (service_execute._run_effect)."""
+        plan, expected = payload["storage_plan"], payload["storage_plan_sha256"]
+        self._native_origin(state, operation, plan)
+        receipt = storage.purge_quarantine(plan=plan, expected_plan_sha256=expected)
+        verified = storage.verify_outcome(plan=plan, expected_plan_sha256=expected, receipt=receipt)
+        result = {"native_receipt": receipt, "verification": verified}
+        return self._finish(self.engine.read_session(session_id), operation, outcome="succeeded", receipt=result)
 
     def _reconcile_storage_quarantine(self, session_id, operation, intent, payload, **arguments):
         return self._reconcile_storage(session_id, operation, intent, payload, **arguments)
