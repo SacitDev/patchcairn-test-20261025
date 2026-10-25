@@ -19,8 +19,5 @@
     "assistant_chat",
     "terminal"
   ],
-  "public_site": "documentation_only",
-  "branding": {
-    "report_logo": "assets/patchcairn-logo.png"
-  }
+  "public_site": "documentation_only"
 }

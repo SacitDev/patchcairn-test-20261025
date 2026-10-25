@@ -274,7 +274,7 @@ class SchemaTests(unittest.TestCase):
                  "patchcairn.assessment.access", "patchcairn.assessment.summary", "patchcairn.assessment.verification",
                  "patchcairn.restart.pending", "patchcairn.restart.verification", "patchcairn.windows.boot.observation"}
         self.assertLessEqual(today, pc_records.SCHEMAS - pc_records.PLANNED_SCHEMAS)
-        self.assertEqual(pc_records.PLANNED_SCHEMAS, {"patchcairn.package", "patchcairn.schedule", "patchcairn.report"})
+        self.assertEqual(pc_records.PLANNED_SCHEMAS, {"patchcairn.package", "patchcairn.schedule"})
         self.assertEqual(pc_records.CONTAINERS, {"engine_marker", "session_state", "session_creation",
                                                  "response_envelope", "workflows_template", "tool_catalog", "toolkit_marker"})
         # One name per family: new storage records are kinds of patchcairn.storage, so no second name may
@@ -299,12 +299,12 @@ class SchemaTests(unittest.TestCase):
             self.assertIs(pc_records.register_reader("patchcairn.storage", reader), reader)
             self.assertIs(pc_records.READERS["patchcairn.storage"], reader)
             for name, candidate, code in (("patchcairn.storage", len, "reader-registered"),
-                                          ("patchcairn.report", len, "schema-planned"),
+                                          ("patchcairn.package", len, "schema-planned"),
                                           ("patchcairn.unknown", len, "schema-unregistered"),
                                           ("patchcairn.service", "not callable", "invalid-reader")):
                 with self.subTest(name=name):
                     self.refused(lambda: pc_records.register_reader(name, candidate), code)
-            self.assertNotIn("patchcairn.report", pc_records.READERS)
+            self.assertNotIn("patchcairn.package", pc_records.READERS)
 
 
 class TimeTests(unittest.TestCase):

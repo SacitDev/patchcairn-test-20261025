@@ -22,6 +22,7 @@ ROOT = Path(__file__).absolute().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 import pc_records
 import diagnostic_core
+import report
 import storage_contract
 import storage_ops
 import workflow_core
@@ -30,7 +31,7 @@ import workflow_service
 # Short fixture names keep the deepest record path within the Windows private-path cap from a long checkout path.
 WORK = ROOT / "work" / "test-fixtures"
 # A family's reader lives in the lowest module that reads it, named by its layer (D-036 item 2).
-OWNER_PREFIXES = ("workflow_core", "engine_", "workflow_service", "service_", "storage_", "diagnostic_")
+OWNER_PREFIXES = ("workflow_core", "engine_", "workflow_service", "service_", "storage_", "diagnostic_", "report")
 # The kind a sample record carries in the families whose records are told apart by "kind".
 SAMPLE_KINDS = {"patchcairn.storage": "backup_receipt", "patchcairn.diagnostics": "result", "patchcairn.service": "service_marker"}
 MISSING = object()
