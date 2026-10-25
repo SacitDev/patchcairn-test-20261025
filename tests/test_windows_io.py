@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 import ctypes
+import gc
 import hashlib
 import json
 import os
@@ -358,6 +359,49 @@ class WindowsIoTests(Fixture):
         self.assertEqual(measured["after"], measured["before"],
                          f"handle count changed by {measured['after'] - measured['before']:+d}; {threads}")
         self.assertEqual(measured["io_threads"], 0, threads)
+
+    def test_refused_call_leaves_no_reference_cycle(self):
+        # A refusal raised on the root's I/O thread must not stay tied to that thread's job or to the frame that
+        # re-raises it: the job, the root and its I/O thread would then wait for the garbage collector, and on
+        # Python 3.12 for Windows each lock in them holds a kernel semaphore until then. Only this module's objects
+        # are counted, so garbage from anything else in the process cannot fail the test.
+        root = self.open_root()
+        record = self.seed(root, "a.bin", b"a")
+        calls = {"inspect": lambda: root.inspect("absent.bin"), "open_new": lambda: root.open_new("a.bin").__enter__(),
+                 "stream_to": lambda: root.stream_to("a.bin", expected={**record, "inode": 1}, writer=len),
+                 "root": lambda: windows_scoped.WindowsRoot(str(self.path("absent")))}
+        owned = (ScopedFSError, windows_scoped._Job, windows_scoped._IoThread, windows_scoped.WindowsRoot)
+
+        def ours(item):
+            frame = item.tb_frame if isinstance(item, types.TracebackType) else item
+            if isinstance(frame, types.FrameType):
+                return frame.f_code.co_filename.endswith("windows_scoped.py") and frame.f_code.co_qualname
+            return isinstance(item, owned) and type(item).__name__
+
+        enabled, debug = gc.isenabled(), gc.get_debug()
+        for name, call in calls.items():
+            gc.collect()
+            gc.disable()
+            gc.set_debug(gc.DEBUG_SAVEALL)
+            saved = list(gc.garbage)
+            gc.garbage.clear()
+            try:
+                try:
+                    call()
+                except ScopedFSError:
+                    refused = True
+                else:
+                    refused = False
+                root.list_directory()  # the next call replaces the thread's last job, as in normal use
+                gc.collect()  # outside the except block, where the exception is no longer being handled
+                kept = sorted(label for label in map(ours, gc.garbage) if label)
+            finally:
+                gc.garbage[:] = saved
+                gc.set_debug(debug)
+                if enabled:
+                    gc.enable()
+            self.assertTrue(refused, f"the {name} call was not refused")
+            self.assertEqual(kept, [], f"the refused {name} call left objects for the garbage collector")
 
     def test_private_dacl_before_first_byte(self):
         root = self.open_root()

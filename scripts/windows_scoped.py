@@ -243,9 +243,15 @@ class _IoThread:
             raise CapabilityHold("io-unresolved", "A file operation did not finish before its deadline; its outcome is unknown")
         # Only a call that outlived its deadline keeps its arguments (and the caller's buffers) alive.
         job.args = job.kwargs = None
-        if job.error is not None:
-            raise job.error
-        return job.value
+        error, job.error = job.error, None
+        if error is None:
+            return job.value
+        try:
+            raise error
+        finally:
+            # Its traceback holds this frame and the job's: else the job, this root and its I/O thread wait in a cycle for the
+            # next collection (on Python 3.12 for Windows every lock in them holds a kernel semaphore).
+            del error
 
     def release(self, stack):
         """Close an operation's handles. While a call is stuck they stay open: the thread closes them as soon

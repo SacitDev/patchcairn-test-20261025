@@ -699,6 +699,15 @@ def altered(info, **changes):
     return types.SimpleNamespace(**{**fields, **changes})
 
 
+def refusing_rename(code):
+    """A native no-overwrite rename that fails with errno ``code``, reported the way ctypes reports it. Patching
+    ctypes.get_errno instead would also feed ``code`` to other native checks in the same call (macOS's ACL check)."""
+    def rename(*args):
+        ctypes.set_errno(code)
+        return -1
+    return mock.Mock(side_effect=rename)
+
+
 @unittest.skipUnless(os.name == "posix", "only on posix: PosixRoot runs on POSIX descriptors")
 class PosixRootTests(unittest.TestCase):
     """PosixRoot behaviour beyond the shared contract, on real folders under work/test-fixtures/."""
@@ -833,9 +842,8 @@ class PosixRootTests(unittest.TestCase):
             with self.assertRaises(fs.CapabilityHold) as caught:
                 self.root.open_new("a.bin").__enter__()
         self.assertEqual(caught.exception.code, "no-replace-unavailable")
-        refusing = mock.Mock(return_value=-1)
-        with mock.patch.object(fs, "_rename_function", return_value=refusing), \
-                mock.patch.object(fs.ctypes, "get_errno", return_value=errno.EINVAL):
+        refusing = refusing_rename(errno.EINVAL)
+        with mock.patch.object(fs, "_rename_function", return_value=refusing):
             with self.assertRaises(fs.CapabilityHold) as caught:
                 with self.root.open_new("b.bin") as out:
                     out.write(b"fictional")
@@ -889,9 +897,8 @@ class PosixRootTests(unittest.TestCase):
     def test_admission_holds_where_no_replace_rename_fails(self):
         # macOS msdos and exFAT may refuse RENAME_EXCL: a destination proves the rename before anything is written.
         (self.base / "usb").mkdir()
-        refusing = mock.Mock(return_value=-1)
-        with mock.patch.object(fs, "_rename_function", return_value=refusing), \
-                mock.patch.object(fs.ctypes, "get_errno", return_value=errno.ENOTSUP):
+        refusing = refusing_rename(errno.ENOTSUP)
+        with mock.patch.object(fs, "_rename_function", return_value=refusing):
             with self.assertRaises(fs.CapabilityHold) as caught:
                 fs.admit_destination(str(self.base / "usb"), non_private_destination=True,
                                      volumes=lambda fd: {"filesystem": "exfat", "removable": True})
@@ -1026,9 +1033,8 @@ class PosixRemovalTests(unittest.TestCase):
         # A bind mount has the same device but refuses the rename with EXDEV: nothing moved, so the verified
         # original is deleted in place instead.
         self.removal._device = self.root._device
-        refusing = mock.Mock(return_value=-1)
-        with mock.patch.object(fs, "_rename_function", return_value=refusing), \
-                mock.patch.object(fs.ctypes, "get_errno", return_value=errno.EXDEV):
+        refusing = refusing_rename(errno.EXDEV)
+        with mock.patch.object(fs, "_rename_function", return_value=refusing):
             self.assertEqual(self.removed("kept.txt", kept, removal_name=fs.new_removal_name()), kept)
         refusing.assert_called_once()
         self.assertEqual((os.listdir(self.base / "selected"), os.listdir(self.folder)), ([], []))
