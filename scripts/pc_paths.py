@@ -54,6 +54,8 @@ PROTECTED_COMPONENTS = frozenset({
     "$recycle.bin", "system volume information", ".trash", ".trashes",
     # Saved Wi-Fi and VPN keys (NetworkManager) and macOS account password hashes.
     "system-connections", "dslocal",
+    # The partitions of a Samba domain controller's account database, also inside a samba-tool backup.
+    "sam.ldb.d",
 })
 PROTECTED_FILES = frozenset({
     ".env", ".npmrc", ".pypirc", ".netrc", "_netrc", ".pgpass", "id_rsa", "id_dsa",
@@ -65,18 +67,56 @@ PROTECTED_FILES = frozenset({
     ".psql_history", "consolehost_history.txt", "state.vscdb", "access_tokens.db",
     "credentials.db", "application_default_credentials.json",
     "wpa_supplicant.conf", "krb5.keytab", "chap-secrets", "pap-secrets", "ipsec.secrets",
+    # strongSwan's swanctl.conf (its secrets section holds pre-shared keys and passwords), Libreswan's NSS password
+    # and the .secrets file of local CI runners (act).
+    "swanctl.conf", "nsspassword", ".secrets",
+    # Cargo, Terraform and OpenTofu registry tokens (CLI configuration files hold credentials blocks), the HashiCorp
+    # Vault token and Bitcoin-style wallets.
+    "credentials.toml", "credentials.tfrc.json", ".terraformrc", "terraform.rc", ".tofurc", "tofurc", "tofu.rc",
+    ".vault-token", "wallet.dat",
+    # Password databases wherever they were copied: Samba's (any layout) and winbind's offline-logon cache, an
+    # Active Directory domain controller's and an AD LDS instance's, earlier Linux password hashes
+    # (/etc/security/opasswd) and the old NSS key database (Firefox, Libreswan).
+    "secrets.tdb", "passdb.tdb", "secrets.ldb", "sam.ldb", "winbindd_cache.tdb", "ntds.dit", "adamntds.dit",
+    "opasswd", "key3.db",
 })
-PROTECTED_PREFIXES = (".env.", ".trash-")
+# .env.local, .Trash-1000, renamed copies of a wallet or an AD database (wallet.dat.bak, ntds.dit.old) and
+# Ethereum key files (UTC--<time>--<address>).
+PROTECTED_PREFIXES = (".env.", ".trash-", "wallet.dat.", "ntds.dit.", "utc--")
+# .secrets: per-connection IPsec secrets (ipsec.d/*.secrets); .tfrc: a Terraform or OpenTofu CLI configuration file.
 PROTECTED_SUFFIXES = frozenset({".pem", ".key", ".pfx", ".p12", ".kdbx", ".kdb", ".keyring", ".wallet",
-                                ".jks", ".keystore", ".keychain", ".keychain-db", ".ppk", ".gpg", ".asc", ".keytab"})
+                                ".jks", ".keystore", ".keychain", ".keychain-db", ".ppk", ".gpg", ".asc", ".keytab",
+                                ".secrets", ".tfrc"})
 BROWSER_PREFIXES = ("google-chrome", "microsoft-edge", "edge", "chrome", "chromium",
                     "firefox", "mozilla", "brave", "brave-browser", "safari", "opera", "vivaldi")
-# Name pairs that are private wherever they appear, for example in a copy of another system's disk:
-# messages, password hashes, SSH host keys, Wi-Fi keys, the Windows account database and Windows
-# protected keys. A source folder merely named wpa_supplicant or Microsoft stays readable.
+# Name sequences that are private wherever they appear, for example in a copy of another system's disk: messages,
+# password hashes (Linux, BSD, macOS, Samba's private folders, SSSD's login cache), SSH host keys, Wi-Fi and VPN keys
+# (wpa_supplicant, iwd, WireGuard on Linux and Windows, IPsec ipsec.d and swanctl), the Windows account database and
+# its old copies in Windows\repair (RegBack too), Windows protected keys, sops age keys (in the default folders, and
+# keys.txt under any configuration folder) and Ethereum key folders. Each names a system location, so a folder merely
+# named wpa_supplicant, Microsoft, Samba/Private or Windows/Repair inside a person's files stays readable.
 PROTECTED_SEQUENCES = (("library", "messages"), (".local", "share", "trash"), ("etc", "shadow"), ("etc", "shadow-"),
-                       ("etc", "gshadow"), ("etc", "gshadow-"), ("etc", "ssh"), ("etc", "wpa_supplicant"),
-                       ("system32", "config"), ("microsoft", "protect"), ("microsoft", "crypto"))
+                       ("etc", "gshadow"), ("etc", "gshadow-"), ("etc", "master.passwd"), ("etc", "spwd.db"),
+                       ("samba", "smbpasswd"), ("private", "smbpasswd"), ("etc", "samba", "private"),
+                       ("var", "lib", "samba", "private"), ("usr", "local", "samba", "private"),
+                       ("samba4", "private"), ("var", "lib", "sss", "db"), ("var", "db", "sss"),
+                       ("etc", "ssh"), ("etc", "wpa_supplicant"), ("var", "lib", "iwd"), ("etc", "wireguard"),
+                       ("wireguard", "data", "configurations"), ("ipsec.d", "private"),
+                       *(("swanctl", keys) for keys in ("private", "rsa", "ecdsa", "bliss", "pkcs8", "pkcs12",
+                                                        "conf.d")),
+                       ("system32", "config"),
+                       *((system, "repair", hive) for system in ("windows", "winnt")
+                         for hive in ("sam", "security", "system", "software", "regback")),
+                       ("microsoft", "protect"), ("microsoft", "crypto"),
+                       (".config", "sops", "age"), ("application support", "sops", "age"), ("sops", "age", "keys.txt"),
+                       (".ethereum", "keystore"), ("ethereum", "keystore"))
+# A domain controller's NTDS folder holds the directory database (ntds.dit, a protected name anywhere, and renamed
+# copies such as ntds_old.dit or ntds.dit.bak kept after an offline defragmentation) and its engine files: the
+# checkpoint, the reserve and rotating transaction logs (edb0001a.log), the flush map and temp.edb. Matching them by
+# file type, also in subfolders such as dsadata.bak, keeps a person's notes in a folder named Windows/NTDS readable;
+# protected_root refuses the folder itself.
+NTDS_FOLDERS = (("windows", "ntds"), ("winnt", "ntds"))
+NTDS_SUFFIXES = frozenset({".dit", ".bak", ".old", ".chk", ".log", ".jrs", ".jfm", ".edb"})
 # Matched only as the leading components of an absolute path, so ordinary folders named dev, etc or
 # windows inside a selection stay readable.
 WINDOWS_SYSTEM_ROOTS = frozenset({"windows", "program files", "program files (x86)", "program files (arm)",
@@ -84,7 +124,9 @@ WINDOWS_SYSTEM_ROOTS = frozenset({"windows", "program files", "program files (x8
                                   "windows.old"})
 POSIX_SYSTEM_ROOTS = frozenset({"usr", "var", "opt", "etc", "bin", "sbin", "boot", "efi", "dev", "proc", "sys", "run",
                                 "snap", "nix", "private", "system", "library", "applications"})
-TEMPORARY_PREFIXES = (("dev", "shm"), ("tmp",), ("var", "tmp"), ("private", "tmp"), ("private", "var", "folders"))
+# macOS resolves /tmp, /var/tmp and /var/folders to the same names under /private, so both spellings count.
+TEMPORARY_PREFIXES = (("dev", "shm"), ("tmp",), ("var", "tmp"), ("private", "tmp"), ("private", "var", "tmp"),
+                      ("var", "folders"), ("private", "var", "folders"))
 
 
 class PathRefusal(ValueError):
@@ -256,14 +298,23 @@ def is_system_root(abs_path):
         return _windows_system(parts)
     if not parts:
         return True
+    # On WSL /mnt holds every Windows drive and /mnt/wsl the disks that wsl --mount attaches. A path cannot tell WSL
+    # from another Linux, so both folders are refused on every system; a drive or folder below them is checked as
+    # usual. /mnt/wslg and everything below it is WSLg's own runtime folder (sockets, logs and a view of the
+    # distribution), so all of it is refused.
+    mount = [part.casefold() for part in parts[:2]]
+    if (len(parts) <= 2 and mount in (["mnt"], ["mnt", "wsl"])) or mount == ["mnt", "wslg"]:
+        return True
     if _temporary_length(parts):
         return False
     # udisks mounts removable drives at /run/media/<user>/<label> on Fedora, Arch and openSUSE.
     if parts[:2] == ["run", "media"] and len(parts) >= 4:
         return False
-    # On a Windows host a rooted path such as /Windows./System32 or /Windows::$INDEX_ALLOCATION opens C:\Windows.
+    # On a Windows host a rooted path such as /Windows./System32 or /Windows::$INDEX_ALLOCATION opens C:\Windows,
+    # and an 8.3 alias such as /PROGRA~1 opens C:\Program Files; any 8.3-shaped first name is refused.
     lead = parts[0].split(":", 1)[0].rstrip(". ").casefold()
-    return lead in POSIX_SYSTEM_ROOTS or lead in WINDOWS_SYSTEM_ROOTS or lead.startswith("lib")
+    return (lead in POSIX_SYSTEM_ROOTS or lead in WINDOWS_SYSTEM_ROOTS or lead.startswith("lib")
+            or bool(_SHORT_NAME.fullmatch(lead)))
 
 
 def _root_names(abs_path):
@@ -274,7 +325,7 @@ def _root_names(abs_path):
     return parts[_temporary_length(parts):] if flavor == "posix" else parts
 
 
-def _matches(names):
+def _matches(names, *, selected_root=False):
     folded = []
     for name in names:
         name = _IGNORABLE.sub("", name)
@@ -291,6 +342,13 @@ def _matches(names):
         size = len(sequence)
         if any(tuple(folded[index:index + size]) == sequence for index in range(len(folded) - size + 1)):
             return True
+    # A selected root at or below an NTDS folder is refused; inside one, files of a directory-database type are
+    # protected at any depth (dsadata.bak/, old/).
+    below = next((index + 2 for index in range(len(folded) - 1) if tuple(folded[index:index + 2]) in NTDS_FOLDERS),
+                 None)
+    if below is not None and (selected_root or (below < len(folded)
+                                                and PurePosixPath(folded[-1]).suffix in NTDS_SUFFIXES)):
+        return True
     return bool(folded) and PurePosixPath(folded[-1]).suffix in PROTECTED_SUFFIXES
 
 
@@ -313,8 +371,9 @@ def protected(rel, *, root=None):
 
 
 def protected_root(abs_path):
-    """True if an owner-selected source or restore target must be refused: a system root, or a protected
-    name anywhere in its absolute path.
+    """True if an owner-selected source or restore target must be refused: a system root, a protected
+    name anywhere in its absolute path, or a domain controller's NTDS folder (Windows/NTDS, WINNT/NTDS)
+    or anything below one.
 
     Only the harmless temporary prefixes in TEMPORARY_PREFIXES and /run/user/<uid> are skipped before
     matching; anything that is not a plain absolute path is refused. Generic names match too broadly
@@ -322,4 +381,4 @@ def protected_root(abs_path):
     are checked with is_system_root instead.
     """
     names = _root_names(abs_path)
-    return names is None or is_system_root(abs_path) or _matches(names)
+    return names is None or is_system_root(abs_path) or _matches(names, selected_root=True)

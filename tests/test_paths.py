@@ -175,11 +175,97 @@ class ProtectedNameTests(unittest.TestCase):
             with self.subTest(rel=rel):
                 self.assertTrue(pc_paths.protected(rel))
                 self.assertTrue(pc_paths.protected(rel, root="/media/example/OLDDISK"))
-        neighbours =("etc/NetworkManager/NetworkManager.conf", "etc/NetworkManager/dispatcher.d/01-ifupdown",
+        neighbours = ("etc/NetworkManager/NetworkManager.conf", "etc/NetworkManager/dispatcher.d/01-ifupdown",
                       "etc/ppp/options", "etc/krb5.conf", "etc/ipsec.conf", "var/db/locate.database",
                       "src/wpa_supplicant/main.c", "hostap/wpa_supplicant/README",
                       "ProgramData/Microsoft/Windows/Start Menu/x.lnk", "Windows/System32/Microsoft/Windows/x.dll",
                       "Documents/Microsoft/notes.docx")
+        for rel in neighbours:
+            with self.subTest(rel=rel):
+                self.assertFalse(pc_paths.protected(rel))
+
+    def test_more_system_credential_stores_are_protected(self):
+        # Stores on a copied system disk: VPN and Wi-Fi keys, BSD and macOS password hashes, Samba's password
+        # databases in every layout, SSSD's and winbind's login caches, earlier Linux password hashes, the Windows
+        # account database (its old copies in Windows\repair and a domain controller's NTDS folder). Several rows
+        # match only one rule.
+        stores = ("etc/wireguard/wg0.conf", "var/lib/iwd/home.psk", "etc/master.passwd", "private/etc/master.passwd",
+                  "etc/spwd.db", "etc/samba/smbpasswd", "etc/samba/private/smbpasswd",  # gitleaks:allow
+                  # Samba: Debian and RHEL, a source build, FreeBSD, TrueNAS, other prefixes, Samba 3 layouts, a
+                  # samba-tool backup, and winbind's offline-logon cache.
+                  "var/lib/samba/private/secrets.tdb", "var/lib/samba/private/smbpasswd",  # gitleaks:allow
+                  "var/lib/samba/private/privilege.ldb", "usr/local/samba/private/privilege.ldb",
+                  "var/db/samba4/private/privilege.ldb", "var/db/samba4/private/secrets.tdb",
+                  "var/db/system/samba4/private/smbpasswd", "var/db/system/samba4/private/netlogon_creds_cli.tdb",
+                  "mydisk/samba/private/smbpasswd",
+                  "samba-backup/private/smbpasswd", "var/lib/samba/secrets.tdb", "var/lib/samba/passdb.tdb",
+                  "etc/samba/secrets.tdb", "samba-backup/private/sam.ldb", "samba-backup/private/secrets.ldb",
+                  "samba-backup/private/sam.ldb.d/DC=EXAMPLE,DC=COM.ldb", "var/cache/samba/winbindd_cache.tdb",
+                  "var/lib/samba/winbindd_cache.tdb", "var/lib/sss/db/cache_example.com.ldb",
+                  "var/db/sss/db/cache_example.com.ldb", "etc/security/opasswd",
+                  # Windows: the repair copies (also in RegBack, also on Windows 2000) and the NTDS engine files.
+                  "Windows/repair/SAM", "WINDOWS/Repair/SECURITY", "Windows/repair/system", "Windows/repair/software",
+                  "WINNT/repair/sam", "WINNT/repair/security", "WINNT/repair/system", "WINNT/repair/software",
+                  "Windows/repair/RegBack/SAM", "WINNT/repair/RegBack/system", "Windows/NTDS/ntds.dit",
+                  "Windows/NTDS/edb.log", "Windows/NTDS/edb0001A.log", "Windows/NTDS/edb.chk",
+                  "Windows/NTDS/edbres00001.jrs", "Windows/NTDS/ntds.jfm", "Windows/NTDS/temp.edb",
+                  "WINNT/NTDS/edb.log", "NTDS-data/ntds.dit",
+                  # Renamed database copies kept after an offline defragmentation, NTDS subfolders, and AD LDS.
+                  "Windows/NTDS/ntds.dit.old", "Windows/NTDS/ntds_old.dit", "Windows/NTDS/ntds.dit.bak",
+                  "Windows/NTDS/ntds.bak", "Windows/NTDS/ntds.old",
+                  "backup/ntds.dit.bak", "WINNT/NTDS/dsadata.bak/edb.log", "Windows/NTDS/old/edb00002.log",
+                  "Program Files/Microsoft ADAM/instance1/data/adamntds.dit",
+                  # IPsec: ipsec.d (Libreswan, older strongSwan) and swanctl (strongSwan; Fedora under strongswan/).
+                  "etc/ipsec.d/private/key.der", "etc/strongswan/ipsec.d/private/key.der", "etc/ipsec.d/home.secrets",
+                  "etc/ipsec.d/key3.db", "etc/ipsec.d/nsspassword", "etc/swanctl/private/key.der",
+                  "etc/swanctl/rsa/key.der", "etc/swanctl/ecdsa/key.der", "etc/swanctl/bliss/key.der",
+                  "etc/swanctl/pkcs8/key.der", "etc/strongswan/swanctl/pkcs12/vpn", "etc/swanctl/swanctl.conf",
+                  "etc/strongswan/swanctl/swanctl.conf", "etc/swanctl/conf.d/vpn.conf", "backup/swanctl.conf",
+                  "Program Files/WireGuard/Data/Configurations/wg0.conf.dpapi")
+        for rel in stores:
+            with self.subTest(rel=rel):
+                self.assertTrue(pc_paths.protected(rel))
+                self.assertTrue(pc_paths.protected(rel, root="/Volumes/OLDDISK"))
+        self.assertTrue(pc_paths.protected("wg0.conf", root="/Volumes/OLDDISK/etc/wireguard"))
+        # A person's own folders named after these systems stay readable.
+        neighbours = ("etc/samba/smb.conf", "usr/bin/smbpasswd", "srv/samba/private/report.docx",
+                      "Shares/Samba/Private/taxes.pdf", "var/lib/samba/usershares/data",
+                      "var/cache/samba/printing/queue.tdb", "src/wireguard/main.c",
+                      "Program Files/WireGuard/wireguard.exe", "var/lib/iwd-notes.txt", "etc/ipsec.d/policies/clear",
+                      "etc/strongswan.conf", "etc/strongswan.d/charon.conf", "etc/swanctl/x509/peer.der",
+                      "etc/swanctl/pubkey/peer.der", "etc/security/limits.conf", "Windows/Logs/CBS/CBS.log",
+                      "Windows/repair/setup.log", "Documents/IT/Windows/Repair/guide.md",
+                      "Documents/IT/Windows/Repair/regback.md", "clients/windows/repair/invoice.pdf",
+                      "docs/repair/windows.md", "Documents/IT/Windows/NTDS/notes.md",
+                      "Documents/IT/Windows/NTDS/old/notes.md", "clients/windows/ntds/invoice.pdf",
+                      "backup/ntds-notes.txt", "src/samba4/README.md")
+        for rel in neighbours:
+            with self.subTest(rel=rel):
+                self.assertFalse(pc_paths.protected(rel))
+
+    def test_more_credential_files_are_protected(self):
+        # Registry tokens (Cargo, Terraform, OpenTofu), the Vault token, a CI runner's .secrets file, the sops age key
+        # folder on Linux and macOS and keys.txt under any configuration folder (XDG_CONFIG_HOME, a dotfiles copy,
+        # Windows' Roaming), wallets and their copies, Ethereum key folders (~/.ethereum, ~/Library/Ethereum) and key
+        # files anywhere, test-network keystores included.
+        files = (".cargo/credentials.toml", ".cargo/credentials", ".terraform.d/credentials.tfrc.json", ".terraformrc",
+                 "old-pc/terraform.rc", ".tofurc", ".config/opentofu/tofurc", "old-pc/tofu.rc", "proj/ci.tfrc",
+                 ".vault-token", "projects/app/.secrets", ".config/sops/age/keys.txt", ".config/sops/age/keys.txt.bak",
+                 ".config/sops/age/old-keys.txt", "Library/Application Support/sops/age/keys.txt",
+                 "dot_config/sops/age/keys.txt", "custom-xdg/sops/age/keys.txt", "Roaming/sops/age/keys.txt",
+                 "wallet.dat", "Bitcoin/wallet.dat", "old/coins/WALLET.DAT", "Bitcoin/wallet.dat.bak",
+                 ".ethereum/keystore/key.json", "Library/Ethereum/keystore/key.json",
+                 ".ethereum/sepolia/keystore/UTC--2026-x", "Library/Ethereum/holesky/keystore/UTC--2026-x",
+                 "backup/keys/UTC--2026-10-25T01-02-03.0Z--ab12")
+        for rel in files:
+            with self.subTest(rel=rel):
+                self.assertTrue(pc_paths.protected(rel))
+                self.assertTrue(pc_paths.protected(rel, root=profile("macos")))
+        self.assertTrue(pc_paths.protected("sops/age/keys.txt", root="D:\\OldPC\\Roaming"))
+        neighbours = (".cargo/config.toml", ".cargo/registry/index/x", ".terraform.d/plugins/x", "docs/terraform.md",
+                      "projects/infra/main.tf", "projects/infra/.terraform.lock.hcl", "docs/opentofu.md",
+                      "projects/app/.sops.yaml", "projects/sops/age/keysource.go", ".config/sops/config.yaml",
+                      "notes/wallet.txt", ".ethereum/geth/chaindata/x", "notes/utc-times.txt")
         for rel in neighbours:
             with self.subTest(rel=rel):
                 self.assertFalse(pc_paths.protected(rel))
@@ -253,7 +339,72 @@ class RootRefusalTests(unittest.TestCase):
 
     def test_dev_shm_root_allowed(self):
         self.allowed("/dev/shm/patchcairn-test/root", "/dev/shm", "/run/user/1000/patchcairn/root", "/tmp/pc/root",
-                     "/var/tmp/pc", "/private/tmp/pc", "/private/var/folders/ab/xyz123/T/pc")
+                     "/var/tmp/pc", "/private/tmp/pc", "/private/var/tmp/pc", "/private/var/folders/ab/xyz123/T/pc")
+
+    def same_answers(self, short, resolved, rests):
+        # macOS resolves /var/... to /private/var/..., so an unresolved root must get the answers of the real path.
+        for rest in rests:
+            with self.subTest(short=short, rest=rest):
+                self.assertEqual(pc_paths.is_system_root(short + rest), pc_paths.is_system_root(resolved + rest))
+                self.assertEqual(pc_paths.protected_root(short + rest), pc_paths.protected_root(resolved + rest))
+                self.assertEqual(pc_paths.protected("Messages/x", root=short + rest + "/Library"),
+                                 pc_paths.protected("Messages/x", root=resolved + rest + "/Library"))
+
+    def test_var_folders_is_treated_like_private_var_folders(self):
+        rests = ("", "/ab/xyz123/T", "/ab/xyz123/T/pc/root", "/ab/xyz123/T/x/.ssh", "/ab/xyz123/C/Library/Messages")
+        self.same_answers("/var/folders", "/private/var/folders", rests)
+        self.allowed("/var/folders/ab/xyz123/T/pc", "/var/folders/ab/xyz123/T/pc/root")
+        self.refused("/var/folders/ab/xyz123/T/x/.ssh")
+        for path in ("/var/foldersx/a", "/var/folder/a", "/var/db/x"):
+            with self.subTest(path=path):
+                self.assertTrue(pc_paths.is_system_root(path))
+
+    def test_var_tmp_is_treated_like_private_var_tmp(self):
+        self.same_answers("/var/tmp", "/private/var/tmp", ("", "/pc", "/pc/root", "/x/.ssh", "/copy/Library/Messages"))
+        self.allowed("/private/var/tmp/pc", "/private/var/tmp/pc/root")
+        self.refused("/private/var/tmp/x/.ssh")
+        for path in ("/private/var/tmpx/a", "/private/var/db/x"):
+            with self.subTest(path=path):
+                self.assertTrue(pc_paths.is_system_root(path))
+
+    def test_mnt_and_mnt_wsl_are_system_roots(self):
+        # On WSL /mnt holds every Windows drive, so a selected /mnt would reach c/Windows without a system-root check.
+        # A path alone cannot tell WSL from another Linux, so these are refused on every system.
+        for path in ("/mnt", "/mnt/", "/mnt/wsl", "/mnt/wsl/", "/MNT", "\\\\wsl$\\Ubuntu\\mnt",
+                     "\\\\wsl.localhost\\Ubuntu\\mnt\\wsl"):
+            with self.subTest(path=path):
+                self.assertTrue(pc_paths.is_system_root(path))
+                self.assertTrue(pc_paths.protected_root(path))
+        self.allowed(profile("wsl-mnt", "Documents"), profile("wsl-unc-drive", "Documents"), "/mnt/data/archive",
+                     "/mnt/usb", "/mnt/wsl/shared", "/mnt/wslx", "/mnt/wslgx/a")
+
+    def test_ntds_folder_is_refused_as_a_root(self):
+        # A domain controller's NTDS folder holds every domain account's password hashes: selecting it, or a folder
+        # below it, is refused; its neighbours and a person's folder merely named NTDS stay selectable.
+        self.refused("/mnt/old/Windows/NTDS", "/mnt/old/WINNT/NTDS", "/mnt/old/windows/ntds/",
+                     "D:\\OldDC\\Windows\\NTDS", "/Volumes/OLDDC/Windows/NTDS/dsadata.bak")
+        self.allowed("/mnt/old/Windows", "/mnt/old/Documents/IT/NTDS", "D:\\OldDC\\NTDS-notes")
+        self.assertFalse(pc_paths.protected("notes.md", root="/mnt/old/Documents/IT/NTDS"))
+
+    def test_mnt_wslg_and_everything_below_it_are_system_roots(self):
+        # WSLg's runtime folder holds sockets, logs and a view of the distribution, never a person's files.
+        for path in ("/mnt/wslg", "/mnt/wslg/", "/mnt/wslg/distro", "/mnt/wslg/distro/etc", "/mnt/wslg/runtime-dir",
+                     "/MNT/WSLG/x", "\\\\wsl$\\Ubuntu\\mnt\\wslg\\distro"):
+            with self.subTest(path=path):
+                self.assertTrue(pc_paths.is_system_root(path))
+                self.assertTrue(pc_paths.protected_root(path))
+
+    def test_short_name_first_component_is_a_system_root(self):
+        # On a Windows host a rooted 8.3 alias opens a system folder (/PROGRA~1 is C:\Program Files), and backup
+        # destinations are checked with is_system_root alone.
+        for path in ("/PROGRA~1/x", "/PROGRA~2", "/PROGRA~3/x", "/WINDOW~1/System32", "/progra~1/App/", "/SYSTEM~1",
+                     "/$RECYC~1.BIN/S-1-5", "/PROGRA~1./x", "/PROGRA~1::$INDEX_ALLOCATION/x", "C:\\PROGRA~1\\App",
+                     "D:/WINDOW~1/System32", "/c/PROGRA~1/App", "/mnt/c/WINDOW~1/System32",
+                     "\\\\wsl$\\Ubuntu\\mnt\\c\\PROGRA~2\\x", "\\\\server\\share\\WINDOW~1"):
+            with self.subTest(path=path):
+                self.assertTrue(pc_paths.is_system_root(path))
+                self.assertTrue(pc_paths.protected_root(path))
+        self.allowed("/backup~old/x", "/srv/files~2026/x")
 
     def test_removable_drives_under_run_media_are_allowed(self):
         self.allowed("/run/media/example/USB/photos", "/run/media/example/USB")
@@ -324,10 +475,19 @@ class RootRefusalTests(unittest.TestCase):
                 self.assertTrue(pc_paths.protected_root(path))
 
     def test_profile_helper_builds_each_spelling(self):
-        self.assertEqual(profile("windows", "a", "b"), "C:" + "\\Users\\example\\a\\b")
-        self.assertEqual(profile("posix", "a"), "/ho" + "me/example/a")
-        self.assertEqual(profile("wsl-mnt"), "/mnt/c" + "/Users/example")
-        self.assertEqual(profile("posix").replace("/example", "//example"), "/ho" + "me//example")
+        # Written out apart from _PROFILE_ROOTS, so a mistyped root in any of the eight spellings fails here.
+        expected = {"windows": ("C:" + "\\Users\\example", "\\"), "windows-slash": ("C:" + "/Users/example", "/"),
+                    "posix": ("/ho" + "me/example", "/"), "macos": ("/" + "Users/example", "/"),
+                    "git-bash": ("/c" + "/Users/example", "/"), "wsl-mnt": ("/mnt/c" + "/Users/example", "/"),
+                    "wsl-unc-home": ("\\\\wsl$\\Ubuntu" + "\\home\\example", "\\"),
+                    "wsl-unc-drive": ("\\\\wsl$\\Ubuntu\\mnt\\c" + "\\Users\\example", "\\")}
+        self.assertEqual(set(expected), set(_PROFILE_ROOTS))
+        for platform, (folder, separator) in expected.items():
+            with self.subTest(platform=platform):
+                self.assertEqual(profile(platform), folder)
+                self.assertEqual(profile(platform).split(separator)[-1], "example")
+                self.assertEqual(profile(platform, "x"), profile(platform) + separator + "x")
+                self.assertEqual(profile(platform, "a", "b"), folder + separator + "a" + separator + "b")
 
     def test_generic_words_in_a_root_path_still_refuse_it(self):
         # A documented limit: generic names such as git, session or vault, and 8.3-looking names, match too broadly.

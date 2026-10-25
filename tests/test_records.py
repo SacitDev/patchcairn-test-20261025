@@ -5,7 +5,7 @@ Run from the repository root: python3 -I -S -B -m unittest discover -s tests -p 
 from __future__ import annotations
 
 import ast
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 from pathlib import Path
@@ -293,6 +293,8 @@ class SchemaTests(unittest.TestCase):
             return pc_records.require_schema(record, "patchcairn.storage")
 
         with mock.patch.dict(pc_records.READERS):
+            # Another module (storage_ops) may have registered its reader earlier in the same process.
+            pc_records.READERS["patchcairn.storage"] = None
             self.assertIs(pc_records.register_reader("patchcairn.storage", reader), reader)
             self.assertIs(pc_records.register_reader("patchcairn.storage", reader), reader)
             self.assertIs(pc_records.READERS["patchcairn.storage"], reader)
@@ -322,8 +324,34 @@ class TimeTests(unittest.TestCase):
                     pc_records.parse_utc(text)
                 self.assertEqual(caught.exception.code, "utc-time")
         self.assertEqual(pc_records.parse_utc("2026-10-25T01:02:03Z").hour, 1)
-        self.assertEqual(pc_records.parse_utc("2026-10-25T01:02:03.5Z").microsecond, 500000)
+        self.assertEqual(pc_records.parse_utc("2026-10-25T01:02:03.500000Z").microsecond, 500000)
         self.assertEqual(pc_records.parse_utc("2026-10-25T01:02:03.000123Z").microsecond, 123)
+
+    def test_parse_utc_fraction_has_six_digits_or_none(self):
+        # One spelling per instant that has a fraction: .5Z and .500000Z must not both be accepted.
+        for text in ("2026-10-25T01:02:03.5Z", "2026-10-25T01:02:03.50Z", "2026-10-25T01:02:03.00012Z",
+                     "2026-10-25T01:02:03.0000000Z", "2026-10-25T01:02:03.5000000Z", "2026-10-25T01:02:03.Z"):
+            with self.subTest(text=text):
+                with self.assertRaises(Refusal) as caught:
+                    pc_records.parse_utc(text)
+                self.assertEqual(caught.exception.code, "utc-time")
+                # The refusal tells the writer the rule, not only an example.
+                self.assertIn("no fraction, or a fraction of exactly six digits", str(caught.exception))
+        whole = datetime(2026, 10, 25, 1, 2, 3, tzinfo=timezone.utc)
+        self.assertEqual(pc_records.parse_utc("2026-10-25T01:02:03.000000Z"), whole)
+        self.assertEqual(pc_records.parse_utc("2026-10-25T01:02:03Z"), whole)
+        self.assertEqual(pc_records.parse_utc("2026-10-25T01:02:03.999999Z"), whole + timedelta(microseconds=999999))
+
+    def test_utc_now_writes_six_digits_at_a_whole_second(self):
+        class WholeSecond(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return datetime(2026, 10, 25, 1, 2, 3, tzinfo=tz)
+
+        with mock.patch.object(pc_records, "datetime", WholeSecond):
+            now = pc_records.utc_now()
+        self.assertEqual(now, "2026-10-25T01:02:03.000000Z")
+        self.assertEqual(pc_records.parse_utc(now), datetime(2026, 10, 25, 1, 2, 3, tzinfo=timezone.utc))
 
     def at(self, base, seconds):
         return (pc_records.parse_utc(base) + timedelta(seconds=seconds)).isoformat(timespec="microseconds").replace("+00:00", "Z")

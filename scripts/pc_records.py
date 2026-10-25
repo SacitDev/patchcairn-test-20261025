@@ -35,8 +35,11 @@ _MAX_INTEGER_DIGITS = 20
 FUTURE_SKEW_SECONDS = 2.0
 ID = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,95}\Z")
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
-# Hours stop at 23: Python also reads 24:00:00 as the next midnight, a second spelling of one instant.
-_UTC_TEXT = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](?:\.[0-9]{1,6})?Z\Z")
+# Hours stop at 23: Python also reads 24:00:00 as the next midnight, a second spelling of one instant. A fraction
+# has exactly the six digits utc_now writes, so .5 and .500000 cannot both name one instant. Whole seconds keep two
+# valid spellings, 03:04:05Z (written by seconds-precision collectors) and 03:04:05.000000Z (the one utc_now writes);
+# they parse to the same instant but hash and sort as different text.
+_UTC_TEXT = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](?:\.[0-9]{6})?Z\Z")
 _VERSIONED_NAME = re.compile(r".*[._-]v[0-9]+\Z", re.IGNORECASE)
 _DECIMAL_VERSION = re.compile(r"[0-9]+\.[0-9]+\Z")
 
@@ -281,17 +284,19 @@ def require_container(record, kind):
 
 
 def utc_now():
-    """Current UTC time with microseconds, in the 'Z' form records use."""
+    """Current UTC time with exactly six fraction digits (microseconds, .000000 too), in the 'Z' form records use."""
     return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
 def parse_utc(text):
-    """Parse a record timestamp: YYYY-MM-DDTHH:MM:SS, an optional fraction of 1-6 digits, then 'Z'.
+    """Parse a record timestamp: YYYY-MM-DDTHH:MM:SS, no fraction or a fraction of exactly 6 digits, then 'Z'.
 
-    One spelling per instant keeps record hashes and text ordering consistent.
+    A fixed-width fraction gives an instant with a fraction one spelling, which keeps record hashes and the
+    text ordering of utc_now() timestamps consistent.
     """
     if not isinstance(text, str) or not _UTC_TEXT.match(text):
-        raise Refusal("utc-time", "A UTC timestamp such as 2026-01-02T03:04:05Z is required")
+        raise Refusal("utc-time", "A UTC timestamp such as 2026-01-02T03:04:05Z or 2026-01-02T03:04:05.123456Z is"
+                                  " required: no fraction, or a fraction of exactly six digits")
     try:
         return datetime.fromisoformat(text[:-1] + "+00:00")
     except ValueError as error:
