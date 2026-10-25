@@ -5,7 +5,7 @@ is wrong, versioned or missing; containers need the integer version; records in 
 refused with the clear message. The readers are the ones the product modules register when they are imported.
 The golden-layout tests pin the exact bytes or hashes of the engine marker, creation marker, session state and
 journal, service marker and retention registry, diagnostic request, storage attempt record and storage capabilities
-(F-011); the storage inventory rows and fingerprint fields are pinned in test_storage_ops. Fixtures stay under
+(F-011); the storage inventory rows and fingerprint fields are pinned in test_storage_assess. Fixtures stay under
 work/test-fixtures/ss-<id>/.
 """
 from __future__ import annotations
