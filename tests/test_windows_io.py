@@ -58,16 +58,6 @@ def remove_fixture(path):
     shutil.rmtree("\\\\?\\" + str(path), onexc=writable_then_retry)
 
 
-def handle_count():
-    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel.GetCurrentProcess.restype = ctypes.c_void_p
-    kernel.GetProcessHandleCount.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
-    count = ctypes.c_uint32()
-    if not kernel.GetProcessHandleCount(kernel.GetCurrentProcess(), ctypes.byref(count)):
-        raise ctypes.WinError(ctypes.get_last_error())
-    return count.value
-
-
 def volumes(filesystem, drive_type):
     """A fake volume-information source: the real folder appears to be on another kind of drive."""
     return lambda handle, drive: {"filesystem": filesystem, "drive_type": drive_type}
@@ -295,25 +285,79 @@ class WindowsIoTests(Fixture):
                                     "sys", "threading", "pc_paths", "pc_records", "scoped_base", "win32_files"})
 
     def test_handles_released_after_operations(self):
-        self.seed(self.open_root(), "warm.bin", b"warm")  # first use binds and caches what later calls reuse
-        before = handle_count()
-        operations = 0
-        for round_number in range(20):
-            with windows_scoped.WindowsRoot(str(self.path())) as root:
-                operations += 1
-                for index in range(5):
-                    record = self.seed(root, f"r{round_number}-{index}.bin", pattern(2000 + index))
-                    root.stream_to(record["relative_path"], expected=record, writer=len)
-                    self.code(root.inspect, "absent.bin")
-                    self.code(root.stream_to, record["relative_path"], expected={**record, "inode": 1}, writer=len)
-                    self.code(lambda: root.open_new(record["relative_path"]).__enter__())
-                    root.remove_file(record["relative_path"], expected=root.inspect(record["relative_path"], hash_file=True))
-                    root.list_directory()
-                    operations += 8
-                self.code(windows_scoped.WindowsRoot, str(self.path("absent")))
-                operations += 1
-        self.assertGreaterEqual(operations, 500)
-        self.assertEqual(handle_count(), before)
+        # In a fresh interpreter: handles that earlier tests in this process left for Windows to close in its own time
+        # (an ALPC port, an event, a thread) would otherwise move the process-wide count.
+        driver = textwrap.dedent("""
+            import ctypes, gc, json, sys, threading, time
+            sys.path.insert(0, sys.argv[1])
+            import windows_scoped
+            from scoped_base import ScopedFSError
+
+            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel.GetCurrentProcess.restype = ctypes.c_void_p
+            kernel.GetProcessHandleCount.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+
+            def handle_count():
+                count = ctypes.c_uint32()
+                if not kernel.GetProcessHandleCount(kernel.GetCurrentProcess(), ctypes.byref(count)):
+                    raise ctypes.WinError(ctypes.get_last_error())
+                return count.value
+
+            def io_threads():
+                return [thread for thread in threading.enumerate() if thread.name.startswith("patchcairn-windows-io")]
+
+            def seed(root, relative, data):
+                return {key: value for key, value in root.create_file(relative, data=data).items() if key != "durable"}
+
+            def refused(call, *args, **kwargs):
+                try:
+                    call(*args, **kwargs)
+                except ScopedFSError:
+                    return
+                raise AssertionError("the call was not refused")
+
+            warm = windows_scoped.WindowsRoot(sys.argv[2])
+            seed(warm, "warm.bin", b"warm")  # first use binds and caches what later calls reuse
+            warm.close()
+            deadline = time.monotonic() + 10  # a quiet point: no file I/O thread left, garbage collected
+            for thread in io_threads():
+                thread.join(max(0.0, deadline - time.monotonic()))
+            if io_threads():
+                sys.exit(f"{len(io_threads())} file I/O thread(s) still alive 10 seconds after the warm-up root closed "
+                         f"(idents {[thread.ident for thread in io_threads()]})")
+            gc.collect()
+            before = handle_count()
+            gc.disable()  # a handle that only the garbage collector would release stays counted
+            operations = 0
+            for round_number in range(20):
+                with windows_scoped.WindowsRoot(sys.argv[2]) as root:
+                    operations += 1
+                    for index in range(5):
+                        size = 2000 + index
+                        record = seed(root, f"r{round_number}-{index}.bin", (bytes(range(256)) * (size // 256 + 1))[:size])
+                        root.stream_to(record["relative_path"], expected=record, writer=len)
+                        refused(root.inspect, "absent.bin")
+                        refused(root.stream_to, record["relative_path"], expected={**record, "inode": 1}, writer=len)
+                        refused(lambda: root.open_new(record["relative_path"]).__enter__())
+                        root.remove_file(record["relative_path"], expected=root.inspect(record["relative_path"], hash_file=True))
+                        root.list_directory()
+                        operations += 8
+                    refused(windows_scoped.WindowsRoot, sys.argv[3])
+                    operations += 1
+            alive = io_threads()  # no wait: close() has already joined each root's thread
+            after = handle_count()  # no wait and no collection
+            print(json.dumps({"operations": operations, "before": before, "after": after, "io_threads": len(alive),
+                              "idents": [thread.ident for thread in alive]}))
+        """)
+        result = subprocess.run([sys.executable, "-I", "-S", "-B", "-c", driver, str(SCRIPTS), str(self.path()),
+                                 str(self.path("absent"))], capture_output=True, timeout=300)
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+        measured = json.loads(result.stdout)
+        self.assertGreaterEqual(measured["operations"], 500)
+        threads = f"{measured['io_threads']} file I/O thread(s) alive after the last root closed (idents {measured['idents']})"
+        self.assertEqual(measured["after"], measured["before"],
+                         f"handle count changed by {measured['after'] - measured['before']:+d}; {threads}")
+        self.assertEqual(measured["io_threads"], 0, threads)
 
     def test_private_dacl_before_first_byte(self):
         root = self.open_root()

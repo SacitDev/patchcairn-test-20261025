@@ -1357,11 +1357,24 @@ class ScheduleRenderTests(unittest.TestCase):
                         self.assertEqual(schedule_probe.system_offset()(now), offset)
                 finally:
                     time.tzset()
-            if os.name == "nt":  # Windows: the system zone's active bias, read-only from the registry
-                import winreg
-                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\TimeZoneInformation") as key:
-                    bias = winreg.QueryValueEx(key, "ActiveTimeBias")[0]
-                self.assertEqual(offset, -(bias - 2 ** 32 if bias >= 2 ** 31 else bias) * 60)
+            if os.name == "nt":  # Windows: the active bias from GetTimeZoneInformation, not the product's dynamic API
+                import ctypes
+                from ctypes import wintypes
+
+                class TimeZoneInformation(ctypes.Structure):
+                    _fields_ = [("Bias", wintypes.LONG), ("StandardName", wintypes.WCHAR * 32),
+                                ("StandardDate", wintypes.WORD * 8), ("StandardBias", wintypes.LONG),
+                                ("DaylightName", wintypes.WCHAR * 32), ("DaylightDate", wintypes.WORD * 8),
+                                ("DaylightBias", wintypes.LONG)]
+                kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+                kernel.GetTimeZoneInformation.argtypes = (ctypes.POINTER(TimeZoneInformation),)
+                kernel.GetTimeZoneInformation.restype = wintypes.DWORD
+                info = TimeZoneInformation()
+                zone_id = kernel.GetTimeZoneInformation(ctypes.byref(info))
+                # 0 unknown (no daylight saving), 1 standard, 2 daylight; TIME_ZONE_ID_INVALID fails.
+                self.assertIn(zone_id, (0, 1, 2), f"GetTimeZoneInformation failed, Windows error {ctypes.get_last_error()}")
+                bias = info.Bias + (0, info.StandardBias, info.DaylightBias)[zone_id]
+                self.assertEqual(offset, -bias * 60)
         else:
             self.refused("schedule-time", schedule_probe.system_offset)
 

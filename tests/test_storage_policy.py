@@ -47,10 +47,15 @@ def make_directory_link(link, target):
 
 
 def create_file_everyone_may_read(path, data):
-    """A new Windows file whose DACL adds access for Everyone to what it inherits, so it is broad wherever the
-    repository is cloned (an inherited DACL may be private, for example in a user's profile). No ACL is changed."""
+    """A new Windows file whose DACL is one explicit full-access entry for Everyone, so it is broad wherever the
+    repository is cloned (a folder's own permissions may be private, for example in a user's profile). Windows marks a
+    DACL given at creation as protected (D:P), so the file inherits nothing from its folder. No ACL is changed.
+    The current user is named as owner, so the broad DACL is the file's only defect: a process with a full
+    administrator token (any elevated process; GitHub's Windows runners disable UAC) would otherwise get
+    Administrators as the default owner."""
     import ctypes
     from ctypes import wintypes
+    import win32_files
 
     class Attributes(ctypes.Structure):
         _fields_ = [("length", wintypes.DWORD), ("descriptor", ctypes.c_void_p), ("inherit", wintypes.BOOL)]
@@ -64,8 +69,8 @@ def create_file_everyone_may_read(path, data):
     kernel.WriteFile.restype = wintypes.BOOL
     kernel.CloseHandle.argtypes, kernel.CloseHandle.restype = (wintypes.HANDLE,), wintypes.BOOL
     descriptor, size = ctypes.c_void_p(), wintypes.DWORD()
-    # Everyone may do anything (so the owner can still remove the fixture); no "P", so inherited ACEs merge.
-    if not convert("D:(A;;FA;;;WD)", 1, ctypes.byref(descriptor), ctypes.byref(size)):
+    # Everyone may do anything (so the owner can still remove the fixture); this is the file's only ACE.
+    if not convert("O:" + win32_files.token_user() + "D:(A;;FA;;;WD)", 1, ctypes.byref(descriptor), ctypes.byref(size)):
         raise ctypes.WinError(ctypes.get_last_error())
     try:
         handle = kernel.CreateFileW(str(path), 0x40000000, 0, ctypes.byref(Attributes(ctypes.sizeof(Attributes), descriptor, False)), 1, 0x80, None)

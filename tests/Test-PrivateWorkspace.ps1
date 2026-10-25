@@ -73,8 +73,20 @@ try {
  foreach ($file in @('backup.zip','manifest.json','README.txt')) {
   Check ('backup file '+$file+': owner, protected DACL, exactly three ACEs') { (Get-Privacy (Join-Path $work ('selected\backup\'+$file)) $false) -ceq 'private' }
  }
- Check 'restored file in an existing folder inherits that folder''s permissions' { (Get-Privacy (Join-Path $work 'selected\restored.txt') $false) -ceq 'not protected' }
- Check 'ordinary folder is recognised as not private' { (Get-Privacy (Join-Path $work 'selected') $true) -ceq 'not protected' }
+ # A non-private object gets the token's default owner: Administrators for a process with a full administrator token
+ # (any elevated process; GitHub's Windows runners disable UAC), otherwise the user. So the restored file's check
+ # ignores the owner, and the ordinary folder's check expects the answer Get-Privacy must give for the owner it has.
+ Check 'restored file in an existing folder inherits that folder''s permissions' {
+  $acl=Get-Acl -LiteralPath (Join-Path $work 'selected\restored.txt')
+  $rules=@($acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]))
+  -not $acl.AreAccessRulesProtected -and $rules.Count -ge 1 -and @($rules | Where-Object { -not $_.IsInherited }).Count -eq 0
+ }
+ Check 'ordinary folder is recognised as not private' {
+  $folder=Join-Path $work 'selected'
+  $acl=Get-Acl -LiteralPath $folder
+  $expected=if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Equals($user)) { 'not protected' } else { 'owner' }
+  (Get-Privacy $folder $true) -ceq $expected -and -not $acl.AreAccessRulesProtected
+ }
 } finally {
  Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
 }
