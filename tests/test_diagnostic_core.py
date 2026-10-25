@@ -97,7 +97,7 @@ class DiagnosticCoreTests(unittest.TestCase):
 
     def test_untrusted_identifiers_and_traversal_refused_before_read(self):
         for value in ("../outside", "diag-" + "0" * 32 + "/secret", "$(malicious)", "C:\\private"):
-            with self.subTest(value=value), mock.patch("workflow_service.os.open") as opened:
+            with self.subTest(value=value), mock.patch("service_diagnostics.os.open") as opened:
                 with self.assertRaises(DiagnosticRefusal):
                     self.store.read_request(value)
                 opened.assert_not_called()
@@ -261,7 +261,7 @@ class DiagnosticCoreTests(unittest.TestCase):
         extra = path.with_name("fictional-hardlink.json")
         os.link(path, extra)
         # Keep native namespace admission's descriptor capability checks intact.
-        with mock.patch("workflow_service.os", wraps=os) as diagnostic_os:
+        with mock.patch("service_diagnostics.os", wraps=os) as diagnostic_os:
             with self.assertRaisesRegex(DiagnosticRefusal, "Single-link ordinary file required"):
                 self.store.read_record(self.id, self.receipt["record_id"])
             diagnostic_os.open.assert_not_called()
@@ -287,7 +287,7 @@ class DiagnosticPrivacyTests(unittest.TestCase):
 
     def test_namespace_refusal_precedes_private_record_writer(self):
         root = self.fixture_root()
-        with mock.patch("workflow_service.ensure_private_directory", side_effect=PrivateWorkspaceError("fixture-private-hold")), mock.patch("workflow_service.write_private_new") as writer:
+        with mock.patch("service_diagnostics.ensure_private_directory", side_effect=PrivateWorkspaceError("fixture-private-hold")), mock.patch("service_diagnostics.write_private_new") as writer:
             with self.assertRaises(PrivateWorkspaceError):
                 DiagnosticStore(root)
             writer.assert_not_called()
@@ -357,7 +357,7 @@ class DiagnosticPrivacyTests(unittest.TestCase):
                 self.skipTest("only on posix: private namespace unavailable; native refusal covered separately")
             raise
         receipt = store.create_request(platform="macos", recipe_id="macos.os_version", symptom="Fictional E42", scope=["os_metadata"])
-        with mock.patch("workflow_service.ensure_private_file", side_effect=PrivateWorkspaceError("fixture-file-private-hold")), mock.patch("workflow_service.os.open") as opened:
+        with mock.patch("service_diagnostics.ensure_private_file", side_effect=PrivateWorkspaceError("fixture-file-private-hold")), mock.patch("service_diagnostics.os.open") as opened:
             with self.assertRaises(PrivateWorkspaceError):
                 store.read_record(receipt["record"]["request_id"], receipt["record_id"])
             opened.assert_not_called()
