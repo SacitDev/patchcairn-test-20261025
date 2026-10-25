@@ -2,6 +2,7 @@
 
 import importlib.util
 from pathlib import Path, PurePosixPath
+import shutil
 import stat
 import subprocess
 import sys
@@ -12,9 +13,32 @@ from unittest.mock import MagicMock, patch
 
 
 _MODULE = Path(__file__).resolve().parents[1] / "scripts" / "collect_linux.py"
+sys.path.insert(0, str(_MODULE.parent))
+import pc_records
 _SPEC = importlib.util.spec_from_file_location("fixture_linux_collector", _MODULE)
 linux = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(linux)
+WORK = _MODULE.parents[1] / "work" / "test-fixtures" / "linux-collector"
+
+
+def inventory_session(test, platform):
+    """A fresh engine session in its own fixture folder (removed after the test) whose whole-device,
+    metadata-only scope the fictional owner authorizes before evidence is registered."""
+    # The engine core does not check the host platform (the CLI and the service refuse a non-native
+    # real session), so this real session simulates a native host of the given platform.
+    import workflow_core
+    root = WORK / ("fictional-engine-" + uuid.uuid4().hex)
+    root.mkdir(parents=True)
+    test.addCleanup(shutil.rmtree, root)
+    engine = workflow_core.WorkflowEngine(root)
+    access = {"schema": "patchcairn.assessment.access", "schema_version": 1, "target": "whole_device",
+              "operations": ["metadata"], "local_content": [], "llm_content": [], "sensitive_exceptions": []}
+    scope = {"roots": [], "purpose": "Fictional installed-software inventory", "assessment": access}
+    session_id = engine.create_session(mode="real", platform=platform, scope=scope)["session_id"]
+    engine.authorize_scope(session_id, owner_quote="Read only installed-software metadata on this fictional device.",
+                           owner_message_id="fictional-owner-scope")
+    test.assertEqual(engine.read_session(session_id)["scope_authorization"]["scope_sha256"], pc_records.digest(scope))
+    return engine, scope, session_id
 
 
 def _run_controlled_pipe_fixture(program, *, timeout=linux.QUERY_TIMEOUT, byte_limit=linux.MAX_BYTES):
@@ -101,23 +125,33 @@ class LinuxParserTests(unittest.TestCase):
         self.assertIsNone(rows[0]["version"])
         self.assertEqual(rows[0]["scope"], "system")
 
+    def test_collector_feeds_inventory_evidence(self):
+        """Simulated native collection becomes exact inventory evidence in a fresh engine session."""
+        engine, scope, session_id = inventory_session(self, "linux")  # the authorized real session that receives the evidence
+        uname = MagicMock(release="6.1.0-example", machine="x86_64")
+        observed = pc_records.utc_now()
+        with patch.object(linux.sys, "platform", "linux"), \
+             patch.object(linux, "_read_os_release", return_value={"ID": "example", "VERSION_ID": "12", "PRETTY_NAME": "Example Linux 12"}), \
+             patch.object(linux.os, "uname", return_value=uname, create=True), \
+             patch.object(linux, "_find_program", side_effect=lambda name: "/usr/bin/dpkg-query" if name == "dpkg-query" else None), \
+             patch.object(linux, "_run_query", return_value="example\t1.0-2vendor\tamd64\tii \texample-source\n"), \
+             patch.object(linux.pc_records, "utc_now", return_value=observed):
+            facts = linux.collect()
+        self.assertEqual((facts["platform"], facts["collection_mode"], facts["observed_utc"], facts["errors"]),
+                         ("linux", "real", observed, []))
+        self.assertEqual([item["kind"] for item in facts["observations"]], ["operating_system", "kernel", "package"])
+        package = facts["observations"][2]
+        self.assertEqual((package["update_offer"], package["security_applicability"]), ("not_checked", "not_assessed"))
+        content = pc_records.encoded(facts)
+        engine.register_evidence(session_id, evidence_id="fictional-linux-inventory", content=content, kind="inventory",
+                                 scope=scope, observed_utc=facts["observed_utc"],
+                                 facts={"item_count": len(facts["observations"])})
+        row = engine.read_session(session_id)["evidence"]["fictional-linux-inventory"]
+        self.assertEqual((row["kind"], row["sha256"], row["observed_utc"]), ("inventory", pc_records.digest(content), observed))
+        self.assertEqual(pc_records.decode_strict((engine.work / session_id / row["path"]).read_bytes()), facts)
+
 
 class LinuxSafetyTests(unittest.TestCase):
-    def test_legacy_store_privacy_hold_precedes_mocked_collector(self):
-        source_root = _MODULE.parent.parent
-        fixture = source_root / "work" / "upgrade_v3" / "filesystem" / "legacy_privacy" / ("linux-collector-" + uuid.uuid4().hex)
-        fixture.mkdir(parents=True)
-        (fixture / "toolkit.json").write_bytes((source_root / "toolkit.json").read_bytes())
-        specification = importlib.util.spec_from_file_location("fictional_linux_legacy_core", _MODULE.with_name("posix_core.py"))
-        core = importlib.util.module_from_spec(specification)
-        specification.loader.exec_module(core)
-        with patch.object(core, "_private_directory", side_effect=core.Refusal("Private storage refused: private-linux-foreign-filesystem")), \
-                patch.object(linux, "collect") as collector:
-            with self.assertRaisesRegex(core.Refusal, "private-linux-foreign-filesystem"):
-                core.Toolkit(fixture).collect_baseline("run-" + "a" * 32)
-        collector.assert_not_called()
-        self.assertFalse((fixture / "work").exists())
-
     def test_pipe_fixture_admits_only_controlled_non_system_interpreter_and_restores_policy(self):
         interpreter = "/opt/hostedtoolcache/Python/3.12.9/x64/bin/python3"
         original_admission = linux._trusted_system_path
@@ -261,7 +295,7 @@ class LinuxSafetyTests(unittest.TestCase):
         self.assertTrue(all(set(item) == {"scope", "code"} for item in result["errors"]))
 
 
-@unittest.skipUnless(sys.platform.startswith("linux"), "Native Linux pipe fixture only; no host inventory")
+@unittest.skipUnless(sys.platform.startswith("linux"), "only on linux: native pipe fixture of the Linux collector; no host inventory")
 class LinuxPipeFixtureTests(unittest.TestCase):
     """Only spawn this test interpreter with fixed fictional-output programs."""
 

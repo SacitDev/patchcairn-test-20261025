@@ -36,6 +36,8 @@ SITE_CSP = "default-src 'none'; img-src 'self'; style-src 'self'; script-src 'se
 REPOSITORY_NOTICE = "GitHub repository link not configured"
 REPOSITORY_FALLBACK = '<span class="repository-link" aria-disabled="true" title="' + REPOSITORY_NOTICE + '" aria-label="' + REPOSITORY_NOTICE + '">GitHub</span>'
 MAX_SOURCE_BYTES = 2_000_000
+# The manifest lists this builder's own inputs and outputs; it is not a PatchCairn record and carries no schema fields.
+SITE_GENERATOR = "patchcairn-site-builder"
 # Exact positive allowlist. No glob, discovery, recursive source copy, or work input.
 PAGES = {
     "docs/GETTING_STARTED.md": "guides/getting-started.html",
@@ -59,7 +61,6 @@ PAGES = {
     "RECOVERY_AND_CLEANUP.md": "guides/recovery.html",
     "AGENTS.md": "guides/working-agreement.html",
     "WORKFLOW.md": "guides/maintenance-workflow.html",
-    "LEDGER_SPEC.md": "guides/ledger-reference.html",
     "PUBLICATION.md": "guides/publication.html",
     "PROMPTS.md": "guides/prompts.html",
     "references/COMMUNICATION.md": "guides/communication.html",
@@ -69,7 +70,6 @@ PAGES = {
     "references/LINUX.md": "guides/linux.html",
     "references/MACOS.md": "guides/macos.html",
     "references/DIAGNOSIS.md": "guides/diagnosis-reference.html",
-    "references/HELPER_API.md": "guides/helper-api.html",
     "references/SECURITY_UPDATES_WORKFLOW.md": "guides/security-updates-workflow.html",
     "references/DIAGNOSIS_WORKFLOW.md": "guides/diagnosis-workflow.html",
     "references/STORAGE_CLEANUP_WORKFLOW.md": "guides/storage-cleanup-workflow.html",
@@ -333,7 +333,7 @@ GUIDE_GROUPS = (
     ("Get started", (("docs/YOUR_FIRST_RUN.md", "Your first run"), ("docs/GETTING_STARTED.md", "Setup and first session"), ("docs/FAQ.md", "Common questions"), ("docs/ASSISTANT_COMPATIBILITY.md", "Assistant capabilities"), ("PROMPTS.md", "Prompt examples"))),
     ("Jobs and workflows", (("references/SECURITY_UPDATES_WORKFLOW.md", "Security updates"), ("references/STORAGE_CLEANUP_WORKFLOW.md", "Storage cleanup"), ("references/DIAGNOSIS_WORKFLOW.md", "Diagnosis and repair"), ("references/BACKUP_RECOVERY_WORKFLOW.md", "Backup and recovery"), ("WORKFLOW.md", "Maintenance workflow"), ("docs/DIAGNOSIS_EXAMPLE.md", "Diagnosis example"), ("references/DIAGNOSIS.md", "Diagnosis reference"))),
     ("Safety and requirements", (("docs/PLATFORM_SUPPORT.md", "Platform support"), ("docs/TOOLS.md", "Official tools"), ("SECURITY.md", "Security and privacy"), ("RECOVERY_AND_CLEANUP.md", "Recovery and cleanup"), ("references/COMMUNICATION.md", "Communication"), ("references/COMPATIBILITY.md", "Compatibility"))),
-    ("Technical reference", (("docs/WORKFLOW_ENGINE.md", "Workflow engine"), ("docs/SERVICE_INTEGRATION.md", "Service integration"), ("docs/STORAGE_BACKUP_API.md", "Storage and backup API"), ("docs/DIAGNOSTIC_API.md", "Diagnostic API"), ("docs/ARCHITECTURE.md", "Architecture"), ("docs/SCOPED_FILESYSTEM.md", "Scoped filesystem"), ("docs/WINDOWS_ADAPTER.md", "Windows adapter"), ("references/HELPER_API.md", "Record helper reference"), ("LEDGER_SPEC.md", "Ledger reference"), ("references/AGENTS_AND_DECISIONS.md", "Agents and decisions"), ("references/LINUX.md", "Linux reference"), ("references/MACOS.md", "macOS reference"))),
+    ("Technical reference", (("docs/WORKFLOW_ENGINE.md", "Workflow engine"), ("docs/SERVICE_INTEGRATION.md", "Service integration"), ("docs/STORAGE_BACKUP_API.md", "Storage and backup API"), ("docs/DIAGNOSTIC_API.md", "Diagnostic API"), ("docs/ARCHITECTURE.md", "Architecture"), ("docs/SCOPED_FILESYSTEM.md", "Scoped filesystem"), ("docs/WINDOWS_ADAPTER.md", "Windows adapter"), ("references/AGENTS_AND_DECISIONS.md", "Agents and decisions"), ("references/LINUX.md", "Linux reference"), ("references/MACOS.md", "macOS reference"))),
     ("Project", (("docs/CONTRIBUTING.md", "Contributing"), ("AGENTS.md", "Working agreement"), ("references/SOURCES_AND_RESEARCH.md", "Sources and research"), ("PUBLICATION.md", "Public package"), ("docs/GITHUB_SETUP.md", "GitHub and Pages"), ("docs/UTC_PUBLICATION.md", "UTC publication"))),
 )
 
@@ -722,7 +722,7 @@ def existing_output(output: Path, expected_names: set[str]) -> dict[str, str]:
         return {}
     manifest_data = read_regular(output, "site-manifest.json")
     manifest = json.loads(manifest_data)
-    if set(manifest) != {"schema_version", "inputs", "outputs"} or manifest["schema_version"] != "patchcairn.public-site.v1" or not isinstance(manifest["outputs"], dict):
+    if not isinstance(manifest, dict) or set(manifest) != {"generator", "inputs", "outputs"} or manifest["generator"] != SITE_GENERATOR or not isinstance(manifest["outputs"], dict):
         raise SiteRefusal("Existing output is not a recognized managed site")
     known = manifest["outputs"]
     if set(known) != expected_names - {"site-manifest.json"}:
@@ -778,7 +778,7 @@ def build_site(output: str | Path, *, root: Path = ROOT, repository: str | None 
         outputs[target] = guide_html(title, body, target, repository).encode("utf-8")
     outputs[".nojekyll"] = b""
     validate_public_output(outputs)
-    manifest = {"schema_version": "patchcairn.public-site.v1", "inputs": {name: digest(data) for name, data in sorted(inputs.items())}, "outputs": {name: digest(data) for name, data in sorted(outputs.items())}}
+    manifest = {"generator": SITE_GENERATOR, "inputs": {name: digest(data) for name, data in sorted(inputs.items())}, "outputs": {name: digest(data) for name, data in sorted(outputs.items())}}
     outputs["site-manifest.json"] = (json.dumps(manifest, ensure_ascii=True, sort_keys=True, indent=2) + "\n").encode("utf-8")
     previous = existing_output(destination, set(outputs))
     create_directories(root, destination)

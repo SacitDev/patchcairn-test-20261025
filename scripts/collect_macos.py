@@ -1,13 +1,16 @@
 """Bounded macOS metadata collection; no updates, elevation, cleanup, or writes.
 
+A read-only inventory provider: collect() returns validated facts, which the coordinator
+registers as inventory evidence in an engine session whose owner authorized this collection.
+Create the engine session first; it admits private storage before any collection.
 The real entry point is Darwin-only. Tests must explicitly opt into fixtures and
-provide their own command runner, application roots, and Homebrew candidates.
+provide their own command runner, application roots, and Homebrew candidates;
+fixture results report collection_mode "fixture".
 Never pass imported report values as collector options or executable commands.
 """
 
 from __future__ import annotations
 
-import datetime as dt
 import itertools
 import os
 from pathlib import Path
@@ -22,6 +25,8 @@ import unicodedata
 from dataclasses import dataclass
 from typing import Callable, Iterable, Sequence
 from xml.parsers.expat import ExpatError
+
+import pc_records
 
 
 MAX_COMMAND_BYTES = 256 * 1024
@@ -286,7 +291,7 @@ def collect(*, runner: CommandRunner | None = None, fixture: bool = False,
             homebrew_candidates: Iterable[Path] | None = None,
             timeout: float = 5.0, max_apps: int = 200,
             max_receipts: int = 200) -> dict[str, object]:
-    """Return bounded metadata; core owns authorization, persistence and ledgering.
+    """Return bounded metadata; the caller owns authorization and persistence.
 
     Fixture mode requires an injected runner and explicit fixture-only filesystem
     roots, ensuring Windows/Linux tests never query native application paths.
@@ -411,7 +416,7 @@ def collect(*, runner: CommandRunner | None = None, fixture: bool = False,
                                  "source": "path presence only; executable not read or run", "status": "hold",
                                  "reason": "Verify provenance and package ownership separately before invoking an existing manager."})
     return {"platform": "macos", "collection_mode": "fixture" if fixture else "real",
-            "observed_utc": dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+            "observed_utc": pc_records.utc_now(),
             "observations": observations, "limits": limits,
             "coverage": {"commands": command_status, "application_roots_accessible": roots_accessible,
                          "application_records": app_count, "application_skipped": app_skipped,

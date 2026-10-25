@@ -92,13 +92,14 @@ class SiteTests(unittest.TestCase):
         expected = {"index.html", ".nojekyll", "site-manifest.json", *site.PAGES.values(), *site.COPIES.values()}
         actual = {path.relative_to(self.output).as_posix() for path in self.output.rglob("*") if path.is_file()}
         self.assertEqual(actual, expected)
-        self.assertEqual(result["pages"], 37)
+        self.assertEqual(result["pages"], 35)
         logo = (self.output / "assets/patchcairn-logo.png").read_bytes()
         self.assertEqual(logo, (ROOT / "assets/patchcairn-logo.png").read_bytes())
         self.assertEqual(site.digest(logo), site.LOGO_SHA256)
         outputs = {name: (self.output / name).read_bytes() for name in expected}
         site.validate_public_output(outputs)
         manifest = json.loads(outputs["site-manifest.json"])
+        self.assertEqual((set(manifest), manifest["generator"]), ({"generator", "inputs", "outputs"}, site.SITE_GENERATOR))
         self.assertEqual(set(manifest["inputs"]), set(site.PUBLIC_SOURCES))
         self.assertFalse(any(name.startswith(("work/", ".git/")) for name in manifest["inputs"]))
         self.assertEqual({name for name in actual if name.endswith(".js")}, {"enhancements.js"})
@@ -144,13 +145,13 @@ class SiteTests(unittest.TestCase):
         help_result = subprocess.run([sys.executable, "-B", str(helper), "--help"], cwd=self.fixture, text=True, capture_output=True, timeout=15, check=False)
         self.assertEqual(help_result.returncode, 0, help_result.stderr)
         self.assertIn("work/site/", help_result.stdout)
-        self.assertNotIn("upgrade_v3", help_result.stdout)
+        self.assertNotRegex(help_result.stdout, r"(?i)[._-]v[0-9]+\b")
         self.assertNotIn("--root", help_result.stdout)
         self.assertFalse((self.fixture / ".git").exists())
         self.assertFalse((self.fixture / "work").exists())
         result = subprocess.run([sys.executable, "-B", str(helper), "--output", "work/site/output"], cwd=self.fixture, text=True, capture_output=True, timeout=30, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("Built 37 documentation pages", result.stdout)
+        self.assertIn("Built 35 documentation pages", result.stdout)
         manifest = json.loads((self.output / "site-manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(set(manifest["inputs"]), set(site.PUBLIC_SOURCES))
         self.assertFalse((self.fixture / ".git").exists())
@@ -158,11 +159,11 @@ class SiteTests(unittest.TestCase):
     def test_output_escape_and_boundary_root_refused(self) -> None:
         self.assertEqual(site.OUTPUT_BOUNDARY.as_posix(), "work/site")
         self.assertEqual(site.FIXTURE_BOUNDARY.as_posix(), "work/site/tests")
-        for target in ("../escape", "site/output", "work", "work/site", "work/site/../escape", "work/upgrade_v3/site", "work/upgrade_v3/site/output", str(self.fixture.parent / "outside")):
+        for target in ("../escape", "site/output", "work", "work/site", "work/site/../escape", "work/test-fixtures/site", "work/test-fixtures/site/output", str(self.fixture.parent / "outside")):
             with self.subTest(target=target), self.assertRaises(site.SiteRefusal):
                 site.build_site(target, root=self.fixture)
         self.assertFalse((self.fixture / "site/output").exists())
-        for source_root in (ROOT / "docs", ROOT / "work", ROOT / "work/site", ROOT / "work/site/tests", ROOT / "work/site/night_review/fictional-other", ROOT / "work/upgrade_v3/site/fictional-other", self.fixture / ".." / "fictional-other"):
+        for source_root in (ROOT / "docs", ROOT / "work", ROOT / "work/site", ROOT / "work/site/tests", ROOT / "work/site/night_review/fictional-other", ROOT / "work/test-fixtures/site/fictional-other", self.fixture / ".." / "fictional-other"):
             with self.subTest(source_root=source_root), self.assertRaises(site.SiteRefusal):
                 site.build_site("work/site/output", root=source_root)
 
@@ -214,15 +215,13 @@ class SiteTests(unittest.TestCase):
         junction = False
         try:
             parent.symlink_to(outside, target_is_directory=True)
-        except (OSError, NotImplementedError):
+        except OSError:
             if os.name != "nt":
-                self.skipTest("This host does not permit creating symbolic-link fixtures")
-            try:
-                import _winapi
-                _winapi.CreateJunction(str(outside), str(parent))
-                junction = True
-            except (OSError, AttributeError):
-                self.skipTest("This host permits neither symbolic-link nor junction fixtures")
+                raise
+            # Without the symbolic-link privilege Windows still creates a junction: the same reparse-point boundary.
+            import _winapi
+            _winapi.CreateJunction(str(outside), str(parent))
+            junction = True
         try:
             with self.assertRaisesRegex(site.SiteRefusal, "Links and reparse"):
                 self.build()
@@ -241,15 +240,13 @@ class SiteTests(unittest.TestCase):
         junction = False
         try:
             alias.symlink_to(target, target_is_directory=True)
-        except (OSError, NotImplementedError):
+        except OSError:
             if os.name != "nt":
-                self.skipTest("This host does not permit creating symbolic-link fixtures")
-            try:
-                import _winapi
-                _winapi.CreateJunction(str(target), str(alias))
-                junction = True
-            except (OSError, AttributeError):
-                self.skipTest("This host permits neither symbolic-link nor junction fixtures")
+                raise
+            # Without the symbolic-link privilege Windows still creates a junction: the same reparse-point boundary.
+            import _winapi
+            _winapi.CreateJunction(str(target), str(alias))
+            junction = True
         try:
             with self.assertRaisesRegex(site.SiteRefusal, "Links and reparse"):
                 site.build_site("work/site/output", root=alias / "nested")
@@ -360,8 +357,9 @@ class SiteTests(unittest.TestCase):
 
     def test_local_script_syntax_and_motion_states_without_a_browser(self) -> None:
         node = shutil.which("node")
-        if node is None:
-            self.skipTest("Node is unavailable; static integrity and source checks still run")
+        if node is None and sys.platform.startswith("linux"):
+            self.skipTest("only on windows, macos: the site script logic is OS-independent and is enforced in Node on Windows and macOS")
+        self.assertIsNotNone(node, "Node.js is required on Windows and macOS: the site script runs in Node's offline VM")
         source = self.fixture / "site/enhancements.js"
         self.assertEqual(site.digest(source.read_bytes()), site.ENHANCEMENTS_SHA256)
         syntax = subprocess.run([node, "--check", str(source)], cwd=self.fixture, text=True, capture_output=True, timeout=15, check=False)
@@ -549,8 +547,28 @@ console.log('Finite presentation-only motion state checks passed without a brows
                 opened = [details for details in parser.details if "open" in details]
                 self.assertEqual(len(opened), 1)
                 self.assertIn(group, markup)
-                self.assertIn("Record helper reference", markup)
+                self.assertNotIn("Record helper reference", markup)
                 self.assertNotIn("Legacy helper API", markup)
+
+    def test_retired_ledger_pages_are_not_published(self) -> None:
+        for source, target, label in (("LEDGER_SPEC.md", "guides/ledger-reference.html", "Ledger reference"),
+                                      ("references/HELPER_API.md", "guides/helper-api.html", "Record helper reference")):
+            with self.subTest(source=source):
+                self.assertNotIn(source, site.PUBLIC_SOURCES)
+                self.assertNotIn(target, site.PAGES.values())
+                self.assertNotIn(label, site.guide_navigation("guides/workflow-engine.html")[0])
+
+    def test_foreign_site_manifest_is_not_adopted(self) -> None:
+        self.build()
+        path = self.output / "site-manifest.json"
+        manifest = json.loads(path.read_bytes())
+        for index, foreign in enumerate(({**manifest, "generator": "fictional-other-builder"}, {**manifest, "schema_version": 1}, [manifest])):
+            with self.subTest(index=index):
+                data = json.dumps(foreign).encode("utf-8")
+                path.write_bytes(data)
+                with self.assertRaisesRegex(site.SiteRefusal, "not a recognized managed site"):
+                    self.build()
+                self.assertEqual(path.read_bytes(), data)
 
     def test_toc_uses_actual_rendered_ids_and_plain_escaped_text(self) -> None:
         source = '# Sample\n\nOpening explanation.\n\n## A - B\n\n### -- Edge --\n\n## [Official reference](https://example.org/docs) & "quoted"\n\n## </a><img src=x onerror=alert(1)>\n\n## &quot; &lt; & text\n'

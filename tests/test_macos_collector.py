@@ -3,22 +3,43 @@
 from __future__ import annotations
 
 import json
-import errno
 import os
 from pathlib import Path
 import plistlib
+import shutil
 import struct
 import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import collect_macos as mac
-import posix_core as core
+import pc_records
 
 
-WORK = Path(__file__).resolve().parents[1] / "work" / "v2" / "macos"
+WORK = Path(__file__).resolve().parents[1] / "work" / "test-fixtures" / "macos"
+
+
+def inventory_session(test, platform):
+    """A fresh engine session in its own fixture folder (removed after the test) whose whole-device,
+    metadata-only scope the fictional owner authorizes before evidence is registered."""
+    # The engine core does not check the host platform (the CLI and the service refuse a non-native
+    # real session), so this real session simulates a native host of the given platform.
+    import workflow_core
+    root = WORK / ("fictional-engine-" + uuid.uuid4().hex)
+    root.mkdir(parents=True)
+    test.addCleanup(shutil.rmtree, root)
+    engine = workflow_core.WorkflowEngine(root)
+    access = {"schema": "patchcairn.assessment.access", "schema_version": 1, "target": "whole_device",
+              "operations": ["metadata"], "local_content": [], "llm_content": [], "sensitive_exceptions": []}
+    scope = {"roots": [], "purpose": "Fictional installed-software inventory", "assessment": access}
+    session_id = engine.create_session(mode="real", platform=platform, scope=scope)["session_id"]
+    engine.authorize_scope(session_id, owner_quote="Read only installed-software metadata on this fictional device.",
+                           owner_message_id="fictional-owner-scope")
+    test.assertEqual(engine.read_session(session_id)["scope_authorization"]["scope_sha256"], pc_records.digest(scope))
+    return engine, scope, session_id
 
 
 def fake_runner(responses=None):
@@ -75,73 +96,43 @@ class MacCollectorTests(unittest.TestCase):
         return mac.collect(fixture=True, runner=runner or fake_runner(),
                            application_roots=roots, homebrew_candidates=candidates, **kwargs)
 
-    def isolated_toolkit(self):
-        """Build fictional controls only; never use another run's authority."""
-        toolkit_root = self.root / "fictional-toolkit"
-        (toolkit_root / "templates").mkdir(parents=True)
-        source_root = Path(__file__).resolve().parents[1]
-        for name in ("toolkit.json", "templates/ledger-contract.json"):
-            (toolkit_root / name).write_bytes((source_root / name).read_bytes())
-        try:
-            return core.Toolkit(toolkit_root)
-        except core.Refusal as error:
-            if str(error) in {
-                "Private storage refused: private-linux-foreign-filesystem",
-                "Private storage refused: private-linux-abi-unavailable",
-                "Private storage refused: private-linux-libc-unavailable",
-                "Private storage refused: private-darwin-acl-api-unavailable",
-                "Private storage refused: private-darwin-acl-not-empty",
-            }:
-                self.skipTest("Actual private-workspace capability hold: " + str(error))
-            raise
-
-    def test_nonfixture_macos_producer_integrates_with_real_core_contract(self):
-        """Exercise the actual producer/consumer handoff, with no live OS reads."""
-        toolkit = self.isolated_toolkit()
+    def test_collector_feeds_inventory_evidence(self):
+        """Real-mode facts (Darwin and its commands simulated, no live reads) become exact inventory evidence."""
+        engine, scope, session_id = inventory_session(self, "macos")  # the authorized real session that receives the evidence
         runner = fake_runner()
-        # Only the native capability boundary is simulated. The core's mode,
-        # platform, evidence and ledger checks remain in the exercised path.
-        with patch.object(core.Toolkit, "assert_native_platform") as platform_gate:
-            run_id = toolkit.new_run(mode="real", platform="macos",
-                                     purpose="Fictional mocked producer/consumer contract test")["run_id"]
-            with patch.object(mac.platform, "system", return_value="Darwin"), \
-                    patch.object(mac, "_default_runner", side_effect=runner), \
-                    patch.object(mac.Path, "home", return_value=self.root / "fictional-home"), \
-                    patch.object(mac, "_no_links", return_value=False), \
-                    patch.object(mac.os.path, "lexists", return_value=False), \
-                    patch.object(mac.os, "scandir", side_effect=AssertionError("No live application traversal")) as scan, \
-                    patch.object(mac, "inspect_app", side_effect=AssertionError("No live application metadata")) as inspect:
-                result = toolkit.collect_baseline(run_id)
-            self.assertEqual(platform_gate.call_args_list, [unittest.mock.call("macos"), unittest.mock.call("macos")])
+        observed = pc_records.utc_now()
+        with patch.object(mac.platform, "system", return_value="Darwin"), \
+                patch.object(mac, "_default_runner", side_effect=runner), \
+                patch.object(mac.Path, "home", return_value=self.root / "fictional-home"), \
+                patch.object(mac, "_no_links", return_value=False), \
+                patch.object(mac.os.path, "lexists", return_value=False), \
+                patch.object(mac.os, "scandir", side_effect=AssertionError("No live application traversal")) as scan, \
+                patch.object(mac, "inspect_app", side_effect=AssertionError("No live application metadata")) as inspect, \
+                patch.object(mac.pc_records, "utc_now", return_value=observed):
+            facts = mac.collect()
         self.assertEqual(set(runner.calls), mac.ALLOWED_COMMANDS)
         scan.assert_not_called()
         inspect.assert_not_called()
-        ledger = toolkit.read_ledger(run_id)
-        self.assertEqual(ledger["run"]["mode"], "real")
-        self.assertEqual(ledger["run"]["platform"], "macos")
-        self.assertEqual(result["observation_count"], 4)
-        self.assertEqual(ledger["components"][0]["name"], "macOS")
-        self.assertEqual(ledger["components"][0]["installed_version"], "15.5.2")
-        self.assertTrue(all(item["security_state"] == "not_assessed" for item in ledger["components"]))
-        evidence = ledger["evidence"][0]
-        saved = core.decode(core.safe_read(toolkit.work / run_id, evidence["relative_path"]))
-        self.assertEqual(saved["collection_mode"], "real")
-        self.assertEqual(saved["observations"][0]["build"], "24F123")
-
-    def test_fixture_macos_producer_is_refused_by_real_core_contract(self):
-        toolkit = self.isolated_toolkit()
-        fixture_result = self.collect_fixture()
-        self.assertEqual(fixture_result["collection_mode"], "fixture")
-        with patch.object(core.Toolkit, "assert_native_platform"):
-            run_id = toolkit.new_run(mode="real", platform="macos",
-                                     purpose="Fictional fixture-rejection contract test")["run_id"]
-            before = core.safe_read(toolkit.work / run_id, "ledger.json")
-            with patch.object(mac, "collect", return_value=fixture_result) as producer:
-                with self.assertRaisesRegex(core.Refusal, "real/fixture mode mismatch"):
-                    toolkit.collect_baseline(run_id)
-            producer.assert_called_once_with()
-        self.assertEqual(before, core.safe_read(toolkit.work / run_id, "ledger.json"))
-        self.assertEqual(toolkit.read_ledger(run_id)["evidence"], [])
+        self.assertEqual((facts["platform"], facts["collection_mode"], facts["observed_utc"]), ("macos", "real", observed))
+        self.assertEqual([item["kind"] for item in facts["observations"]],
+                         ["operating_system", "developer_tool_selection", "package_receipt", "package_receipt"])
+        content = pc_records.encoded(facts)
+        engine.register_evidence(session_id, evidence_id="fictional-macos-inventory", content=content, kind="inventory",
+                                 scope=scope, observed_utc=facts["observed_utc"],
+                                 facts={"item_count": len(facts["observations"])})
+        row = engine.read_session(session_id)["evidence"]["fictional-macos-inventory"]
+        self.assertEqual((row["kind"], row["sha256"], row["observed_utc"]), ("inventory", pc_records.digest(content), observed))
+        saved = pc_records.decode_strict((engine.work / session_id / row["path"]).read_bytes())
+        self.assertEqual(saved, facts)
+        self.assertEqual((saved["observations"][0]["version"], saved["observations"][0]["build"]), ("15.5.2", "24F123"))
+        # The engine refuses kind 'fixture' evidence in a real session; it does not read collection_mode.
+        import workflow_core
+        fixture = self.collect_fixture()
+        self.assertEqual(fixture["collection_mode"], "fixture")
+        with self.assertRaisesRegex(workflow_core.WorkflowRefusal, "cannot be promoted into a real session"):
+            engine.register_evidence(session_id, evidence_id="fictional-macos-fixture", content=pc_records.encoded(fixture),
+                                     kind="fixture", scope=scope, observed_utc=fixture["observed_utc"])
+        self.assertEqual(set(engine.read_session(session_id)["evidence"]), {"fictional-macos-inventory"})
 
     def test_wrong_platform_stops_before_commands_or_files(self):
         with patch.object(mac.platform, "system", return_value="Windows"), patch.object(mac.os, "scandir", side_effect=AssertionError("Must not inspect")), patch.object(mac.subprocess, "Popen", side_effect=AssertionError("Must not execute")):
@@ -233,17 +224,10 @@ class MacCollectorTests(unittest.TestCase):
         with patch.object(mac.os, "open", side_effect=AssertionError("A nonregular leaf must never be opened")):
             self.assertIsNone(mac._read_regular(self.root, mac.MAX_PLIST_BYTES))
 
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "only on posix: os.mkfifo creates the fictional FIFO")
     def test_native_fifo_is_rejected_without_opening(self):
-        if not hasattr(os, "mkfifo"):
-            self.skipTest("This host does not support creating fictional POSIX FIFOs")
         fifo = self.root / "fictional-metadata.fifo"
-        try:
-            os.mkfifo(fifo, 0o600)
-        except OSError as error:
-            unsupported = {errno.ENOSYS, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EPERM, errno.EACCES}
-            if error.errno in unsupported:
-                self.skipTest("This owned fixture filesystem does not support POSIX FIFO creation")
-            raise
+        os.mkfifo(fifo, 0o600)
         with patch.object(mac.os, "open", side_effect=AssertionError("A FIFO must never be opened for metadata")):
             self.assertIsNone(mac._read_regular(fifo, mac.MAX_PLIST_BYTES))
 
@@ -254,8 +238,10 @@ class MacCollectorTests(unittest.TestCase):
         link = approved / "Alias.app"
         try:
             link.symlink_to(source, target_is_directory=True)
-        except (OSError, NotImplementedError):
-            self.skipTest("OS does not permit creating a fictional symlink")
+        except OSError as error:
+            if os.name != "nt" or getattr(error, "winerror", None) != 1314:
+                raise
+            self.skipTest("only on posix: Windows refused the symbolic link because the symbolic-link privilege is not held")
         self.assertIsNone(mac.inspect_app(link, "fictional"))
         real = make_app(approved, "Real.app")
         (real / "Contents" / "Info.plist").unlink()
@@ -274,10 +260,10 @@ class MacCollectorTests(unittest.TestCase):
         self.assertTrue(all(command[0] != str(candidate) for command in runner.calls))
 
     def test_custom_developer_path_is_not_retained(self):
-        private_path = "/Users/FictionalUser/private/Tools.app/Contents/Developer"
+        private_path = "/Users/example/private/Tools.app/Contents/Developer"
         data = self.collect_fixture(runner=fake_runner({("/usr/bin/xcode-select", "--print-path"): private_path}))
         self.assertNotIn(private_path, json.dumps(data))
-        self.assertNotIn("FictionalUser", json.dumps(data))
+        self.assertNotIn("/Users/example", json.dumps(data))
 
     def test_raw_errors_and_oversized_command_output_are_not_retained(self):
         sentinel = "fictional-private-error-value"

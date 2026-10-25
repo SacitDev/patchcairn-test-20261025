@@ -1,10 +1,11 @@
 """Bounded native Linux installed-metadata adapter. No writes or update commands.
 
-The coordinator establishes assessment authorization and registers returned evidence.
+A read-only inventory provider: collect() returns validated facts, which the coordinator
+registers as inventory evidence in an engine session whose owner authorized this collection.
+Create the engine session first; it admits private storage before any collection.
 This module deliberately does not discover projects, user profiles or repositories.
 """
 
-from datetime import datetime, timezone
 import os
 from pathlib import Path
 import re
@@ -14,6 +15,8 @@ import stat
 import subprocess
 import sys
 import time
+
+import pc_records
 
 
 MAX_BYTES = 2 * 1024 * 1024
@@ -263,13 +266,13 @@ def collect():
     """Return metadata, coverage and safe errors; caller owns consent and all writes.
 
     Direct calls still collect native metadata: this guard prevents the wrong OS,
-    not unauthorized calling code. Use the coordinator's real-run authorization.
+    not unauthorized calling code. Call it only for a session's authorized scope.
     """
     if not sys.platform.startswith("linux"):
         raise CollectionError("native_linux_required")
-    observed = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    observed = pc_records.utc_now()
     result = {
-        "platform": "linux", "observed_utc": observed, "observations": [],
+        "platform": "linux", "collection_mode": "real", "observed_utc": observed, "observations": [],
         "coverage": [], "errors": [], "limits": [
             "Selected installed metadata only; no update offers or security conclusions.",
             "No user profiles, project environments, repositories, browser data or private logs inspected.",
