@@ -1,0 +1,6 @@
+exampletool 0:8.9.1-2.fc41.x86_64
+examplelib 1:2.1-1.fc41.x86_64
+examplekernel 0:6.11.4-301.fc41.x86_64
+examplekernel 0:6.11.5-300.fc41.x86_64
+exampleother 0:4.0-1.fc41.noarch
+gpg-pubkey 0:e99d6ad1-64d2612c.(none)

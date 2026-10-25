@@ -1,0 +1,5 @@
+[updates]
+name = Example 41 - x86_64 - Updates
+enabled = 1
+pkg_gpgcheck = 1
+repo_gpgcheck = 0

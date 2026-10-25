@@ -1,0 +1,9 @@
+NOTE: This is only a simulation!
+Inst libexampledep (1.0-1 Example:24.04/example-updates [amd64])
+Inst examplecurl [8.5.0-2example1] (8.5.0-2example2 Example:24.04/example-updates [amd64])
+Inst libexample1 [2.1-1] (2.1-2 Example:24.04/example-updates [amd64]) [libexample1:i386 ]
+Inst libexample1:i386 [2.1-1] (2.1-2 Example:24.04/example-updates [i386])
+Conf libexampledep (1.0-1 Example:24.04/example-updates [amd64])
+Conf examplecurl (8.5.0-2example2 Example:24.04/example-updates [amd64])
+Conf libexample1 (2.1-2 Example:24.04/example-updates [amd64])
+Conf libexample1:i386 (2.1-2 Example:24.04/example-updates [i386])

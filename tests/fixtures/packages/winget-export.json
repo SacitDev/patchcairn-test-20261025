@@ -1,0 +1,41 @@
+{
+ "$schema": "https://aka.ms/winget-packages.schema.2.0.json",
+ "CreationDate": "2026-10-25T10:00:00.000-00:00",
+ "Sources": [
+  {
+   "Packages": [
+    {
+     "PackageIdentifier": "Contoso.NoteTaker",
+     "Version": "3.4.0"
+    },
+    {
+     "PackageIdentifier": "Fabrikam.PhotoViewerPro",
+     "Version": "8.7.0"
+    },
+    {
+     "PackageIdentifier": "Litware.Tool",
+     "Version": "Unknown"
+    },
+    {
+     "PackageIdentifier": "Adatum.Sync",
+     "Version": "1.0"
+    },
+    {
+     "PackageIdentifier": "Adatum.SyncPlus",
+     "Version": "1.0"
+    },
+    {
+     "PackageIdentifier": "-Northwind.Shell",
+     "Version": "1.0"
+    }
+   ],
+   "SourceDetails": {
+    "Argument": "https://cdn.winget.microsoft.com/cache",
+    "Identifier": "Microsoft.Winget.Source_8wekyb3d8bbwe",
+    "Name": "winget",
+    "Type": "Microsoft.PreIndexed.Package"
+   }
+  }
+ ],
+ "WinGetVersion": "1.12.350"
+}

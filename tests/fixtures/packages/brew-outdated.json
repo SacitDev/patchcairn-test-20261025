@@ -1,0 +1,87 @@
+{
+ "formulae": [
+  {
+   "name": "examplefetch",
+   "installed_versions": [
+    "1.24.5"
+   ],
+   "current_version": "1.25.0_2",
+   "pinned": false,
+   "pinned_version": null
+  },
+  {
+   "name": "exampledep",
+   "installed_versions": [
+    "3.3.0"
+   ],
+   "current_version": "3.3.1",
+   "pinned": false,
+   "pinned_version": null
+  },
+  {
+   "name": "examplepin",
+   "installed_versions": [
+    "2.0"
+   ],
+   "current_version": "2.1",
+   "pinned": true,
+   "pinned_version": "2.0"
+  },
+  {
+   "name": "fabrikam/tools/examplecli",
+   "installed_versions": [
+    "0.9"
+   ],
+   "current_version": "1.0",
+   "pinned": false,
+   "pinned_version": null
+  },
+  {
+   "name": "-examplebad",
+   "installed_versions": [
+    "1.0"
+   ],
+   "current_version": "1.1",
+   "pinned": false,
+   "pinned_version": null
+  }
+ ],
+ "casks": [
+  {
+   "name": "exampleviewer",
+   "installed_versions": [
+    "131.0"
+   ],
+   "current_version": "132.0",
+   "pinned": false,
+   "pinned_version": null
+  },
+  {
+   "name": "exampleupdater",
+   "installed_versions": [
+    "5.0"
+   ],
+   "current_version": "5.1",
+   "pinned": false,
+   "pinned_version": null
+  },
+  {
+   "name": "exampleinstaller",
+   "installed_versions": [
+    "1.0"
+   ],
+   "current_version": "1.1",
+   "pinned": false,
+   "pinned_version": null
+  },
+  {
+   "name": "examplenocheck",
+   "installed_versions": [
+    "2.0"
+   ],
+   "current_version": "2.1",
+   "pinned": false,
+   "pinned_version": null
+  }
+ ]
+}

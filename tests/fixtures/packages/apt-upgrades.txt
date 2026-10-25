@@ -1,0 +1,17 @@
+NOTE: This is only a simulation!
+      apt-get needs root privileges for real execution.
+Reading package lists...
+Building dependency tree...
+Reading state information...
+Calculating upgrade...
+The following packages have been kept back:
+  examplekernel
+The following packages will be upgraded:
+  examplecurl libexample1 libexample1:i386
+3 upgraded, 0 newly installed, 0 to remove and 1 not upgraded.
+Inst examplecurl [8.5.0-2example1] (8.5.0-2example2 Example:24.04/example-updates [amd64]) []
+Inst libexample1 [2.1-1] (2.1-2 Example:24.04/example-updates [amd64]) [libexample1:i386 ]
+Inst libexample1:i386 [2.1-1] (2.1-2 Example:24.04/example-updates [i386])
+Conf examplecurl (8.5.0-2example2 Example:24.04/example-updates [amd64])
+Conf libexample1 (2.1-2 Example:24.04/example-updates [amd64])
+Conf libexample1:i386 (2.1-2 Example:24.04/example-updates [i386])

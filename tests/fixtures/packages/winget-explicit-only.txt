@@ -1,0 +1,6 @@
+No installed package found matching input criteria.
+
+The following packages have an upgrade available, but require explicit targeting for upgrade:
+Name             Id              Version Available
+--------------------------------------------------
+Adatum Sync Plus Adatum.SyncPlus 1.0     1.2

@@ -1,0 +1,145 @@
+{
+ "formulae": [
+  {
+   "name": "examplefetch",
+   "full_name": "examplefetch",
+   "tap": "homebrew/core",
+   "pinned": false,
+   "disabled": false,
+   "keg_only": false,
+   "linked_keg": "1.25.0_2",
+   "installed": [
+    {
+     "version": "1.25.0_2",
+     "installed_on_request": true
+    }
+   ]
+  },
+  {
+   "name": "exampledep",
+   "full_name": "exampledep",
+   "tap": "homebrew/core",
+   "pinned": false,
+   "disabled": false,
+   "keg_only": true,
+   "linked_keg": null,
+   "installed": [
+    {
+     "version": "3.3.1",
+     "installed_on_request": true
+    }
+   ]
+  },
+  {
+   "name": "examplepin",
+   "full_name": "examplepin",
+   "tap": "homebrew/core",
+   "pinned": true,
+   "disabled": false,
+   "keg_only": false,
+   "linked_keg": "2.0",
+   "installed": [
+    {
+     "version": "2.0",
+     "installed_on_request": true
+    }
+   ]
+  },
+  {
+   "name": "examplecli",
+   "full_name": "fabrikam/tools/examplecli",
+   "tap": "fabrikam/tools",
+   "pinned": false,
+   "disabled": false,
+   "keg_only": false,
+   "linked_keg": "0.9",
+   "installed": [
+    {
+     "version": "0.9",
+     "installed_on_request": true
+    }
+   ]
+  },
+  {
+   "name": "exampleother",
+   "full_name": "exampleother",
+   "tap": "homebrew/core",
+   "pinned": false,
+   "disabled": false,
+   "keg_only": false,
+   "linked_keg": "4.0",
+   "installed": [
+    {
+     "version": "4.0",
+     "installed_on_request": true
+    }
+   ]
+  }
+ ],
+ "casks": [
+  {
+   "token": "exampleviewer",
+   "tap": "homebrew/cask",
+   "installed": "131.0",
+   "auto_updates": null,
+   "sha256": "0000000000000000000000000000000000000000000000000000000000000001",
+   "version": "131.0",
+   "artifacts": [
+    {
+     "app": [
+      "Example Viewer.app"
+     ]
+    }
+   ],
+   "disabled": false
+  },
+  {
+   "token": "exampleupdater",
+   "tap": "homebrew/cask",
+   "installed": "5.0",
+   "auto_updates": true,
+   "sha256": "0000000000000000000000000000000000000000000000000000000000000001",
+   "version": "5.0",
+   "artifacts": [
+    {
+     "app": [
+      "Example Viewer.app"
+     ]
+    }
+   ],
+   "disabled": false
+  },
+  {
+   "token": "exampleinstaller",
+   "tap": "homebrew/cask",
+   "installed": "1.0",
+   "auto_updates": false,
+   "sha256": "0000000000000000000000000000000000000000000000000000000000000001",
+   "version": "1.0",
+   "artifacts": [
+    {
+     "pkg": [
+      "ExampleInstaller.pkg"
+     ]
+    }
+   ],
+   "disabled": false
+  },
+  {
+   "token": "examplenocheck",
+   "tap": "homebrew/cask",
+   "installed": "2.0",
+   "auto_updates": false,
+   "sha256": "no_check",
+   "version": "2.0",
+   "artifacts": [
+    {
+     "app": [
+      "Example Viewer.app"
+     ]
+    }
+   ],
+   "disabled": false
+  }
+ ]
+}

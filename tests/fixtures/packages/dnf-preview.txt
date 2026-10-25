@@ -1,0 +1,17 @@
+Updating and loading repositories:
+Repositories loaded.
+Package                   Arch    Version          Repository      Size
+Upgrading:
+ exampletool              x86_64  8.9.1-3.fc41     updates    789.2 KiB
+   replacing exampletool  x86_64  8.9.1-2.fc41     updates    790.1 KiB
+ examplelib               x86_64  1:2.1-2.fc41     updates     10.0 KiB
+   replacing examplelib   x86_64  1:2.1-1.fc41     updates     10.0 KiB
+Installing dependencies:
+ exampledep               x86_64  1.0-1.fc41       updates      5.0 KiB
+
+Transaction Summary:
+ Installing:         1 package
+ Upgrading:          2 packages
+ Replacing:          2 packages
+
+Operation aborted by the user.

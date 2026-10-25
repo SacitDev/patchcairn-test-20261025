@@ -1,0 +1,13 @@
+Name                  Id                 Version Available
+----------------------------------------------------------
+Contoso Notes         Contoso.NoteTaker  3.4.0   3.4.1
+Fabrikam Photo Viewer Fabrikam.PhotoVie… 8.7.0   8.7.1
+Litware Tool          Litware.Tool       Unknown 2.0
+Adatum Sync           Adatum.Sy…         1.0     1.1
+Northwind Shell       -Northwind.Shell   1.0     1.1
+5 upgrades available.
+
+The following packages have an upgrade available, but require explicit targeting for upgrade:
+Name             Id              Version Available
+--------------------------------------------------
+Adatum Sync Plus Adatum.SyncPlus 1.0     1.2

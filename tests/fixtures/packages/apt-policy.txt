@@ -1,0 +1,8 @@
+examplecurl:
+  Installed: 8.5.0-2example1
+  Candidate: 8.5.0-2example2
+  Version table:
+     8.5.0-2example2 500
+        500 http://archive.example.invalid/ubuntu noble-updates/main amd64 Packages
+ *** 8.5.0-2example1 100
+        100 /var/lib/dpkg/status

@@ -1,0 +1,6 @@
+examplecurl	amd64	8.5.0-2example2	ii 
+libexample1	amd64	2.1-2	ii 
+libexample1	i386	2.1-2	ii 
+examplekernel	amd64	6.8.0-45.45	ii 
+exampleheld	amd64	1.0-1	hi 
+libexampledep	amd64	1.0-1	ii 

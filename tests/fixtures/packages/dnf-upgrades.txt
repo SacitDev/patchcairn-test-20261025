@@ -1,0 +1,2 @@
+exampletool-0:8.9.1-3.fc41.x86_64 updates
+examplelib-1:2.1-2.fc41.x86_64 updates
