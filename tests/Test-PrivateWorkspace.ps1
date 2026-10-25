@@ -4,7 +4,8 @@ param()
 # creates through private_workspace and the Windows file backend: the owner is the current user, the DACL is protected
 # and holds exactly the user, SYSTEM and Administrators with full control (inherited by children of a folder). Prints
 # one PASS or FAIL line per check and exits 1 if any check fails. Runs a small driver with `-I -S -B` under the Python
-# named by PATCHCAIRN_TEST_PYTHON (an absolute path, as CI sets it), otherwise under `py -3.14` (the Python launcher);
+# named by PATCHCAIRN_TEST_PYTHON (a full drive path such as C:\..., as CI sets it; a set value that is not an existing
+# full drive path fails the run), and when it is unset under `py -3.14` (the Python launcher);
 # fixtures live under work/test-fixtures/ and are removed. No account names or SIDs are printed.
 $env:TZ='UTC'
 $ErrorActionPreference='Stop'
@@ -59,7 +60,7 @@ try {
  $script=Join-Path $work 'driver.py'
  [IO.File]::WriteAllText($script,$driver,(New-Object Text.UTF8Encoding($false)))
  $python=$env:PATCHCAIRN_TEST_PYTHON;$version=@()
- if ($python -and -not ([IO.Path]::IsPathRooted($python) -and (Test-Path -LiteralPath $python -PathType Leaf))) { $python=$null }
+ if ($python -and -not ($python -match '^[A-Za-z]:\\' -and (Test-Path -LiteralPath $python -PathType Leaf))) { $python=$null }
  elseif (-not $python) {
   $launcher=Get-Command py -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
   if ($launcher) { $python=$launcher.Source;$version=@('-3.14') }

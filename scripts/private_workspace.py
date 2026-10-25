@@ -55,6 +55,10 @@ def _absolute(path, boundary=None):
             value.relative_to(limit)
         except ValueError:
             _hold("private-boundary-escape")
+        # Strictly below; pathlib folds case with str.lower(), NTFS with its own table (U+212A is not "k").
+        if value == limit or (os.name == "nt" and w32.API is not None
+                              and not all(map(w32.same_name, value.parts, limit.parts))):
+            _hold("private-boundary-escape")
     return value
 
 
@@ -232,7 +236,7 @@ def _posix_capability():
 def private_directory(path, *, create=False, parents=False, exist_ok=False, boundary=None):
     """Admit a private target and hold Windows ordinary ancestry during use.
 
-    `boundary` confines the target; existing ordinary repository/work ancestors
+    `boundary` confines the target strictly below it; existing ordinary repository/work ancestors
     may be shared. Existing target permissions are validated, never changed.
     """
     if os.name != "nt":

@@ -188,6 +188,19 @@ class WindowsPrivateWorkspaceTests(unittest.TestCase):
                 private.ensure_private_directory(value, boundary=self.base)
         with self.assertRaises(private.PrivateWorkspaceError):
             private.ensure_private_directory(self.base.parent, boundary=self.base)
+        # The boundary folder itself is not below the boundary, even though it is private; nor is a sibling whose
+        # name only Unicode case folding makes equal (U+212A KELVIN SIGN folds to "k", NTFS keeps it apart).
+        for label, value, limit in (("boundary-itself", self.base, self.base),
+                                    ("kelvin-sibling", Path("C:\\fictional\\wor\u212a\\run"), Path("C:\\fictional\\work"))):
+            with self.subTest(category=label):
+                with self.assertRaises(private.PrivateWorkspaceError) as caught:
+                    private.ensure_private_directory(value, boundary=limit)
+                self.assertTrue(caught.exception.code == "private-boundary-escape")
+        # A folder below the boundary is still admitted when its spelling differs only in letter case.
+        inner = private.ensure_private_directory(self.base / "inner", create=True)
+        variant = self.base.parent / self.base.name.upper() / "inner"
+        self.assertTrue(private.ensure_private_directory(variant, boundary=self.base) == variant)
+        self.assertTrue(inner.is_dir())
 
     def test_backend_files_and_folders_pass_private_admission(self):
         # The selected-root backend and private_workspace share win32_files; each admits what the other creates.
@@ -398,6 +411,16 @@ class PosixPrivateWorkspaceTests(unittest.TestCase):
         self.assertTrue(stat.S_IMODE(path.stat().st_mode) == 0o700)
         self.assertTrue(stat.S_IMODE((path / "fictional.bin").stat().st_mode) == 0o600)
         private.ensure_private_file(path / "fictional.bin")
+        # A private folder is still refused as its own boundary: the boundary admits only what is below it.
+        with self.assertRaises(private.PrivateWorkspaceError) as caught:
+            private.ensure_private_directory(path, boundary=path)
+        self.assertTrue(caught.exception.code == "private-boundary-escape")
+
+    def test_boundary_itself_is_refused_before_file_access(self):
+        # A path check before any file access, so it holds on file systems without private modes too.
+        with self.assertRaises(private.PrivateWorkspaceError) as caught:
+            private.ensure_private_directory(FIXTURES, boundary=FIXTURES)
+        self.assertTrue(caught.exception.code == "private-boundary-escape")
 
 
 if __name__ == "__main__":
