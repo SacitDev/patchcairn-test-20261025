@@ -2,23 +2,28 @@
 
 Run from the repository root: python3 -I -S -B -m unittest discover -s tests -p "test_scoped_contract.py"
 RootContract holds the behaviour every backend must show. FakeRoot, an in-memory
-backend defined here, runs it now; the Windows and POSIX backends add subclasses
-that supply new_root() and the hooks.
+backend defined here, runs it; WindowsRootContractTests runs it against the Windows
+backend on real folders under work/test-fixtures/, and the POSIX backend adds its own
+subclass that supplies new_root() and the hooks.
 """
 from __future__ import annotations
 
 import ast
 from collections import Counter
 import contextlib
+import ctypes
 import hashlib
 import io
 import itertools
+import os
 from pathlib import Path
+import shutil
 import stat
 import struct
 import sys
 import unittest
 from unittest import mock
+import uuid
 import zipfile
 
 sys.dont_write_bytecode = True
@@ -120,9 +125,13 @@ class _NewFile(io.BytesIO):
 class FakeRoot(scoped_base.RootBase):
     """In-memory backend: names map to nodes; handles keep their node like a descriptor."""
 
-    def __init__(self, device=7):
+    def __init__(self, device=7, volume=None, non_private_destination=False):
         self.device, self.durable, self.closed = device, True, False
         self._inodes = itertools.count(2)
+        if volume is not None:  # admitted as a backup destination on a volume of this kind
+            kind = {"private": "private", "removable-exfat": "non-private", "fat32": "fat32"}.get(volume, volume)
+            vars(self).update(scoped_base.destination_facts(kind, non_private_destination=non_private_destination,
+                                                            stable_ids=volume == "private"))
         self.nodes = {"": _Node("directory", 1)}
         self.aliases = {}
 
@@ -207,11 +216,13 @@ class FakeRoot(scoped_base.RootBase):
             handle.close()
 
     @contextlib.contextmanager
-    def open_new(self, relative, *, private=True, original_mode=None):
+    def open_new(self, relative, *, private=True, original_mode=None, partial=None):
         bits = scoped_base.new_file_mode(private, original_mode)
+        partial = scoped_base.partial_name(partial)
         self.require_absent(relative)
         parent = relative.rpartition("/")[0]
-        temp = (parent + "/" if parent else "") + scoped_base.new_partial_name()
+        temp = (parent + "/" if parent else "") + partial
+        self.require_absent(temp)
         self.nodes[temp] = self.new_node("file")
         if bits is not None:
             self.nodes[temp].mode, self.nodes[temp].private = stat.S_IFREG | bits, False
@@ -332,6 +343,11 @@ class RootContract:
 
     def alias(self, root, relative):
         """Another spelling the file system resolves to ``relative`` (an 8.3 alias), or None."""
+        raise NotImplementedError
+
+    def new_destination_root(self, volume, *, non_private_destination):
+        """A root admitted as a backup destination on a faked volume: "private" (fixed, keeps permissions),
+        "removable-exfat", "fat32" or "unsupported" (for example a network drive)."""
         raise NotImplementedError
 
     def setUp(self):
@@ -497,6 +513,96 @@ class RootContract:
                 raise RuntimeError("writer failed")
         self.assertEqual(self.temp_names(self.root), [])
         self.assertNotIn("draft.bin", self.names())
+
+    def test_open_new_uses_caller_partial_name(self):
+        # The caller records the temporary name first, so reconciliation can remove it after a crash.
+        name = scoped_base.new_partial_name()
+        with self.root.open_new("named.bin", partial=name) as out:
+            out.write(b"x")
+            self.assertEqual(self.temp_names(self.root), [name])
+            out.commit()
+        self.assertEqual(self.temp_names(self.root), [])
+        for bad in ("notes.txt", ".partial-" + "A" * 32, 1):
+            with self.subTest(partial=bad):
+                self.assertRefused("invalid-option", lambda: self.root.open_new("other.bin", partial=bad).__enter__())
+
+    def test_source_root_is_not_a_destination(self):
+        # new_root() admits a source; only the separate destination admission sets destination (plan RR2-4).
+        self.assertIs(self.root.destination, False)
+
+    def test_source_root_is_private(self):
+        self.assertIs(self.root.private, True)
+        with self.root.open_new("p.bin") as out:
+            out.write(b"p")
+            out.commit()
+        self.assertEqual(self.permissions(self.root, "p.bin"), "private")
+
+    def test_privacy_note_matches_privacy(self):
+        self.assertEqual(self.root.privacy_note, None if self.root.private else scoped_base.NON_PRIVATE_NOTE)
+
+    def test_max_file_bytes_is_a_bound(self):
+        cap = self.root.max_file_bytes
+        self.assertTrue(type(cap) is int and 0 < cap <= scoped_base.MAX_STREAM_BYTES, cap)
+
+    def test_admit_new_refuses_only_above_max_file_bytes(self):
+        cap = self.root.max_file_bytes
+        self.assertIsNone(self.root.admit_new("new.bin", 0))
+        self.assertIsNone(self.root.admit_new("folder/new.bin", cap))
+        self.assertRefused("file-too-large-for-volume", self.root.admit_new, "new.bin", cap + 1)
+        for bad in (-1, True, 1.5, "1"):
+            with self.subTest(size=bad):
+                self.assertRefused("invalid-cap", self.root.admit_new, "new.bin", bad)
+        for relative, code in (("", "invalid-relative-path"), ("../new.bin", "invalid-path-component"),
+                               ("NUL", "reserved-path-component")):
+            with self.subTest(relative=relative):
+                self.assertRefused(code, self.root.admit_new, relative, 0)
+                self.assertRefused(code, lambda: self.root.open_new(relative).__enter__())
+        self.assertEqual(self.names(), [])
+
+    def destination(self, volume, *, acknowledged=False):
+        root = self.new_destination_root(volume, non_private_destination=acknowledged)
+        self.addCleanup(root.close)
+        return root
+
+    def test_destination_without_acknowledgment_is_held(self):
+        for volume in ("removable-exfat", "fat32"):
+            with self.subTest(volume=volume):
+                with self.assertRaises(scoped_base.CapabilityHold) as caught:
+                    self.destination(volume)
+                self.assertEqual(caught.exception.code, "non-private-destination-acknowledgment-required")
+                self.assertIn(scoped_base.NON_PRIVATE_NOTE, str(caught.exception))
+        self.assertRefused("destination-volume-unsupported", self.destination, "unsupported", acknowledged=True)
+
+    def test_private_destination_keeps_privacy(self):
+        root = self.destination("private")
+        self.assertEqual((root.destination, root.private, root.privacy_note), (True, True, None))
+        self.assertEqual(root.identity_keys, scoped_base.IDENTITY_KEYS)
+
+    def test_acknowledged_destination_is_not_private(self):
+        root = self.destination("removable-exfat", acknowledged=True)
+        self.assertEqual((root.destination, root.private, root.privacy_note), (True, False, scoped_base.NON_PRIVATE_NOTE))
+        self.assertEqual(root.identity_keys, scoped_base.UNSTABLE_ID_KEYS)
+        with root.open_new("backup.zip") as out:
+            out.write(b"archive")
+            record = out.commit()
+        self.assertEqual(root.inspect("backup.zip", hash_file=True), without_durable(record))
+
+    def test_fat32_destination_caps_file_size(self):
+        root = self.destination("fat32", acknowledged=True)
+        self.assertEqual(root.max_file_bytes, scoped_base.FAT32_MAX_FILE_BYTES)
+        self.assertEqual(root.identity_keys, scoped_base.UNSTABLE_ID_KEYS)
+        self.assertIsNone(root.admit_new("backup.zip", scoped_base.FAT32_MAX_FILE_BYTES))
+        self.assertRefused("file-too-large-for-volume", root.admit_new, "backup.zip", 1 << 32)
+
+    def test_open_new_refuses_a_partial_name_in_use(self):
+        name = scoped_base.new_partial_name()
+        with self.root.open_new("first.bin", partial=name) as out:
+            out.write(b"first")
+            self.assertRefused("destination-exists", lambda: self.root.open_new("second.bin", partial=name).__enter__())
+            record = without_durable(out.commit())
+        self.assertEqual(self.root.read_bytes("first.bin", expected=record, max_bytes=10), b"first")
+        self.assertNotIn("second.bin", self.names())
+        self.assertEqual(self.temp_names(self.root), [])
 
     def test_commit_reports_durability(self):
         with self.root.open_new("d.bin") as out:
@@ -807,6 +913,9 @@ class FakeRootContractTests(RootContract, unittest.TestCase):
         root.aliases["SECRET~1.TXT"] = relative
         return "SECRET~1.TXT"
 
+    def new_destination_root(self, volume, *, non_private_destination):
+        return FakeRoot(volume=volume, non_private_destination=non_private_destination)
+
 
 class _LaxRoot(FakeRoot):
     """A backend that forgets its exit check, to show the shared methods do not depend on it."""
@@ -988,13 +1097,15 @@ class SharedMethodTests(unittest.TestCase):
         posix = {"relative_path": "a/b.txt", "kind": "file", "device": 2049, "inode": 1835041, "mode": 0o100644,
                  "size": 3, "mtime_ns": 4, "ctime_ns": 5, "nlink": 1, "sha256": "a" * 64, "attributes": 0}
         windows = {**posix, "device": 0x9A3F21C4, "inode": 0x0003000000012A4F, "mode": 0o100666, "attributes": 0x20}
-        for good in (posix, windows):
-            self.assertIs(scoped_base.expected_record(good, "a/b.txt"), good)
+        before_1970 = {**windows, "mtime_ns": -315619200000000000, "ctime_ns": -11644473600000000000}
+        for good in (posix, windows, before_1970):
+            self.assertIs(accepted(self, scoped_base.expected_record, good, "a/b.txt"), good)
         self.assertIs(scoped_base.expected_record({**posix, "sha256": None}, "a/b.txt", hashed=False)["sha256"], None)
         bad = [{**posix, "kind": "directory"}, {**posix, "sha256": "A" * 64}, {**posix, "sha256": None},
                {**posix, "inode": 0}, {**posix, "nlink": 2}, {**posix, "size": -1}, {**posix, "size": True},
                {**posix, "size": scoped_base.MAX_STREAM_BYTES + 1}, {**posix, "mode": 0o040755},
                {**windows, "mode": 0x20}, {**windows, "inode": "0003000000012a4f"}, {**posix, "extra": 1},
+               {**posix, "device": -1}, {**posix, "mtime_ns": -1.0},
                {key: value for key, value in posix.items() if key != "attributes"}, None, []]
         for value in bad:
             with self.subTest(value=repr(value)[:60]):
@@ -1036,7 +1147,36 @@ class SharedMethodTests(unittest.TestCase):
         with self.assertRaises(ScopedFSError):
             scoped_base.not_included("", "x", "too-big")
 
+    def test_admit_new_uses_max_file_bytes(self):
+        root = FakeRoot()
+        self.assertIsNone(root.admit_new("a.bin", scoped_base.MAX_STREAM_BYTES))
+        with self.assertRaises(ScopedFSError) as caught:
+            root.admit_new("a.bin", scoped_base.MAX_STREAM_BYTES + 1)  # the default cap is MAX_STREAM_BYTES
+        self.assertEqual(caught.exception.code, "file-too-large-for-volume")
+        root.max_file_bytes = (1 << 32) - 1
+        self.assertIsNone(root.admit_new("a.bin", (1 << 32) - 1))
+        with self.assertRaises(ScopedFSError) as caught:
+            root.admit_new("a.bin", 1 << 32)
+        self.assertEqual(caught.exception.code, "file-too-large-for-volume")
+
+    def test_destination_identity_keys(self):
+        def keys(volume, stable_ids):
+            return scoped_base.destination_facts(volume, non_private_destination=True, stable_ids=stable_ids)["identity_keys"]
+        self.assertEqual(keys("private", True), scoped_base.IDENTITY_KEYS)
+        self.assertEqual(keys("non-private", True), scoped_base.IDENTITY_KEYS)  # a removable NTFS drive
+        self.assertEqual(keys("non-private", False), scoped_base.UNSTABLE_ID_KEYS)  # exFAT, vfat
+        for stable_ids in (True, False):  # FAT file ids change between mounts
+            self.assertEqual(keys("fat32", stable_ids), scoped_base.UNSTABLE_ID_KEYS)
+        with self.assertRaises(TypeError):  # every backend says whether its ids are stable
+            scoped_base.destination_facts("private", non_private_destination=False)
+
     def test_partial_names(self):
+        self.assertRegex(scoped_base.partial_name(), scoped_base.PARTIAL_NAME)
+        given = scoped_base.new_partial_name()
+        self.assertEqual(scoped_base.partial_name(given), given)
+        for bad in ("notes.txt", given.upper(), given + "x", 1):
+            with self.subTest(partial=bad), self.assertRaises(ScopedFSError):
+                scoped_base.partial_name(bad)
         name = scoped_base.new_partial_name()
         self.assertRegex(name, scoped_base.PARTIAL_NAME)
         self.assertNotEqual(name, scoped_base.new_partial_name())
@@ -1080,6 +1220,161 @@ class SharedMethodTests(unittest.TestCase):
         imported |= {node.module.split(".")[0] for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)}
         self.assertEqual(imported, {"__future__", "abc", "contextlib", "hashlib", "re", "stat", "typing", "uuid",
                                     "pc_paths", "pc_records"})
+
+
+FIXTURES = ROOT / "work" / "test-fixtures"
+
+
+def remove_fixture(path):
+    """Remove a fixture folder, including names only the extended path form reaches and read-only files."""
+    def writable_then_retry(function, name, _error):
+        os.chmod(name, stat.S_IWRITE)
+        function(name)
+    shutil.rmtree("\\\\?\\" + str(path), onexc=writable_then_retry)
+
+
+@unittest.skipUnless(os.name == "nt", "only on windows: WindowsRoot runs on Win32 file handles")
+class WindowsRootContractTests(RootContract, unittest.TestCase):
+    """The contract against the Windows backend, on real NTFS folders under work/test-fixtures/.
+
+    A file this backend reads is shared for reading only and a file it removes is not shared at all,
+    so no other program can grow, shrink or swap it meanwhile: grow and shrink act where the backend
+    reads (win32_files.read) and swap reports that the platform refused it. Timestamps, which share
+    modes do not protect, are changed for real. "secret.txt" is already a valid 8.3 name, so NTFS gives
+    it no alias; test_windows_io covers 8.3 aliases with a long name.
+    """
+
+    absent_capabilities = frozenset({"swap", "posix-mode", "case-pair", "name-colon", "special", "alias"})
+
+    def new_root(self):
+        import windows_scoped
+        self.case = FIXTURES / ("contract-" + uuid.uuid4().hex)
+        (self.case / "root").mkdir(parents=True)
+        (self.case / "outside").mkdir()
+        self.addCleanup(remove_fixture, self.case)
+        return windows_scoped.WindowsRoot(str(self.case / "root"))
+
+    def path(self, relative):
+        return self.case / "root" / relative
+
+    def patch_reads(self, replacement):
+        import win32_files
+        real = win32_files.read
+        patcher = mock.patch.object(win32_files, "read", lambda handle, address, count: replacement(real, handle, address, count))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def grow(self, root, relative, extra):
+        pending = [extra]
+
+        def read(real, handle, address, count):
+            done = real(handle, address, count)
+            if done or not pending:
+                return done
+            data = pending.pop()[:count]
+            ctypes.memmove(address, data, len(data))
+            return len(data)
+
+        self.patch_reads(read)
+
+    def shrink(self, root, relative, size):
+        self.patch_reads(lambda real, handle, address, count: 0)
+
+    def touch(self, root, relative):
+        info = os.stat(self.path(relative))
+        os.utime(self.path(relative), ns=(info.st_atime_ns, info.st_mtime_ns + 10 ** 9))
+
+    def rewrite_in_place(self, root, relative, data):
+        info = os.stat(self.path(relative))
+        self.assertEqual(len(data), info.st_size)
+        with open(self.path(relative), "r+b") as stream:
+            stream.write(data)
+        os.utime(self.path(relative), ns=(info.st_atime_ns, info.st_mtime_ns))
+
+    def swap(self, root, relative, data):
+        other = self.case / "outside" / ("swap-" + uuid.uuid4().hex)
+        other.write_bytes(data)
+        try:
+            os.replace(other, self.path(relative))
+        except PermissionError:
+            other.unlink()
+            return False
+        return True
+
+    def temp_names(self, root):
+        found = []
+        for folder, _dirs, files in os.walk(self.case / "root"):
+            found += [os.path.relpath(os.path.join(folder, name), self.case / "root").replace("\\", "/")
+                      for name in files if scoped_base.PARTIAL_NAME.search(name)]
+        return found
+
+    def make_read_only(self, root, relative):
+        os.chmod(self.path(relative), stat.S_IREAD)
+
+    def permissions(self, root, relative):
+        import win32_files
+        handle = win32_files.open_file(str(self.path(relative)), win32_files.READ_CONTROL, 7, win32_files.OPEN_EXISTING,
+                                       win32_files.FILE_FLAG_OPEN_REPARSE_POINT)
+        with handle:
+            owner, control, aces = win32_files.security_snapshot(handle)
+        if (control & 0x1000 and owner == win32_files.token_user()
+                and sorted(sid for _kind, flags, _mask, sid in aces if not flags) == sorted(win32_files.private_principals())
+                and len(aces) == len(win32_files.private_principals())):
+            return "private"
+        return "inherited" if aces and all(flags & 0x10 for _kind, flags, _mask, _sid in aces) else "other"
+
+    def restored_mode(self, root, relative):
+        return None
+
+    def fail_sync(self, root):
+        import win32_files
+        real, failed = win32_files.flush, []
+
+        def flush(handle):
+            if not failed:
+                failed.append(True)
+                raise OSError(5, "fictional sync failure", None, 1117)
+            return real(handle)
+
+        patcher = mock.patch.object(win32_files, "flush", flush)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return True
+
+    def add_raw_name(self, root, parent, name, kind="file", nlink=1):
+        if kind == "special" or ":" in name:
+            return False  # NTFS has no FIFOs, and a colon names a stream of another file
+        target = self.path(parent) / name if parent else self.path(name)
+        if kind == "link":
+            import _winapi
+            _winapi.CreateJunction(str(self.case / "outside"), str(target))
+            return True
+        # The extended form stores names such as "nul" and "trailing." literally.
+        with open("\\\\?\\" + str(target), "xb") as stream:
+            stream.write(b"raw")
+        if nlink == 2:
+            os.link("\\\\?\\" + str(target), self.case / "outside" / (uuid.uuid4().hex + ".link"))
+        return True
+
+    def add_case_pair(self, root, parent, first, second):
+        self.add_raw_name(root, parent, first)
+        try:
+            self.add_raw_name(root, parent, second)
+        except FileExistsError:
+            return False
+        return True
+
+    def alias(self, root, relative):
+        return None
+
+    def new_destination_root(self, volume, *, non_private_destination):
+        import windows_scoped
+        filesystem, drive_type = {"private": ("NTFS", 3), "removable-exfat": ("exFAT", 2), "fat32": ("FAT32", 2),
+                                  "unsupported": ("NTFS", 4)}[volume]
+        folder = self.case / ("destination-" + uuid.uuid4().hex)
+        folder.mkdir()
+        return windows_scoped.admit_destination(str(folder), non_private_destination=non_private_destination,
+                                               volumes=lambda handle, drive: {"filesystem": filesystem, "drive_type": drive_type})
 
 
 if __name__ == "__main__":

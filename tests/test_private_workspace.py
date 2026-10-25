@@ -1,16 +1,15 @@
-"""Private-copy regression fixtures only; never read or change host folder ACLs."""
+"""Private-copy regression fixtures only; never read or change host folder ACLs.
+
+Fixtures live under work/test-fixtures/ and are removed after each test.
+"""
 from __future__ import annotations
 
-import base64
 import ctypes
-import hashlib
-from ctypes import wintypes
 from contextlib import contextmanager
-import json
 import os
 from pathlib import Path, PurePosixPath
+import shutil
 import stat
-import subprocess
 import sys
 import unittest
 from unittest import mock
@@ -21,142 +20,59 @@ sys.dont_write_bytecode = True
 ROOT = Path(__file__).absolute().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 import private_workspace as private
+import win32_files
 
-FIXTURES = ROOT / "work/upgrade_v3/windows/privacy_fix"
+FIXTURES = ROOT / "work" / "test-fixtures"
 
 
-@unittest.skipUnless(os.name == "nt", "Windows native owner/DACL fixtures")
+def remove_fixture(path):
+    def writable_then_retry(function, name, _error):
+        os.chmod(name, stat.S_IWRITE)
+        function(name)
+    shutil.rmtree(path, onexc=writable_then_retry)
+
+
+@unittest.skipUnless(os.name == "nt", "only on windows: native owner and DACL fixtures")
 class WindowsPrivateWorkspaceTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        private.ensure_private_directory(FIXTURES, create=True, parents=True, exist_ok=True)
-
     def setUp(self):
-        self.base = FIXTURES / ("case-" + uuid.uuid4().hex)
-        private.ensure_private_directory(self.base, create=True)
+        self.base = FIXTURES / ("private-" + uuid.uuid4().hex)
+        private.ensure_private_directory(self.base, create=True, parents=True)
+        self.addCleanup(remove_fixture, self.base)
 
     def node_with_descriptor(self, name, descriptor_suffix, *, directory=True):
         """Creation-time ACL fixture only. Never change an existing object's ACL."""
-        api = private._WindowsSecurity()
+        user = win32_files.token_user()
         descriptor = ctypes.c_void_p()
-        length = wintypes.DWORD()
-        sddl = "O:" + api.user + descriptor_suffix.replace("CURRENT_USER", api.user)
-        self.assertTrue(bool(api.advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        length = ctypes.c_uint32()
+        sddl = "O:" + user + descriptor_suffix.replace("CURRENT_USER", user)
+        self.assertTrue(bool(win32_files.API.ConvertStringSecurityDescriptorToSecurityDescriptorW(
             sddl, 1, ctypes.byref(descriptor), ctypes.byref(length))))
         path = self.base / name
         try:
-            attributes = private._SecurityAttributes(ctypes.sizeof(private._SecurityAttributes), descriptor, False)
+            attributes = win32_files.SECURITY_ATTRIBUTES(ctypes.sizeof(win32_files.SECURITY_ATTRIBUTES), descriptor, False)
             if directory:
-                self.assertTrue(bool(api.kernel.CreateDirectoryW(str(path), ctypes.byref(attributes))))
+                win32_files.create_directory(str(path), attributes)
             else:
-                handle = api.kernel.CreateFileW(str(path), 0xC0020080, 0, ctypes.byref(attributes), 1, 0x00200080, None)
-                self.assertTrue(handle != ctypes.c_void_p(-1).value)
-                api.close(handle)
+                win32_files.open_file(str(path), 0xC0020080, 0, win32_files.CREATE_NEW, 0x00200080, attributes).close()
         finally:
-            api.kernel.LocalFree(descriptor)
+            win32_files.API.LocalFree(descriptor)
         return path
 
+    def security_handle(self, path):
+        return win32_files.open_file(str(path), win32_files.READ_CONTROL, 7, win32_files.OPEN_EXISTING,
+                                     win32_files.FILE_FLAG_BACKUP_SEMANTICS | win32_files.FILE_FLAG_OPEN_REPARSE_POINT)
+
     def descriptor_bytes(self, path, *, directory=True):
-        api = private._WindowsSecurity()
-        handle = api.open(path, directory=directory, security=True)
+        function = ctypes.WinDLL("advapi32", use_last_error=True).GetSecurityDescriptorLength
+        function.argtypes, function.restype = [ctypes.c_void_p], ctypes.c_uint32
         owner, dacl, descriptor = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p()
-        function = api.advapi.GetSecurityDescriptorLength
-        function.argtypes, function.restype = [ctypes.c_void_p], wintypes.DWORD
+        with self.security_handle(path) as handle:
+            self.assertTrue(win32_files.API.GetSecurityInfo(handle.value, 1, 5, ctypes.byref(owner), None,
+                                                            ctypes.byref(dacl), None, ctypes.byref(descriptor)) == 0)
         try:
-            self.assertTrue(api.advapi.GetSecurityInfo(handle, 1, 5, ctypes.byref(owner), None,
-                              ctypes.byref(dacl), None, ctypes.byref(descriptor)) == 0)
             return ctypes.string_at(descriptor, function(descriptor))
         finally:
-            if descriptor.value:
-                api.kernel.LocalFree(descriptor)
-            api.close(handle)
-
-    def protected_file_dacl(self, path):
-        api = private._WindowsSecurity()
-        handle = api.open(path, directory=False, security=True)
-        owner, dacl, descriptor = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p()
-        try:
-            self.assertTrue(api.advapi.GetSecurityInfo(handle, 1, 5, ctypes.byref(owner), None,
-                              ctypes.byref(dacl), None, ctypes.byref(descriptor)) == 0)
-            control, revision = wintypes.WORD(), wintypes.DWORD()
-            self.assertTrue(bool(api.advapi.GetSecurityDescriptorControl(descriptor, ctypes.byref(control), ctypes.byref(revision))))
-            return bool(control.value & 0x1000)
-        finally:
-            if descriptor.value:
-                api.kernel.LocalFree(descriptor)
-            api.close(handle)
-
-    def assert_private_compiler_directory(self, path, protected_namespace):
-        """Admit inherited compiler DACLs without requiring DACL_PROTECTED.
-
-        The enclosing request/worker namespace remains protected and pinned.
-        Descendants retain ordinary metadata, exact owner, closed allow-list,
-        user access/inheritance, and persistent-ACL checks. No ACL is changed.
-        """
-        path, protected_namespace = Path(path), Path(protected_namespace)
-        relative = path.relative_to(protected_namespace)
-        self.assertTrue(relative.parts and all(p not in {"", ".", ".."} for p in relative.parts),
-                        "Compiler directory escaped its admitted namespace")
-        api = private._WindowsSecurity()
-        held = []
-        with private.private_directory(protected_namespace):
-            current = protected_namespace
-            try:
-                for part in relative.parts:
-                    current /= part
-                    before = current.lstat()
-                    self.assertTrue(stat.S_ISDIR(before.st_mode) and not getattr(before, "st_file_attributes", 0) & 0x400,
-                                    "Compiler directory is not an ordinary directory")
-                    handle = api.open(current, directory=True, security=True)
-                    held.append(handle)
-                    info = api.info(handle, current, directory=True)
-                    identity = (info.volume, info.id_high, info.id_low, info.attributes, info.links)
-                    owner, dacl, descriptor = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p()
-                    try:
-                        status = api.advapi.GetSecurityInfo(handle, 1, 5, ctypes.byref(owner), None,
-                                                          ctypes.byref(dacl), None, ctypes.byref(descriptor))
-                        self.assertTrue(status == 0 and descriptor.value and dacl.value,
-                                        "Compiler directory DACL is unavailable or null")
-                        control, revision = wintypes.WORD(), wintypes.DWORD()
-                        self.assertTrue(bool(api.advapi.GetSecurityDescriptorControl(
-                            descriptor, ctypes.byref(control), ctypes.byref(revision))), "Compiler DACL control is unavailable")
-                        self.assertTrue(bool(control.value & 4), "Compiler directory DACL is absent")
-                        # Deliberately no SE_DACL_PROTECTED requirement here:
-                        # safe compiler subdirectories may inherit these rules.
-                        self.assertTrue(api._sid_text(owner) == api.user, "Compiler directory owner differs from fixture owner")
-                        self.assertTrue(bool(api.advapi.IsValidAcl(dacl)), "Compiler directory DACL is invalid")
-                        acl = ctypes.cast(dacl, ctypes.POINTER(private._ACL)).contents
-                        self.assertTrue(1 <= acl.count <= 256, "Compiler DACL ACE count is unsupported")
-                        user_access = user_inheritance = False
-                        for index in range(acl.count):
-                            address = ctypes.c_void_p()
-                            self.assertTrue(bool(api.advapi.GetAce(dacl, index, ctypes.byref(address))),
-                                            "Compiler DACL ACE is unavailable")
-                            ace = ctypes.cast(address, ctypes.POINTER(private._ACE)).contents
-                            self.assertTrue(ace.kind == 0 and not ace.flags & ~0x13 and ace.size >= 16,
-                                            "Compiler DACL ACE type or flags are unsupported")
-                            sid = address.value + 8
-                            self.assertTrue(bool(api.advapi.IsValidSid(sid)) and api.advapi.GetLengthSid(sid) <= ace.size - 8,
-                                            "Compiler DACL SID is invalid")
-                            principal = api._sid_text(sid)
-                            self.assertTrue(principal in api.allowed, "Compiler DACL admits a broad or unknown principal")
-                            if principal == api.user and (ace.mask & 0x1F01FF == 0x1F01FF or ace.mask & 0x10000000):
-                                user_access = True
-                                user_inheritance |= ace.flags & 3 == 3
-                        self.assertTrue(user_access and user_inheritance, "Compiler directory lacks fixture-owner access or inheritance")
-                        serial, maximum, flags = wintypes.DWORD(), wintypes.DWORD(), wintypes.DWORD()
-                        self.assertTrue(bool(api.kernel.GetVolumeInformationByHandleW(
-                            handle, None, 0, ctypes.byref(serial), ctypes.byref(maximum), ctypes.byref(flags), None, 0))
-                            and bool(flags.value & 8), "Compiler directory volume lacks persistent ACLs")
-                        after = api.info(handle, current, directory=True)
-                        self.assertTrue((after.volume, after.id_high, after.id_low, after.attributes, after.links) == identity,
-                                        "Compiler directory metadata changed during admission")
-                    finally:
-                        if descriptor.value:
-                            api.kernel.LocalFree(descriptor)
-            finally:
-                for handle in reversed(held):
-                    api.close(handle)
+            win32_files.API.LocalFree(descriptor)
 
     def test_new_namespace_and_file_actual_owner_dacl_readback(self):
         target = self.base / "namespace"
@@ -167,15 +83,10 @@ class WindowsPrivateWorkspaceTests(unittest.TestCase):
         self.assertTrue((target / "fictional.json").read_bytes() == b'{"fictional":true}')
 
     def test_mismatched_owner_is_a_categorical_hold(self):
-        api = private._WindowsSecurity()
-        handle = api.open(self.base, directory=True, security=True)
-        try:
-            with mock.patch.object(api, "_sid_text", return_value="fictional-other-owner"):
-                with self.assertRaises(private.PrivateWorkspaceError) as caught:
-                    api.validate(handle, directory=True)
-            self.assertTrue(caught.exception.code == "private-owner-refused")
-        finally:
-            api.close(handle)
+        with mock.patch.object(win32_files, "token_user", return_value="S-1-5-21-1-2-3-1001"):
+            with self.assertRaises(private.PrivateWorkspaceError) as caught:
+                private.ensure_private_directory(self.base)
+        self.assertTrue(caught.exception.code == "private-owner-refused")
 
     def test_new_descendants_explicit_writer_and_native_owner_admission(self):
         child = self.base / "namespace" / "child"
@@ -189,29 +100,13 @@ class WindowsPrivateWorkspaceTests(unittest.TestCase):
         with file.open("xb") as stream:
             stream.write(b"fictional inherited file")
         before = self.descriptor_bytes(file, directory=False)
-        api = private._WindowsSecurity()
-        handle = api.open(file, directory=False, security=True)
-        owner, dacl, descriptor = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p()
-        try:
-            self.assertTrue(api.advapi.GetSecurityInfo(handle, 1, 5, ctypes.byref(owner), None,
-                              ctypes.byref(dacl), None, ctypes.byref(descriptor)) == 0)
-            owner_is_user = api._sid_text(owner) == api.user
-            self.assertTrue(bool(dacl.value) and bool(api.advapi.IsValidAcl(dacl)))
-            acl = ctypes.cast(dacl, ctypes.POINTER(private._ACL)).contents
-            self.assertTrue(acl.count == len(api.allowed))
-            inherited_principals = set()
-            for index in range(acl.count):
-                address = ctypes.c_void_p()
-                self.assertTrue(bool(api.advapi.GetAce(dacl, index, ctypes.byref(address))))
-                ace = ctypes.cast(address, ctypes.POINTER(private._ACE)).contents
-                self.assertTrue(ace.kind == 0 and ace.flags & 0x10 and not ace.flags & ~0x13
-                                and ace.size >= 16 and ace.mask & 0x1F01FF == 0x1F01FF)
-                inherited_principals.add(api._sid_text(address.value + 8))
-            self.assertTrue(inherited_principals == api.allowed)
-        finally:
-            if descriptor.value:
-                api.kernel.LocalFree(descriptor)
-            api.close(handle)
+        with self.security_handle(file) as handle:
+            owner, _control, aces = win32_files.security_snapshot(handle)
+        owner_is_user = owner == win32_files.token_user()
+        self.assertTrue(len(aces) == len(win32_files.private_principals()))
+        for kind, flags, mask, _sid in aces:
+            self.assertTrue(kind == 0 and flags & 0x10 and not flags & ~0x13 and mask & 0x1F01FF == 0x1F01FF)
+        self.assertTrue({sid for _kind, _flags, _mask, sid in aces} == set(win32_files.private_principals()))
         if owner_is_user:
             self.assertTrue(private.ensure_private_file(file) == file)
         else:
@@ -228,7 +123,7 @@ class WindowsPrivateWorkspaceTests(unittest.TestCase):
             private.ensure_private_directory(shared)
         self.assertTrue(caught.exception.code == "private-dacl-broad-or-unknown")
         self.assertTrue(before == self.descriptor_bytes(shared))
-        self.assertFalse((shared / "request.json").exists())
+        self.assertEqual(list(shared.iterdir()), [])
 
     def test_null_dacl_refused(self):
         shared = self.node_with_descriptor("null-dacl", "D:NO_ACCESS_CONTROL")
@@ -239,7 +134,8 @@ class WindowsPrivateWorkspaceTests(unittest.TestCase):
     def test_inherit_only_broad_ace_and_unsupported_ace_refuse(self):
         for name, suffix in (
             ("inherit-only", "D:P(A;OICI;FA;;;CURRENT_USER)(A;OICIIO;FR;;;WD)"),
-            ("unsupported-deny", "D:P(D;;0x00000001;;;WD)(A;OICI;FA;;;CURRENT_USER)"),
+            # Denies writing extended attributes only, so the fixture can still be listed and removed.
+            ("unsupported-deny", "D:P(D;;0x00000010;;;WD)(A;OICI;FA;;;CURRENT_USER)"),
         ):
             with self.subTest(category=name):
                 path = self.node_with_descriptor(name, suffix)
@@ -267,13 +163,13 @@ class WindowsPrivateWorkspaceTests(unittest.TestCase):
         self.assertTrue(path.read_bytes() == b"fictional preserved bytes")
 
     def test_file_admission_failure_occurs_before_private_bytes(self):
-        original = private._WindowsSecurity.validate
-        def refuse_file(api, handle, *, directory):
+        original = win32_files.validate_private
+        def refuse_file(handle, *, directory, exact):
             if not directory:
-                raise private.PrivateWorkspaceError("fictional-file-admission-refusal")
-            return original(api, handle, directory=directory)
+                raise win32_files.PrivacyRefusal("fictional-file-admission-refusal")
+            return original(handle, directory=directory, exact=exact)
         path = self.base / "never-populated.bin"
-        with mock.patch.object(private._WindowsSecurity, "validate", new=refuse_file):
+        with mock.patch.object(win32_files, "validate_private", new=refuse_file):
             with self.assertRaises(private.PrivateWorkspaceError):
                 private.write_private_new(path, b"fictional private bytes must stay unwritten")
         self.assertTrue(path.is_file() and path.stat().st_size == 0)
@@ -293,17 +189,19 @@ class WindowsPrivateWorkspaceTests(unittest.TestCase):
         with self.assertRaises(private.PrivateWorkspaceError):
             private.ensure_private_directory(self.base.parent, boundary=self.base)
 
-    def test_namespace_admission_holds_before_payload_write_or_subprocess(self):
+    def test_backend_files_and_folders_pass_private_admission(self):
+        # The selected-root backend and private_workspace share win32_files; each admits what the other creates.
         import windows_scoped
-        shared = self.node_with_descriptor("dispatcher-shared", "D:P(A;OICI;FA;;;CURRENT_USER)(A;OICI;FR;;;WD)")
-        with mock.patch.object(windows_scoped, "_WORK_ROOT", shared), \
-             mock.patch.object(windows_scoped, "write_private_new") as writer, \
-             mock.patch.object(windows_scoped.OwnedTransport, "start") as starter:
-            with self.assertRaises(windows_scoped.CapabilityHold):
-                windows_scoped._dispatch("create", data_base64="ZmljdGlvbmFsIHByaXZhdGUgYnl0ZXM=")
-            self.assertFalse(writer.called)
-            self.assertFalse(starter.called)
-        self.assertTrue(list(shared.iterdir()) == [])
+        with windows_scoped.WindowsRoot(str(self.base)) as root:
+            root.mkdir("backup")
+            root.create_file("backup/manifest.json", data=b"{}")
+            private.write_private_new(self.base / "backup" / "README.txt", b"fictional readme")
+            self.assertEqual(root.inspect("backup/README.txt", hash_file=True)["size"], 16)
+        self.assertTrue(private.ensure_private_directory(self.base / "backup") == self.base / "backup")
+        for name in ("manifest.json", "README.txt"):
+            self.assertTrue(private.ensure_private_file(self.base / "backup" / name) == self.base / "backup" / name)
+            with self.security_handle(self.base / "backup" / name) as handle:
+                win32_files.validate_private(handle, directory=False, exact=True)
 
     @mock.patch("darwin_privacy.assert_private_filesystem")
     def test_darwin_private_namespace_is_hold_before_allocation(self, _volume_gate):
@@ -484,76 +382,12 @@ class WindowsPrivateWorkspaceTests(unittest.TestCase):
             self.assertFalse(write.called)
             self.assertTrue(close.call_count == 1)
 
-    def test_real_dispatch_request_response_and_temporaries_private(self):
-        import windows_scoped
-        self.assertTrue(windows_scoped.shutdown_worker(), "Earlier owned worker did not quiesce")
-        original_runtime = windows_scoped._runtime()
-        legacy = str(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32/WindowsPowerShell/v1.0/powershell.exe")
-        runtimes = [("preferred", original_runtime)]
-        if Path(legacy).is_file() and legacy.casefold() != original_runtime.casefold():
-            runtimes.append(("legacy", legacy))
-        for category, executable in runtimes:
-            with self.subTest(runtime=category):
-                source = self.base / category
-                private.ensure_private_directory(source, create=True)
-                payload = b"fictional source content for private packet regression"
-                private.write_private_new(source / "source.bin", payload)
-                packets = self.base / (category + "-packets")
-                with mock.patch.object(windows_scoped, "_WORK_ROOT", packets), \
-                     mock.patch.object(windows_scoped, "_runtime", return_value=executable):
-                    try:
-                        with windows_scoped.ScopedRoot(source, quiet_workspace=True) as scope:
-                            record = scope.inspect("source.bin", hash_file=True)
-                            self.assertTrue(scope.read_bytes("source.bin", expected=record, max_bytes=1024) == payload)
-                            scope.create_file("created.bin", data=payload, max_bytes=1024)
-                        private.ensure_private_file(source / "created.bin")
-                        self.assertTrue(self.protected_file_dacl(source / "created.bin"))
-                        self.assertEqual((source / "created.bin").read_bytes(), payload)
-                        private.ensure_private_directory(packets)
-                        children = list(packets.iterdir())
-                        requests = [p for p in children if p.name.startswith("request-")]
-                        workers = [p for p in children if p.name.startswith("worker-")]
-                        self.assertEqual(len(requests), 4)
-                        self.assertEqual(len(workers), 1)
-                        self.assertEqual(set(children), set(requests + workers))
-                        for directory in children:
-                            self.assertTrue(len(directory.name.rsplit("-", 1)[1]) == 32)
-                            self.assertTrue(all(c in "0123456789abcdef" for c in directory.name.rsplit("-", 1)[1]))
-                            private.ensure_private_directory(directory)
-                            for entry in directory.rglob("*"):
-                                if entry.is_dir():
-                                    self.assert_private_compiler_directory(entry, directory)
-                                else:
-                                    private.ensure_private_file(entry)
-                        for name in ("Windows.Scoped.Dispatch.ps1", "Windows.Scoped.cs"):
-                            snapshot = workers[0] / name
-                            private.ensure_private_file(snapshot)
-                            self.assertEqual(hashlib.sha256(snapshot.read_bytes()).digest(),
-                                             hashlib.sha256((ROOT / "scripts" / name).read_bytes()).digest())
-                        content_input = content_output = False
-                        operations = []
-                        for request in requests:
-                            q = json.loads((request / "request.json").read_text(encoding="utf-8"))
-                            r = json.loads((request / "response.json").read_text(encoding="utf-8"))
-                            operations.append(q.get("operation"))
-                            content_input |= q.get("operation") == "create" and bool(q.get("data_base64"))
-                            content_output |= q.get("operation") == "read" and bool(r.get("result", {}).get("data_base64"))
-                            if q.get("operation") == "create":
-                                self.assertEqual(base64.b64decode(q["data_base64"], validate=True), payload)
-                            if q.get("operation") == "read":
-                                self.assertEqual(base64.b64decode(r["result"]["data_base64"], validate=True), payload)
-                        self.assertEqual(sorted(operations), ["create", "inspect", "inspect", "read"])
-                        self.assertTrue(content_input and content_output)
-                    finally:
-                        # Retire and release snapshot/request pins before these
-                        # patched runtime/namespace values leave their scope.
-                        self.assertTrue(windows_scoped.shutdown_worker(), "Owned worker teardown was not proven")
 
-
-@unittest.skipUnless(os.name == "posix", "POSIX private mode/owner fixtures")
+@unittest.skipUnless(os.name == "posix", "only on posix: private mode and owner fixtures")
 class PosixPrivateWorkspaceTests(unittest.TestCase):
     def test_private_modes_or_honest_non_enforcing_filesystem_hold(self):
         path = FIXTURES / ("posix-" + uuid.uuid4().hex)
+        self.addCleanup(shutil.rmtree, path, True)
         try:
             private.ensure_private_directory(path, create=True, parents=True)
         except private.PrivateWorkspaceError as error:

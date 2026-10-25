@@ -8,14 +8,14 @@ This cooperative boundary excludes the same user and privileged administrators.
 """
 from __future__ import annotations
 
-from contextlib import contextmanager
-import ctypes
-from ctypes import wintypes
+from contextlib import ExitStack, contextmanager
 import os
 from pathlib import Path
 import re
 import stat
 import sys
+
+import win32_files as w32
 
 
 class PrivateWorkspaceError(ValueError):
@@ -58,243 +58,100 @@ def _absolute(path, boundary=None):
     return value
 
 
-class _Info(ctypes.Structure):
-    _fields_ = [("attributes", wintypes.DWORD), ("creation", wintypes.FILETIME),
-                ("access", wintypes.FILETIME), ("write", wintypes.FILETIME),
-                ("volume", wintypes.DWORD), ("size_high", wintypes.DWORD),
-                ("size_low", wintypes.DWORD), ("links", wintypes.DWORD),
-                ("id_high", wintypes.DWORD), ("id_low", wintypes.DWORD)]
+def _windows_api():
+    if os.name != "nt" or w32.API is None:
+        _hold("private-windows-api-unavailable")
+    try:
+        w32.token_user()
+    except (OSError, w32.PrivacyRefusal):
+        _hold("private-token-unavailable")
 
 
-class _SecurityAttributes(ctypes.Structure):
-    _fields_ = [("length", wintypes.DWORD), ("descriptor", ctypes.c_void_p),
-                ("inherit_handle", wintypes.BOOL)]
+def _windows_info(handle, path, *, directory):
+    try:
+        info = w32.file_information(handle)
+    except OSError:
+        _hold("private-file-metadata-unavailable")
+    if w32.file_type(handle) != w32.FILE_TYPE_DISK:
+        _hold("private-file-metadata-unavailable")
+    if (info.attributes & w32.ATTRIBUTE_REPARSE_POINT or bool(info.attributes & w32.ATTRIBUTE_DIRECTORY) != directory
+            or (not directory and info.links != 1)):
+        _hold("private-link-or-type-refused")
+    try:
+        final = w32.final_path(handle)
+    except OSError:
+        _hold("private-canonical-path-unavailable")
+    if not final.startswith("\\\\?\\"):
+        _hold("private-canonical-path-unavailable")
+    if not w32.same_name(final[4:].rstrip("\\"), str(path).rstrip("\\")):
+        _hold("private-canonical-path-mismatch")
+    return info
 
 
-class _ACL(ctypes.Structure):
-    _fields_ = [("revision", ctypes.c_ubyte), ("reserved", ctypes.c_ubyte),
-                ("size", wintypes.WORD), ("count", wintypes.WORD), ("reserved2", wintypes.WORD)]
+def _windows_open(path, *, directory, security=False, missing=False):
+    access = w32.FILE_READ_ATTRIBUTES | (w32.READ_CONTROL if security else 0)
+    # BACKUP_SEMANTICS only for folders: on a file an enabled SeBackupPrivilege would bypass the file's DACL.
+    flags = w32.FILE_FLAG_OPEN_REPARSE_POINT | (w32.FILE_FLAG_BACKUP_SEMANTICS if directory else 0)
+    try:
+        handle = w32.open_file(str(path), access, w32.FILE_SHARE_READ | w32.FILE_SHARE_WRITE, w32.OPEN_EXISTING, flags)
+    except OSError as error:
+        if missing and error.winerror in (w32.ERROR_FILE_NOT_FOUND, w32.ERROR_PATH_NOT_FOUND):
+            return None
+        _hold("private-path-access-refused")
+    try:
+        _windows_info(handle, path, directory=directory)
+        return handle
+    except BaseException:
+        handle.close()
+        raise
 
 
-class _ACE(ctypes.Structure):
-    _fields_ = [("kind", ctypes.c_ubyte), ("flags", ctypes.c_ubyte),
-                ("size", wintypes.WORD), ("mask", wintypes.DWORD)]
+def _windows_validate(handle, *, directory):
+    try:
+        w32.validate_private(handle, directory=directory, exact=False)
+    except w32.PrivacyRefusal as error:
+        _hold(error.code)
 
 
-class _WindowsSecurity:
-    """Narrow Win32 bindings; deliberately no permission-editing API."""
-    def __init__(self):
-        if os.name != "nt" or not hasattr(ctypes, "WinDLL"):
-            _hold("private-windows-api-unavailable")
-        try:
-            self.kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-            self.advapi = ctypes.WinDLL("advapi32", use_last_error=True)
-        except OSError:
-            _hold("private-windows-api-unavailable")
-        pointer = ctypes.c_void_p
-        self._bind(self.kernel, "GetCurrentProcess", [], wintypes.HANDLE)
-        self._bind(self.kernel, "CloseHandle", [wintypes.HANDLE], wintypes.BOOL)
-        self._bind(self.kernel, "LocalFree", [pointer], pointer)
-        self._bind(self.kernel, "CreateFileW", [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
-                   pointer, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE], wintypes.HANDLE)
-        self._bind(self.kernel, "CreateDirectoryW", [wintypes.LPCWSTR, ctypes.POINTER(_SecurityAttributes)], wintypes.BOOL)
-        self._bind(self.kernel, "GetFileInformationByHandle", [wintypes.HANDLE, ctypes.POINTER(_Info)], wintypes.BOOL)
-        self._bind(self.kernel, "GetFinalPathNameByHandleW", [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD], wintypes.DWORD)
-        self._bind(self.kernel, "GetFileType", [wintypes.HANDLE], wintypes.DWORD)
-        self._bind(self.kernel, "GetDriveTypeW", [wintypes.LPCWSTR], wintypes.UINT)
-        self._bind(self.kernel, "GetVolumeInformationByHandleW", [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD,
-                   ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(wintypes.DWORD),
-                   wintypes.LPWSTR, wintypes.DWORD], wintypes.BOOL)
-        self._bind(self.kernel, "WriteFile", [wintypes.HANDLE, pointer, wintypes.DWORD,
-                   ctypes.POINTER(wintypes.DWORD), pointer], wintypes.BOOL)
-        self._bind(self.kernel, "FlushFileBuffers", [wintypes.HANDLE], wintypes.BOOL)
-        self._bind(self.advapi, "OpenProcessToken", [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)], wintypes.BOOL)
-        self._bind(self.advapi, "GetTokenInformation", [wintypes.HANDLE, ctypes.c_int, pointer,
-                   wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)], wintypes.BOOL)
-        self._bind(self.advapi, "ConvertSidToStringSidW", [pointer, ctypes.POINTER(pointer)], wintypes.BOOL)
-        self._bind(self.advapi, "ConvertStringSecurityDescriptorToSecurityDescriptorW", [wintypes.LPCWSTR,
-                   wintypes.DWORD, ctypes.POINTER(pointer), ctypes.POINTER(wintypes.DWORD)], wintypes.BOOL)
-        self._bind(self.advapi, "GetSecurityInfo", [wintypes.HANDLE, ctypes.c_int, wintypes.DWORD,
-                   ctypes.POINTER(pointer), pointer, ctypes.POINTER(pointer), pointer, ctypes.POINTER(pointer)], wintypes.DWORD)
-        self._bind(self.advapi, "GetSecurityDescriptorControl", [pointer, ctypes.POINTER(wintypes.WORD),
-                   ctypes.POINTER(wintypes.DWORD)], wintypes.BOOL)
-        self._bind(self.advapi, "IsValidAcl", [pointer], wintypes.BOOL)
-        self._bind(self.advapi, "GetAce", [pointer, wintypes.DWORD, ctypes.POINTER(pointer)], wintypes.BOOL)
-        self._bind(self.advapi, "IsValidSid", [pointer], wintypes.BOOL)
-        self._bind(self.advapi, "GetLengthSid", [pointer], wintypes.DWORD)
-        self.user = self._token_user()
-        self.allowed = {self.user, "S-1-5-18", "S-1-5-32-544"}
-
-    @staticmethod
-    def _bind(library, name, arguments, result):
-        try:
-            function = getattr(library, name)
-        except AttributeError:
-            _hold("private-windows-api-unavailable")
-        function.argtypes, function.restype = arguments, result
-
-    def close(self, handle):
-        if handle not in (None, 0, ctypes.c_void_p(-1).value):
-            self.kernel.CloseHandle(handle)
-
-    def _sid_text(self, sid):
-        if not sid or not self.advapi.IsValidSid(sid):
-            _hold("private-owner-or-acl-invalid")
-        text = ctypes.c_void_p()
-        if not self.advapi.ConvertSidToStringSidW(sid, ctypes.byref(text)):
-            _hold("private-owner-or-acl-unavailable")
-        try:
-            return ctypes.wstring_at(text)
-        finally:
-            self.kernel.LocalFree(text)
-
-    def _token_user(self):
-        token = wintypes.HANDLE()
-        if not self.advapi.OpenProcessToken(self.kernel.GetCurrentProcess(), 8, ctypes.byref(token)):
-            _hold("private-token-unavailable")
-        try:
-            size = wintypes.DWORD()
-            self.advapi.GetTokenInformation(token, 1, None, 0, ctypes.byref(size))
-            if not 8 <= size.value <= 65536:
-                _hold("private-token-unavailable")
-            buffer = ctypes.create_string_buffer(size.value)
-            if not self.advapi.GetTokenInformation(token, 1, buffer, size, ctypes.byref(size)):
-                _hold("private-token-unavailable")
-            return self._sid_text(ctypes.c_void_p.from_buffer(buffer).value)
-        finally:
-            self.close(token)
-
-    @contextmanager
-    def descriptor(self, *, directory):
-        inherit = "OICI" if directory else ""
-        # This text remains in memory. Never include it or its identities in errors/evidence.
-        principals = list(dict.fromkeys((self.user, "S-1-5-18", "S-1-5-32-544")))
-        sddl = "O:" + self.user + "D:P" + "".join("(A;" + inherit + ";FA;;;" + sid + ")" for sid in principals)
-        descriptor = ctypes.c_void_p()
-        size = wintypes.DWORD()
-        if not self.advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1, ctypes.byref(descriptor), ctypes.byref(size)):
-            _hold("private-descriptor-unavailable")
-        try:
-            yield _SecurityAttributes(ctypes.sizeof(_SecurityAttributes), descriptor, False)
-        finally:
-            self.kernel.LocalFree(descriptor)
-
-    def info(self, handle, path, *, directory):
-        info = _Info()
-        if not self.kernel.GetFileInformationByHandle(handle, ctypes.byref(info)) or self.kernel.GetFileType(handle) != 1:
-            _hold("private-file-metadata-unavailable")
-        if info.attributes & 0x400 or bool(info.attributes & 0x10) != directory or (not directory and info.links != 1):
-            _hold("private-link-or-type-refused")
-        buffer = ctypes.create_unicode_buffer(32768)
-        count = self.kernel.GetFinalPathNameByHandleW(handle, buffer, len(buffer), 0)
-        if not 0 < count < len(buffer) or not buffer.value.startswith("\\\\?\\"):
-            _hold("private-canonical-path-unavailable")
-        if buffer.value[4:].rstrip("\\").casefold() != str(path).rstrip("\\").casefold():
-            _hold("private-canonical-path-mismatch")
-        return info
-
-    def open(self, path, *, directory, security=False, missing=False):
-        handle = self.kernel.CreateFileW(str(path), 0x80 | (0x20000 if security else 0),
-                                        3, None, 3, 0x02200000, None)
-        if handle == ctypes.c_void_p(-1).value:
-            error = ctypes.get_last_error()
-            if missing and error in (2, 3):
-                return None
-            _hold("private-path-access-refused")
-        try:
-            self.info(handle, path, directory=directory)
-            return handle
-        except BaseException:
-            self.close(handle)
-            raise
-
-    def validate(self, handle, *, directory):
-        owner, dacl, descriptor = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p()
-        result = self.advapi.GetSecurityInfo(handle, 1, 5, ctypes.byref(owner), None,
-                                             ctypes.byref(dacl), None, ctypes.byref(descriptor))
-        try:
-            if result or not descriptor.value or not dacl.value:
-                _hold("private-dacl-unavailable-or-null")
-            control, revision = wintypes.WORD(), wintypes.DWORD()
-            if not self.advapi.GetSecurityDescriptorControl(descriptor, ctypes.byref(control), ctypes.byref(revision)):
-                _hold("private-dacl-unavailable")
-            if not control.value & 4 or (directory and not control.value & 0x1000):
-                _hold("private-dacl-unprotected")
-            if self._sid_text(owner) != self.user:
-                _hold("private-owner-refused")
-            if not self.advapi.IsValidAcl(dacl):
-                _hold("private-dacl-invalid")
-            acl = ctypes.cast(dacl, ctypes.POINTER(_ACL)).contents
-            if not 1 <= acl.count <= 256:
-                _hold("private-dacl-unsupported")
-            user_access = False
-            user_inheritance = not directory
-            for index in range(acl.count):
-                address = ctypes.c_void_p()
-                if not self.advapi.GetAce(dacl, index, ctypes.byref(address)):
-                    _hold("private-dacl-unavailable")
-                ace = ctypes.cast(address, ctypes.POINTER(_ACE)).contents
-                if ace.kind != 0 or ace.flags & ~0x13 or ace.size < 16:
-                    _hold("private-dacl-unsupported")
-                sid = address.value + 8
-                if not self.advapi.IsValidSid(sid) or self.advapi.GetLengthSid(sid) > ace.size - 8:
-                    _hold("private-dacl-invalid")
-                principal = self._sid_text(sid)
-                if principal not in self.allowed:
-                    _hold("private-dacl-broad-or-unknown")
-                if principal == self.user and (ace.mask & 0x1F01FF == 0x1F01FF or ace.mask & 0x10000000):
-                    user_access = True
-                    if ace.flags & 3 == 3:
-                        user_inheritance = True
-            if not user_access or not user_inheritance:
-                _hold("private-dacl-inheritance-or-access-refused")
-            serial, maximum, flags = wintypes.DWORD(), wintypes.DWORD(), wintypes.DWORD()
-            if not self.kernel.GetVolumeInformationByHandleW(handle, None, 0, ctypes.byref(serial),
-                        ctypes.byref(maximum), ctypes.byref(flags), None, 0) or not flags.value & 8:
-                _hold("private-persistent-acl-unavailable")
-        finally:
-            if descriptor.value:
-                self.kernel.LocalFree(descriptor)
-
-    def create_directory(self, path):
-        with self.descriptor(directory=True) as attributes:
-            if not self.kernel.CreateDirectoryW(str(path), ctypes.byref(attributes)):
+def _windows_create_directory(path):
+    try:
+        with w32.private_security(directory=True) as attributes:
+            try:
+                w32.create_directory(str(path), attributes)
+            except OSError:
                 _hold("private-directory-create-refused")
+    except OSError:
+        _hold("private-descriptor-unavailable")
 
 
 @contextmanager
 def _windows_directory(path, *, create, parents, exist_ok):
-    api = _WindowsSecurity()
-    if api.kernel.GetDriveTypeW(path.anchor) != 3:
+    _windows_api()
+    if w32.drive_type(path.anchor) != w32.DRIVE_FIXED:
         _hold("private-fixed-local-volume-required")
-    held = []
-    try:
+    with ExitStack() as held:
         current = Path(path.anchor)
-        held.append(api.open(current, directory=True))
+        last = held.enter_context(_windows_open(current, directory=True))
         parts = path.parts[1:]
         for index, part in enumerate(parts):
             current /= part
             target = index == len(parts) - 1
-            handle = api.open(current, directory=True, security=target, missing=True)
+            handle = _windows_open(current, directory=True, security=target, missing=True)
             if handle is None:
                 if not create or (not target and not parents):
                     _hold("private-directory-missing")
-                api.create_directory(current)
-                handle = api.open(current, directory=True, security=True)
-                held.append(handle)
-                api.validate(handle, directory=True)
+                _windows_create_directory(current)
+                last = held.enter_context(_windows_open(current, directory=True, security=True))
+                _windows_validate(last, directory=True)
             else:
-                held.append(handle)
+                last = held.enter_context(handle)
                 if target:
                     if create and not exist_ok:
                         _hold("private-directory-exists")
-                    api.validate(handle, directory=True)
+                    _windows_validate(last, directory=True)
         yield path
-        api.info(held[-1], path, directory=True)
-        api.validate(held[-1], directory=True)
-    finally:
-        for handle in reversed(held):
-            api.close(handle)
+        _windows_info(last, path, directory=True)
+        _windows_validate(last, directory=True)
 
 
 def _posix_info(path, *, directory, private):
@@ -426,22 +283,15 @@ def ensure_private_file(path):
         _posix_capability()
     path = _absolute(path)
     if os.name == "nt":
-        api = _WindowsSecurity()
-        held = []
-        try:
+        _windows_api()
+        with ExitStack() as held:
             current = Path(path.anchor)
-            held.append(api.open(current, directory=True))
+            held.enter_context(_windows_open(current, directory=True))
             for part in path.parent.parts[1:]:
                 current /= part
-                held.append(api.open(current, directory=True))
-            handle = api.open(path, directory=False, security=True)
-            try:
-                api.validate(handle, directory=False)
-            finally:
-                api.close(handle)
-        finally:
-            for handle in reversed(held):
-                api.close(handle)
+                held.enter_context(_windows_open(current, directory=True))
+            with _windows_open(path, directory=False, security=True) as handle:
+                _windows_validate(handle, directory=False)
     else:
         if os.name != "posix":
             _hold("private-platform-unavailable")
@@ -458,26 +308,36 @@ def write_private_new(path, data):
         _hold("private-bytes-required")
     with private_directory(path.parent):
         if os.name == "nt":
-            api = _WindowsSecurity()
-            with api.descriptor(directory=False) as attributes:
-                handle = api.kernel.CreateFileW(str(path), 0xC0020080, 0, ctypes.byref(attributes), 1, 0x00200080, None)
-            if handle == ctypes.c_void_p(-1).value:
-                _hold("private-file-create-refused")
+            _windows_api()
             try:
-                api.info(handle, path, directory=False)
-                api.validate(handle, directory=False)
+                with w32.private_security(directory=False) as attributes:
+                    try:
+                        handle = w32.open_file(str(path), w32.GENERIC_READ | w32.GENERIC_WRITE | w32.READ_CONTROL, 0,
+                                               w32.CREATE_NEW,
+                                               w32.FILE_FLAG_OPEN_REPARSE_POINT | w32.FILE_ATTRIBUTE_NORMAL, attributes)
+                    except OSError:
+                        _hold("private-file-create-refused")
+            except OSError:
+                _hold("private-descriptor-unavailable")
+            with handle:
+                _windows_info(handle, path, directory=False)
+                _windows_validate(handle, directory=False)
+                # The C runtime descriptor gives the standard os.write and os.fsync (FlushFileBuffers).
+                descriptor = handle.to_fd(os.O_WRONLY | os.O_BINARY)
                 for start in range(0, len(data), 1024 * 1024):
                     chunk = data[start:start + 1024 * 1024]
-                    buffer = ctypes.create_string_buffer(chunk)
-                    count = wintypes.DWORD()
-                    if not api.kernel.WriteFile(handle, buffer, len(chunk), ctypes.byref(count), None) or count.value != len(chunk):
+                    try:
+                        count = os.write(descriptor, chunk)
+                    except OSError:
+                        count = -1
+                    if count != len(chunk):
                         _hold("private-file-write-unresolved")
-                if not api.kernel.FlushFileBuffers(handle):
+                try:
+                    os.fsync(descriptor)
+                except OSError:
                     _hold("private-file-flush-unresolved")
-                api.info(handle, path, directory=False)
-                api.validate(handle, directory=False)
-            finally:
-                api.close(handle)
+                _windows_info(handle, path, directory=False)
+                _windows_validate(handle, directory=False)
         else:
             try:
                 handle = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)

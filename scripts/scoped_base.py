@@ -10,7 +10,8 @@ Records have the keys in RECORD_KEYS on every backend:
   - mode is a POSIX st_mode. Windows backends synthesise it as os.stat does:
     0o100666 for a file, 0o100444 for a file with the read-only attribute,
     0o040777 for a directory;
-  - attributes are the Windows file attributes (0 on POSIX);
+  - attributes are the Windows file attributes without the archive bit, which Windows sets
+    on a rename, and without NORMAL, which only means that no other bit is set (0 on POSIX);
   - device and inode are non-negative integers (on Windows the volume serial
     number and the 64-bit file index), inode never 0 for a file;
   - sha256 is the content hash or None.
@@ -45,6 +46,13 @@ MORE_EXCLUDED = "more"
 # The only temporary names backends create and reconciliation may remove; a user's own
 # ".partial-notes.docx" never matches.
 PARTIAL_NAME = re.compile(r"\.partial-[0-9a-f]{32}\Z")
+# The one plain-language note of a backup destination that cannot keep files private (RootBase.privacy_note).
+NON_PRIVATE_NOTE = ("This drive cannot keep the backup private: anyone who can use the drive, here or on another "
+                    "computer, can open the backup.")
+# Destination volumes (plan RR2-4): FAT32 holds no file of 4 GiB or more, and FAT, exFAT and vfat give a file
+# another id when it is renamed or listed again, so files there are bound by size and SHA-256.
+FAT32_MAX_FILE_BYTES = (1 << 32) - 1
+UNSTABLE_ID_KEYS = frozenset({"relative_path", "kind", "size"})
 _INTEGER_KEYS = ("device", "inode", "mode", "size", "mtime_ns", "ctime_ns", "nlink", "attributes")
 _HEX = frozenset("0123456789abcdef")
 _WINDOWS_READ_ONLY = 0x1
@@ -85,6 +93,41 @@ def relative_path(value, *, allow_root=False):
 def new_partial_name():
     """A fresh temporary file name that matches PARTIAL_NAME."""
     return ".partial-" + uuid.uuid4().hex
+
+
+def partial_name(value=None):
+    """The temporary name for open_new: ``value`` if it is a name made by new_partial_name() (the caller recorded it
+    first, so reconciliation can remove it after a crash), a fresh name if it is None; anything else is refused."""
+    if value is None:
+        return new_partial_name()
+    if not isinstance(value, str) or not PARTIAL_NAME.fullmatch(value):
+        refuse("invalid-option", "partial must be a name made by new_partial_name()")
+    return value
+
+
+def destination_facts(volume, *, non_private_destination, stable_ids):
+    """The admission facts a backup destination root sets, from the kind of volume its backend found.
+
+    ``volume`` is "private" (a fixed drive whose file system keeps permissions), "non-private" (a removable
+    drive, or a file system without permissions such as exFAT or vfat), "fat32" (non-private, files below
+    4 GiB) or anything else (refused with destination-volume-unsupported). A non-private volume needs the
+    owner's typed acknowledgment ``non_private_destination=True``; without it the CapabilityHold
+    non-private-destination-acknowledgment-required carries NON_PRIVATE_NOTE. ``stable_ids`` is True only
+    if the file system keeps file ids across mounts (NTFS: yes; exFAT, vfat: no); "fat32" never does, so
+    its identity keys are always UNSTABLE_ID_KEYS.
+    """
+    if type(non_private_destination) is not bool:
+        refuse("invalid-option", "non_private_destination must be boolean")
+    keys = IDENTITY_KEYS if stable_ids and volume != "fat32" else UNSTABLE_ID_KEYS
+    if volume == "private":
+        return {"destination": True, "private": True, "privacy_note": None, "max_file_bytes": MAX_STREAM_BYTES,
+                "identity_keys": keys}
+    if volume not in ("non-private", "fat32"):
+        refuse("destination-volume-unsupported", "Backups go to a local drive that PatchCairn can write safely")
+    if not non_private_destination:
+        raise CapabilityHold("non-private-destination-acknowledgment-required", NON_PRIVATE_NOTE)
+    return {"destination": True, "private": False, "privacy_note": NON_PRIVATE_NOTE,
+            "max_file_bytes": FAT32_MAX_FILE_BYTES if volume == "fat32" else MAX_STREAM_BYTES, "identity_keys": keys}
 
 
 def name_reason(parent, name):
@@ -132,7 +175,8 @@ def expected_record(value, relative, *, hashed=True):
             or value["relative_path"] != relative
             or not (_sha256_text(value["sha256"]) or (not hashed and value["sha256"] is None))):
         refuse("expected-record", "An exact ordinary-file record for this relative path is required")
-    if (any(type(value[key]) is not int or value[key] < 0 for key in _INTEGER_KEYS)
+    # Times before 1970 are negative and stay admissible; every other integer is non-negative.
+    if (any(type(value[key]) is not int or (value[key] < 0 and key not in ("mtime_ns", "ctime_ns")) for key in _INTEGER_KEYS)
             or not stat.S_ISREG(value["mode"]) or value["inode"] == 0 or value["nlink"] != 1
             or value["size"] > MAX_STREAM_BYTES):
         refuse("expected-record", "Expected native file identity is malformed or unbounded")
@@ -194,7 +238,10 @@ def hash_stream(handle, size, writer=None):
 
 
 class ReadFile(Protocol):
-    """Seekable binary reader from RootBase.open_read, pinned to one file for its lifetime."""
+    """Seekable binary reader from RootBase.open_read, pinned to one file for its lifetime.
+
+    Unbuffered: wrap it in io.BufferedReader for many small reads.
+    """
 
     def read(self, size: int = -1) -> bytes: ...
     def seek(self, offset: int, whence: int = 0) -> int: ...
@@ -206,10 +253,12 @@ class ReadFile(Protocol):
 class NewFile(Protocol):
     """Seekable binary file from RootBase.open_new, written under a PARTIAL_NAME temporary name.
 
-    commit() flushes and syncs the file and its parent, re-checks privacy,
-    renames without replacing anything and checks identity; it returns the file
-    record plus ``durable`` (True only if both syncs succeeded). Leaving the
-    ``with`` block without commit removes the temporary file.
+    commit() syncs the file and its parent, re-checks privacy, renames without
+    replacing anything, checks identity, then syncs the file and its parent again
+    so the new name is on disk too. It returns the file record plus ``durable``:
+    True only if both syncs, before and after the rename, succeeded. Leaving the
+    ``with`` block without commit removes the temporary file. Unbuffered: wrap it in
+    io.BufferedRandom for many small writes and flush that before commit().
     """
 
     def write(self, data: bytes) -> int: ...
@@ -227,13 +276,23 @@ class RootBase(abc.ABC):
     follows them, and refuses an opened component whose stored name differs from
     the requested one other than by case (for example an 8.3 alias). Explicitly
     naming a link, special file, hard-linked file or unportable name is refused;
-    listings report such entries as "not included".
+    listings report such entries as "not included". One caller thread uses a
+    root at a time. Where full paths are bounded, the longest path a root can
+    create is shorter than the longest it lists (open_new); callers check each
+    new file with admit_new() before writing anything.
     """
 
     max_entries = MAX_ENTRIES
     # A root on a file system without stable file ids (FAT, exFAT) narrows this, for example to
     # {"relative_path", "kind", "size"}; the SHA-256 is still compared.
     identity_keys = IDENTITY_KEYS
+    # Admission facts (plan RR2-4). A source keeps these defaults; a backup destination sets the values
+    # destination_facts() returns.
+    destination = False
+    private = True
+    privacy_note = None
+    # The volume's cap on one file or MAX_STREAM_BYTES, whichever is smaller (FAT32: 4 GiB - 1).
+    max_file_bytes = MAX_STREAM_BYTES
 
     @abc.abstractmethod
     def close(self) -> None:
@@ -263,11 +322,21 @@ class RootBase(abc.ABC):
         """
 
     @abc.abstractmethod
-    def open_new(self, relative: str, *, private: bool = True,
-                 original_mode: int | None = None) -> AbstractContextManager[NewFile]:
+    def open_new(self, relative: str, *, private: bool = True, original_mode: int | None = None,
+                 partial: str | None = None) -> AbstractContextManager[NewFile]:
         """Create a temporary file that commit() names ``relative`` without replacing anything.
 
-        It is private before the first byte. ``private=False`` is only for restoring into an existing
+        Its name is partial_name(partial): a name the caller made with new_partial_name() and recorded
+        first, or a fresh one. A temporary name already in use is refused with destination-exists, the code
+        a taken final name gets, and is never reused.
+
+        The temporary file sits in the same folder, so where full paths are bounded the longest path that
+        can be created is shorter than the longest that can be read: on Windows the folder's full path
+        plus a backslash and the 41-unit temporary name must fit in 240 UTF-16 units. admit_new() checks
+        this, with the name and the size, before anything is written.
+
+        When root.private is True, the file is private before its first byte (a destination admitted as
+        not private has no private files). ``private=False`` is only for restoring into an existing
         folder that an exact reviewed restore plan lists, and needs ``original_mode``, the original
         file's recorded mode (see new_file_mode): Windows validates it and creates the file with the
         folder's inherited permissions; POSIX creates it with that mode masked to at most 0o644, under
@@ -296,6 +365,16 @@ class RootBase(abc.ABC):
     @abc.abstractmethod
     def free_bytes(self) -> int:
         """Bytes available to this process on the root's volume."""
+
+    def admit_new(self, relative: str, expected_bytes: int) -> None:
+        """Refuse, before anything is written, what open_new(relative) would refuse for the name or the path
+        length, and an ``expected_bytes`` above max_file_bytes. A backend that bounds full paths also checks the
+        temporary file's path (see open_new). A missing folder or a name in use is found only by open_new."""
+        relative_path(relative)
+        if type(expected_bytes) is not int or expected_bytes < 0:
+            refuse("invalid-cap", "The expected size must be a non-negative integer")
+        if expected_bytes > self.max_file_bytes:
+            refuse("file-too-large-for-volume", "The file would exceed the largest file this drive can hold")
 
     def __enter__(self):
         return self
