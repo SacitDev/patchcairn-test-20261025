@@ -326,6 +326,9 @@ class WindowsIoTests(Fixture):
             if io_threads():
                 sys.exit(f"{len(io_threads())} file I/O thread(s) still alive 10 seconds after the warm-up root closed "
                          f"(idents {[thread.ident for thread in io_threads()]})")
+            # The counts must not include roots this driver still holds: before Python 3.13, each lock in a closed root on
+            # Windows (its thread's event, its queue, its last job's event) holds a kernel semaphore.
+            del warm
             gc.collect()
             before = handle_count()
             gc.disable()  # a handle that only the garbage collector would release stays counted
@@ -345,6 +348,7 @@ class WindowsIoTests(Fixture):
                         operations += 8
                     refused(windows_scoped.WindowsRoot, sys.argv[3])
                     operations += 1
+            del root  # the last closed root, still named by the loop
             alive = io_threads()  # no wait: close() has already joined each root's thread
             after = handle_count()  # no wait and no collection
             print(json.dumps({"operations": operations, "before": before, "after": after, "io_threads": len(alive),
