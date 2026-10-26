@@ -289,38 +289,61 @@ class ReadonlyRunnerTests(unittest.TestCase):
         alias = routes.winget_alias_path(LOCAL_APPDATA)
         target = ntpath.join("C:\\Program Files", "WindowsApps", APP_FOLDER, "winget.exe")
         good = FakeProbe(platform="win32", aliases={alias: appexec_buffer([routes.WINGET_PACKAGE, routes.WINGET_PACKAGE + "!winget", target])})
-        record = readonly_runner.recheck_executable("winget", alias, None, probe=good)
+        record = readonly_runner.executable_identity("winget", alias, probe=good)
         self.assertEqual(record, {"package": APP_FOLDER})
         self.assertEqual(readonly_runner.recheck_executable("winget", alias.upper(), record, probe=good), record)
         other_family = FakeProbe(platform="win32", aliases={alias: appexec_buffer(["Contoso.Notes_abc123", "Contoso.Notes_abc123!App", target])})
-        for probe, path, identity in ((other_family, alias, None), (other_family, alias, record), (good, alias, {"package": "Microsoft.DesktopAppInstaller_9.9.9.9_x64__8wekyb3d8bbwe"}),
-                                      (good, "D:\\PatchCairnTest\\Other\\winget.exe", None), (FakeProbe(platform="win32", tags={alias: 0}), alias, None)):
+        for probe, path, identity in ((other_family, alias, record), (good, alias, {"package": "Microsoft.DesktopAppInstaller_9.9.9.9_x64__8wekyb3d8bbwe"}),
+                                      (good, "D:\\PatchCairnTest\\Other\\winget.exe", record), (FakeProbe(platform="win32", tags={alias: 0}), alias, record)):
             with self.subTest(winget=(path, identity)), self.assertRaises(Refusal):
                 readonly_runner.recheck_executable("winget", path, identity, probe=probe)
-        # A POSIX system tool: listed folder, root-owned ancestry, identified by its resolved file.
-        self.assertEqual(readonly_runner.recheck_executable("system", "/usr/bin/apt-cache", None, probe=FakeProbe()), {"real_path": "/usr/bin/apt-cache"})
-        self.assertEqual(readonly_runner.recheck_executable("system", "/usr/bin/dnf", {"real_path": "/usr/bin/dnf5"}, probe=FakeProbe()),
+        with self.assertRaises(Refusal):
+            readonly_runner.executable_identity("winget", alias, probe=other_family)
+        # A POSIX system tool is the recipe's own program: listed folder, root-owned ancestry, recorded by its location.
+        tools = {"/usr/bin/sudo": regular(), "/usr/bin/bash": regular()}
+        self.assertEqual(readonly_runner.executable_identity("system", "/usr/bin/apt-cache", program="/usr/bin/apt-cache", probe=FakeProbe()),
+                         {"real_path": "/usr/bin/apt-cache"})
+        self.assertEqual(readonly_runner.recheck_executable("system", "/usr/bin/dnf", {"real_path": "/usr/bin/dnf5"}, program="/usr/bin/dnf", probe=FakeProbe()),
                          {"real_path": "/usr/bin/dnf5"})
-        for probe, path, identity in ((FakeProbe(files={"/usr/bin/apt-cache": regular(1000)}), "/usr/bin/apt-cache", None),
-                                      (FakeProbe(files=OUTSIDE), "/usr/local/bin/uname", None), (FakeProbe(), "/usr/bin/dnf", {"real_path": "/usr/bin/dnf4"}),
-                                      (FakeProbe(), "apt-cache", None)):
-            with self.subTest(system=(path, identity)), self.assertRaises(Refusal):
-                readonly_runner.recheck_executable("system", path, identity, probe=probe)
+        self.assertEqual(readonly_runner.executable_identity("system", "/usr/bin/sudo", program="/usr/bin/sudo", probe=FakeProbe(files=tools)),
+                         {"real_path": "/usr/bin/sudo"})
+        for probe, path, program, identity in ((FakeProbe(files={"/usr/bin/apt-cache": regular(1000)}), "/usr/bin/apt-cache", "/usr/bin/apt-cache", None),
+                                               (FakeProbe(files=OUTSIDE), "/usr/local/bin/uname", "/usr/local/bin/uname", None),
+                                               (FakeProbe(), "/usr/bin/dnf", "/usr/bin/dnf", {"real_path": "/usr/bin/dnf4"}),
+                                               (FakeProbe(), "apt-cache", "apt-cache", None),
+                                               # Another root-owned tool in a listed folder is not the recipe's program.
+                                               (FakeProbe(files=tools), "/usr/bin/bash", "/usr/bin/sudo", None),
+                                               (FakeProbe(files=tools), "/usr/bin/sudo", None, None)):
+            with self.subTest(system=(path, program, identity)), self.assertRaises(Refusal):
+                if identity is None:
+                    readonly_runner.executable_identity("system", path, program=program, probe=probe)
+                else:
+                    readonly_runner.recheck_executable("system", path, identity, program=program, probe=probe)
         # A Windows system tool is a plain file in the system folder.
         whoami = ntpath.join(SYSTEM_DIR, "whoami.exe")
-        self.assertEqual(readonly_runner.recheck_executable("system", whoami, None, probe=FakeProbe(platform="win32")), {"real_path": whoami})
-        with self.assertRaises(Refusal):
-            readonly_runner.recheck_executable("system", "C:\\Tools\\whoami.exe", None, probe=FakeProbe(platform="win32"))
+        self.assertEqual(readonly_runner.executable_identity("system", whoami, program="whoami.exe", probe=FakeProbe(platform="win32")), {"real_path": whoami})
+        for path, program in (("C:\\Tools\\whoami.exe", "whoami.exe"), (whoami, "cmd.exe")):
+            with self.subTest(windows=(path, program)), self.assertRaises(Refusal):
+                readonly_runner.executable_identity("system", path, program=program, probe=FakeProbe(platform="win32"))
         # Homebrew at its documented prefix, owned by this account.
         mac = FakeProbe(platform="darwin")
-        self.assertEqual(readonly_runner.recheck_executable("brew", "/opt/homebrew/bin/brew", None, probe=mac), {"real_path": "/opt/homebrew/bin/brew"})
+        self.assertEqual(readonly_runner.executable_identity("brew", "/opt/homebrew/bin/brew", probe=mac), {"real_path": "/opt/homebrew/bin/brew"})
         for probe, path in ((FakeProbe(platform="darwin", files={"/opt/homebrew/bin/brew": regular(0)}), "/opt/homebrew/bin/brew"),
                             (mac, "/usr/local/bin/brew"), (FakeProbe(platform="linux"), "/opt/homebrew/bin/brew")):
             with self.subTest(brew=path), self.assertRaises(Refusal):
-                readonly_runner.recheck_executable("brew", path, None, probe=probe)
+                readonly_runner.executable_identity("brew", path, probe=probe)
         for kind, path in (("python", "/usr/bin/python3"), ("node", "/usr/bin/node"), (None, "/usr/bin/apt-cache"), ("system", None), ("system", "")):
             with self.subTest(kind=kind, path=path), self.assertRaises(Refusal):
-                readonly_runner.recheck_executable(kind, path, None, probe=FakeProbe())
+                readonly_runner.executable_identity(kind, path, program="/usr/bin/apt-cache", probe=FakeProbe())
+
+    def test_recheck_needs_the_identity_recorded_at_plan_time(self):
+        # A run never skips the comparison: a missing identity is refused, it does not record a new one.
+        for identity in (None, {}, [], "/usr/bin/apt-cache"):
+            with self.subTest(identity=identity), self.assertRaises(Refusal) as caught:
+                readonly_runner.recheck_executable("system", "/usr/bin/apt-cache", identity, program="/usr/bin/apt-cache", probe=FakeProbe())
+            self.assertEqual(caught.exception.code, "runner-executable-changed")
+        record = readonly_runner.executable_identity("system", "/usr/bin/apt-cache", program="/usr/bin/apt-cache", probe=FakeProbe())
+        self.assertEqual(readonly_runner.recheck_executable("system", "/usr/bin/apt-cache", record, program="/usr/bin/apt-cache", probe=FakeProbe()), record)
 
     def test_executable_prefix_empty_for_existing_kinds(self):
         for kind in ("winget", "system", "brew"):

@@ -58,7 +58,7 @@ class AcknowledgmentTests(TypedReplyHelpers, WorkflowFixture):
         self.approve(phrase, "typed-ids")
         state = self.state()
         action = state["plan"]["document"]["actions"][0]
-        self.assertIsNone(engine_operations.typed_reply_covers(state, action))
+        self.assertIsNone(engine_operations._typed_reply_covers(state, action))
         # Another action id, with every other field of the reply and the warning unchanged, is not covered; nor is a plain approval.
         other, plain = copy.deepcopy(state), copy.deepcopy(state)
         for record in (other["approval"]["irreversible"], other["irreversible_warning"]):
@@ -66,7 +66,7 @@ class AcknowledgmentTests(TypedReplyHelpers, WorkflowFixture):
         plain["approval"]["irreversible"] = None
         for label, changed in (("other ids", other), ("plain approval", plain)):
             with self.subTest(label), self.assertRaises(WorkflowRefusal) as caught:
-                engine_operations.typed_reply_covers(changed, action)
+                engine_operations._typed_reply_covers(changed, action)
             self.assertEqual(caught.exception.code, "typed-reply-required")
         self.engine.advance_stage(self.sid, evidence_ids=[])
         self.assertTrue(self.begin_action())

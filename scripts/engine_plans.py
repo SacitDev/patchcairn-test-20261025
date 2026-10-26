@@ -16,10 +16,11 @@ from engine_journal import (ASSESSMENT_ACCESS, ASSESSMENT_SUMMARY, ASSESSMENT_VE
                             EVIDENCE_MAX_NODES, FIXTURE_ADAPTER, OUTCOMES, SHA, STATE_KEYS, WorkflowRefusal, bounded_text, checked, container,
                             decode_record, exact_fields, fresh, ids, invalidate, no_links, private_directory, private_file, record_identifier, require_writable,
                             typed_record, utc_time, write_private_new)
-from engine_text import CHECKPOINTS, JOBS, STAGE_LABELS, initial_menu, irreversible_phrase, response, typed_reply
+from engine_decisions import reply_matches
+from engine_text import CHECKPOINTS, JOBS, STAGE_LABELS, initial_menu, irreversible_phrase, response
 import pc_paths
 import pc_records
-from pc_records import SCHEMA_VERSION, digest, encoded
+from pc_records import SCHEMA_VERSION, TYPED_ACKNOWLEDGMENTS, digest, encoded
 import storage_contract
 
 
@@ -36,8 +37,7 @@ EVIDENCE_KINDS |= {"adapter_payload", "recovery_manifest", "restore_verification
 MAX_FACT_ITEMS = pc_records.MAX_BACKUP_ENTRIES
 # Facts are copied into the journal state, so they stay small; large data belongs in the evidence content.
 FACTS_MAX_BYTES = 65_536
-# One typed reply to the engine's warning approves these and acknowledges them; a session keeps its replies' message ids.
-TYPED_ACKNOWLEDGMENTS = frozenset({"permanent_data_loss", "firmware_risk"})
+# A session keeps the message ids of its typed replies, at most this many.
 MAX_USED_MESSAGE_IDS = 1000
 WARNING_FIELDS = frozenset({"plan_sha256", "kind", "action_ids", "number", "bytes", "revision", "recorded_utc"})
 REPLY_FIELDS = frozenset({"type", "action_ids", "number", "bytes", "warning_revision"})
@@ -620,7 +620,7 @@ def _typed_reply(engine, state, action_ids, owner_quote, owner_message_id):
     if warning.get("plan_sha256") != state["plan"]["sha256"] or set(warning.get("action_ids", ())) != {a["action_id"] for a in typed}:
         raise WorkflowRefusal("Show this plan's warning first; the typed reply approves all warned actions together", code="typed-reply-warning")
     phrase = irreversible_phrase(warning.get("kind"), warning.get("number"))
-    if typed_reply(owner_quote) != typed_reply(phrase):
+    if not reply_matches(owner_quote, phrase):
         raise WorkflowRefusal("This step needs the owner's exact typed reply: " + phrase, code="typed-reply-mismatch")
     if owner_message_id in state["used_message_ids"] or used_message_id(engine, owner_message_id):
         raise WorkflowRefusal("This message was already used for a typed reply; ask the owner to reply again", code="message-id-used")

@@ -126,7 +126,7 @@ class WorkflowCliTests(unittest.TestCase):
         # The CLI and the engine's import closure: its L0 records and paths, the pure storage-payload and diagnostic
         # validators, and the private-workspace admission with its native helpers.
         names = ["workflow_core.py", "engine_journal.py", "engine_text.py", "engine_plans.py", "engine_operations.py", "engine_restart.py",
-                 "engine_updates.py", "engine_recovery.py", "engine_schedule.py", "patchcairn_workflow.py", "pc_records.py", "pc_paths.py",
+                 "engine_updates.py", "engine_recovery.py", "engine_schedule.py", "engine_decisions.py", "patchcairn_workflow.py", "pc_records.py", "pc_paths.py",
                  "storage_contract.py", "diagnostic_core.py", "private_workspace.py"]
         for dependency in ("win32_files.py", "darwin_privacy.py", "linux_privacy.py"):
             if (ROOT / "scripts" / dependency).is_file():

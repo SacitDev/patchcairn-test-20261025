@@ -35,6 +35,14 @@ PAYLOAD_REQUIRED = frozenset({"operation", "storage_plan", "storage_plan_sha256"
 # adapter whose facts list permanent data loss.
 DELETION_FIELDS = frozenset({"delete_count", "delete_bytes"})
 PAYLOAD_OPTIONAL = frozenset({"restore_probe_destination"}) | DELETION_FIELDS
+# Where each built permanent deletion's plan lists what it deletes: a purge its quarantine receipt's records (each
+# record's original), removing originals its selected files (the plan builders' "files" rows), deleting selected files
+# its rows file's totals. Retention and session release are not built yet and are refused.
+DELETION_SOURCES = MappingProxyType({
+    pc_records.ADAPTER_STORAGE_PURGE: "receipt",
+    pc_records.ADAPTER_STORAGE_REMOVE_ORIGINALS: "files",
+    pc_records.ADAPTER_STORAGE_DELETE_SELECTED: "rows_file",
+})
 # Above the service's 10,000 retention rows plus its own namespaces, so retained recovery never locks a
 # new plan out (#1); D-015 later narrows the roots to one per destination.
 MAX_PROTECTED_ROOTS = 16_384
@@ -75,6 +83,31 @@ def absolute_path(value, name):
     return value
 
 
+def deletion_size(adapter_id, plan):
+    """(number of items, bytes) that the permanent deletion ``adapter_id`` removes, read from its plan where
+    DELETION_SOURCES says (never from whichever key happens to be present); (None, None) for an adapter whose facts list
+    no permanent data loss. A plan that also carries another deletion's source, or a row size that is not an integer of
+    0 or more, is refused."""
+    if "permanent_data_loss" not in pc_records.ADAPTERS[adapter_id]["acknowledgments"]:
+        return None, None
+    source = DELETION_SOURCES.get(adapter_id)
+    if source is None:
+        _refuse("This permanent deletion is not built yet")
+    if not isinstance(plan, dict) or (set(DELETION_SOURCES.values()) - {source}) & set(plan):
+        _refuse("A permanent deletion's plan lists what it deletes in exactly one place")
+    try:
+        if source == "rows_file":
+            sizes, count = [plan["rows_file"]["row_bytes"]], plan["rows_file"]["row_count"]
+        else:
+            rows = plan["files"] if source == "files" else [record["original"] for record in plan["receipt"]["records"]]
+            sizes, count = [row["size"] for row in rows], len(rows)
+    except (KeyError, TypeError) as error:
+        raise pc_records.Refusal("storage-payload", "A permanent deletion's plan must list the items it deletes and their sizes") from error
+    if type(count) is not int or count < 1 or any(type(size) is not int or size < 0 for size in sizes):
+        _refuse("A permanent deletion's plan must list at least one item, each with a size of 0 or more bytes")
+    return count, sum(sizes)
+
+
 def validate_payload(payload, *, adapter_id, mode, plan_sha256):
     """Return the storage ``payload`` of a reviewed action if it binds exactly ``adapter_id``, ``mode`` and the
     storage plan whose digest is ``plan_sha256``; raise pc_records.Refusal otherwise."""
@@ -101,10 +134,12 @@ def validate_payload(payload, *, adapter_id, mode, plan_sha256):
         if adapter_id != pc_records.ADAPTER_STORAGE_BACKUP_CREATE:
             _refuse("Only a reviewed backup can include a restore-probe destination")
         absolute_path(payload["restore_probe_destination"], "The restore-probe destination")
-    if "permanent_data_loss" not in pc_records.ADAPTERS[adapter_id]["acknowledgments"]:
+    # The typed reply names this count and size, so they must be exactly what the plan deletes.
+    expected = deletion_size(adapter_id, plan)
+    if expected == (None, None):
         if DELETION_FIELDS & set(payload):
             _refuse("Only a permanent deletion carries a deletion count and size")
-    elif (not DELETION_FIELDS <= set(payload) or type(payload["delete_count"]) is not int or payload["delete_count"] < 1
-          or type(payload["delete_bytes"]) is not int or payload["delete_bytes"] < 0):
-        _refuse("A permanent deletion needs its number of items (at least 1) and their bytes (0 or more)")
+    elif (not DELETION_FIELDS <= set(payload) or type(payload["delete_count"]) is not int or type(payload["delete_bytes"]) is not int
+          or (payload["delete_count"], payload["delete_bytes"]) != expected):
+        _refuse("A permanent deletion's count and size must be exactly the items and bytes its plan deletes")
     return payload

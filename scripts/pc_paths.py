@@ -326,17 +326,21 @@ def _root_names(abs_path):
 
 
 def _same_name(left, right):
-    """Equal names, letter case ignored one character at a time (as NTFS compares), so a look-alike that Unicode case
-    folding would equate, such as U+212A (Kelvin sign) for "k", stays a different name."""
-    return len(left) == len(right) and all(a == b or a.upper() == b.upper() for a, b in zip(left, right))
+    """Equal names, with letter case ignored for ASCII letters only: every other character must be the same character.
+    This is stricter than the file system, which also folds the case of many non-ASCII letters, so two different
+    folders are never taken for one; a look-alike such as U+212A (Kelvin sign) for "k" or U+0131 (dotless i) for "i"
+    stays a different name."""
+    return len(left) == len(right) and all(a == b or (a.isascii() and b.isascii() and a.lower() == b.lower()) for a, b in zip(left, right))
 
 
 def _temp_exemption(abs_path, junk_root):
     """The position of the one AppData component of ``abs_path`` that the Windows temp exemption admits, or None.
 
-    ``junk_root`` must be a plain absolute Windows drive path whose last three components are AppData, Local and Temp;
-    the exempt component is its third-from-last, by position. ``abs_path`` must be on the same drive and equal to
-    ``junk_root`` or below it, compared component by component with letter case ignored. Anything else is no exemption.
+    ``junk_root`` must be a plain, long, absolute Windows drive path whose last three components are AppData, Local and
+    Temp: no \\\\?\\ or \\\\.\\ prefix, no UNC path, no 8.3 alias, no trailing dot or space, no stream and no doubled
+    separator (the caller strips a prefix and resolves the long name first). The exempt component is its third-from-last,
+    by position. ``abs_path`` must be on the same drive and equal to ``junk_root`` or below it, compared component by
+    component with ASCII letter case ignored. Anything else is no exemption.
     """
     try:
         raws = [os.fspath(abs_path), os.fspath(junk_root)]
@@ -388,8 +392,9 @@ def protected(rel, *, root=None, junk_root=None):
 
     With ``root``, the root's own components count too, so a name pair such as
     Library/Messages is found when the selection is the Library folder itself.
-    ``junk_root`` is the Windows temp folder (...\\AppData\\Local\\Temp) as the operating system reports it: when the root
-    is that folder or below it, its AppData component is not counted as private. Every other rule still applies.
+    ``junk_root`` is the Windows temp folder (...\\AppData\\Local\\Temp) as a plain long drive path (see _temp_exemption):
+    when the root is that folder or below it and every part of ``rel`` is a plain name, the root's AppData component is
+    not counted as private. Every other rule still applies.
     """
     rel = os.fspath(rel)
     if not isinstance(rel, str):
@@ -399,7 +404,9 @@ def protected(rel, *, root=None, junk_root=None):
         prefix = _root_names(root)
         if prefix is None:
             return True
-        names, exempt = prefix + names, _temp_exemption(root, junk_root)
+        # No exemption past a part that could leave the root: an empty, dot or trailing-dot-or-space part, a drive or a stream.
+        plain = rel == "" or all(name and name == name.rstrip(". ") and ":" not in name for name in names)
+        names, exempt = prefix + names, (_temp_exemption(root, junk_root) if plain else None)
     return _matches(names, exempt=exempt)
 
 

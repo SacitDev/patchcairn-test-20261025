@@ -355,6 +355,8 @@ def bounded_text(value, name="text", limit=4000):
 
 
 ACKNOWLEDGMENTS = frozenset({"permanent_data_loss", "no_component_rollback", "non_private_destination", "firmware_risk"})
+# Given only by the owner's typed reply to the engine's warning, never as a separate acknowledgment.
+TYPED_ACKNOWLEDGMENTS = frozenset({"permanent_data_loss", "firmware_risk"})
 FAMILIES = frozenset({"backup", "restore", "cleanup", "retention", "update", "repair", "assessment"})
 OS_CONSENT = ("never", "per_route", "always")
 BACKUP_RECEIPT = ("none", "optional", "required")

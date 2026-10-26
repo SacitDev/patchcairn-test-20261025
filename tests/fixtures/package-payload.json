@@ -1,10 +1,15 @@
 {
-  "description": "Frozen golden variants of the patchcairn.package payload, one per run kind: each names its adapter and platform, gives the payload and its exact canonical bytes (pc_records.encoded) and their SHA-256. transaction_sha256 is the SHA-256 of the canonical preflight. A flagged payload also carries 'conditional': an object whose keys are the decisions its flags call for (install_scripts gives run_install_scripts with the sorted exact name@version list, runtime_line_change gives runtime_line_change with an empty list). All values are fictional.",
+  "description": "Frozen golden variants of the patchcairn.package payload, one per run kind: each names its adapter and platform, gives the builder inputs that are not payload fields, the payload, its exact canonical bytes (pc_records.encoded) and their SHA-256. transaction_sha256 is digest(preflight) and environment_sha256 is digest(inputs.environment) (pc_records.digest of the canonical value); every other payload field is copied verbatim. A flagged payload also carries 'conditional': an object whose keys are the decisions its flags call for (install_scripts gives run_install_scripts with the sorted exact name@version list, runtime_line_change gives runtime_line_change with an empty list). All values are fictional.",
   "variants": [
     {
       "name": "process_winget_upgrade",
       "adapter_id": "package.upgrade",
       "platform": "windows",
+      "inputs": {
+        "environment": {
+          "fictional": "winget environment"
+        }
+      },
       "payload": {
         "schema": "patchcairn.package",
         "schema_version": 1,
@@ -43,6 +48,11 @@
       "name": "terminal_apt_kernel_through_sudo",
       "adapter_id": "package.upgrade",
       "platform": "linux",
+      "inputs": {
+        "environment": {
+          "fictional": "apt environment"
+        }
+      },
       "payload": {
         "schema": "patchcairn.package",
         "schema_version": 1,
@@ -129,6 +139,11 @@
       "name": "firmware_fwupd_device",
       "adapter_id": "system.firmware_update",
       "platform": "linux",
+      "inputs": {
+        "environment": {
+          "fictional": "fwupd environment"
+        }
+      },
       "payload": {
         "schema": "patchcairn.package",
         "schema_version": 1,

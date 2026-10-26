@@ -640,8 +640,10 @@ class ReportTests(unittest.TestCase):
             self.assertIsNone(re.search(r"(?i)proves? (that )?(a|the) (human|person|owner)|independent|verified by", text))
 
     def test_typed_reply_has_its_own_row_in_the_approval(self):
+        # The report shows exactly the kinds the records accept as a typed reply; checked first, before anything renders.
+        self.assertEqual(set(report.TYPED_REPLIES), pc_records.TYPED_ACKNOWLEDGMENTS)
         plan_sha256 = report_session()["plan"]["sha256"]
-        reply = {"type": "permanent_data_loss", "action_ids": ["fictional-action"], "number": 3, "bytes": 2048, "warning_revision": 7}
+        reply ={"type": "permanent_data_loss", "action_ids": ["fictional-action"], "number": 3, "bytes": 2048, "warning_revision": 7}
 
         def row(value):
             approval = owner("delete 3 files", "fictional-typed", plan_sha256=plan_sha256, action_ids=["fictional-action"],
@@ -651,9 +653,23 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(row(dict(reply, type="firmware_risk", number=2, bytes=None)),
                          "Firmware update (firmware_risk); number in the reply: 2; actions: fictional-action")
         self.assertEqual(row(None), "Not needed for these actions")
-        for bad in (dict(reply, number="3"), dict(reply, action_ids="fictional-action"), dict(reply, bytes=-1), "delete 3 files"):
+        for bad in (dict(reply, number="3"), dict(reply, action_ids="fictional-action"), dict(reply, bytes=-1), "delete 3 files",
+                    dict(reply, type="no_component_rollback")):
             with self.subTest(bad=bad), self.assertRaises(pc_records.Refusal):
                 row(bad)
+
+    def test_separate_acknowledgment_heading_follows_its_recorded_type(self):
+        plan_sha256 = report_session()["plan"]["sha256"]
+
+        def names(ack):
+            return [dict(item)["Decision"] for item in items(rendered(report_session(irreversible_ack=ack)), "approvals")]
+        ack = owner("I accept that this repair cannot be undone.", "fictional-ack", type="no_component_rollback", plan_sha256=plan_sha256,
+                    action_ids=["fictional-action"], scope_sha256="b" * 64, acknowledge_irreversible_loss=True)
+        self.assertIn("Agreement that a repair cannot be rolled back (separate acknowledgment)", names(ack))
+        self.assertIn("Separate acknowledgment (fictional\\u202etype)", names(dict(ack, type="fictional\u202etype")))
+        self.assertIn("Agreement that a repair cannot be rolled back (separate acknowledgment)",
+                      names({key: value for key, value in ack.items() if key != "type"}))
+        self.assertIn("Agreement that a repair cannot be rolled back (separate acknowledgment): not recorded.", notes(rendered(report_session()), "approvals"))
 
     def test_every_owner_decision_is_shown(self):
         plan_sha256 = report_session()["plan"]["sha256"]

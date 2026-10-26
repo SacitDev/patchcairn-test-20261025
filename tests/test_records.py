@@ -512,6 +512,13 @@ class AdapterFactsTests(unittest.TestCase):
             pc_records.ADAPTERS["storage.extra"] = {}
         self.assertTrue(pc_records.ADAPTERS["storage.purge"]["irreversible"])
 
+    def test_typed_acknowledgments_are_the_two_loss_and_firmware_risks(self):
+        # These are given only by the owner's typed reply, never as a separate acknowledgment.
+        self.assertEqual(pc_records.TYPED_ACKNOWLEDGMENTS, {"permanent_data_loss", "firmware_risk"})
+        self.assertLessEqual(pc_records.TYPED_ACKNOWLEDGMENTS, pc_records.ACKNOWLEDGMENTS)
+        with self.assertRaises(AttributeError):
+            pc_records.TYPED_ACKNOWLEDGMENTS.add("no_component_rollback")
+
     def test_acknowledgments_match_the_plan(self):
         acknowledgments = {key: facts["acknowledgments"] for key, facts in pc_records.ADAPTERS.items() if facts["acknowledgments"]}
         self.assertEqual(acknowledgments, {"storage.purge": ("permanent_data_loss",),

@@ -20,33 +20,36 @@ import win32_files as w32
 
 
 class PrivateWorkspaceError(ValueError):
-    def __init__(self, code):
+    def __init__(self, code, message=None):
         self.code = code
-        super().__init__(code)
+        super().__init__(code if message is None else message)
 
 
-def _hold(code):
-    raise PrivateWorkspaceError(code)
+def _hold(code, message=None):
+    raise PrivateWorkspaceError(code, message)
 
 
 def relative_parts(path, root):
     """The parts of ``path`` below ``root``: () for ``root`` itself and None when ``path`` is outside it.
 
     Both are absolute paths compared as text; nothing is opened or resolved, so callers pass paths whose links are
-    already refused. A relative path or a ".." part is None (outside). pathlib folds letter case with str.lower(); on
-    Windows each part is also compared with the file system's own rule (win32_files.same_name), so a look-alike part
-    such as one with U+212A (Kelvin sign) is not "k".
+    already refused. A relative path or a ".." part is None (outside). On Windows the root's parts are compared with the
+    path's leading parts by the file system's own rule (win32_files.same_name), so a look-alike part such as one with
+    U+212A (Kelvin sign) is not "k"; a part ending in a dot or a space, which Windows would trim, and a missing Windows
+    API are None too. Elsewhere pathlib compares the parts exactly.
     """
     path, root = Path(path), Path(root)
     if not (path.is_absolute() and root.is_absolute()) or ".." in path.parts or ".." in root.parts:
         return None
-    try:
-        relative = path.relative_to(root)
-    except ValueError:
+    if os.name != "nt":
+        try:
+            return path.relative_to(root).parts
+        except ValueError:
+            return None
+    if (w32.API is None or any(part[-1:] in (".", " ") for part in path.parts[1:] + root.parts[1:])
+            or len(path.parts) < len(root.parts) or not all(map(w32.same_name, path.parts, root.parts))):
         return None
-    if os.name == "nt" and w32.API is not None and not all(map(w32.same_name, path.parts, root.parts)):
-        return None
-    return relative.parts
+    return path.parts[len(root.parts):]
 
 
 def _absolute(path, boundary=None):
@@ -65,7 +68,8 @@ def _absolute(path, boundary=None):
         # pc_paths' one name rule: no empty, dot or trailing-dot-or-space name, no control, separator, stream or wildcard
         # character, and no reserved device name (CONIN$, CONOUT$ and COM/LPT with a superscript digit included).
         if not all(map(pc_paths.portable, value.parts[1:])):
-            _hold("private-path-invalid")
+            _hold("private-path-invalid", "a folder name on this path is one PatchCairn does not accept (a reserved Windows name, too long, or an "
+                                          "unsupported character)")
     value = value.absolute()
     if value == value.parent:
         _hold("private-root-refused")

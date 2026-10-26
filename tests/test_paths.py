@@ -563,6 +563,36 @@ class JunkRootTests(unittest.TestCase):
             with self.subTest(relative=relative):
                 self.assertTrue(pc_paths.protected(relative, root=self.TEMP, junk_root=self.TEMP))
                 self.assertTrue(pc_paths.protected_root(self.TEMP + "\\" + relative, junk_root=self.TEMP))
+    def test_non_ascii_letters_must_match_exactly(self):
+        # Only ASCII letters fold case: a look-alike that Unicode case mapping would equate names another folder.
+        def temp(user):
+            return "C:\\" + "Users" + "\\" + user + "\\AppData\\Local\\Temp"
+        for real, other in (("chris", "chr\u0131s"), ("sam", "\u017fam"), ("x\ufb06", "x\ufb05"), ("mu\u03bc", "mu\u00b5")):
+            with self.subTest(real=real, other=other):
+                self.assertFalse(pc_paths.protected_root(temp(real) + "\\b", junk_root=temp(real)))
+                self.assertTrue(pc_paths.protected_root(temp(other) + "\\b", junk_root=temp(real)))
+                self.assertTrue(pc_paths.protected("b", root=temp(other), junk_root=temp(real)))
+        self.assertFalse(pc_paths.protected_root(temp("CHRIS") + "\\b", junk_root=temp("chris")))
+        self.assertFalse(pc_paths.protected("b", root=temp("Chris"), junk_root=temp("chris")))
+
+    def test_relative_parts_that_could_leave_temp_get_no_exemption(self):
+        for relative in ("..\\..\\Roaming\\x\\y", "../../../Documents/tax.pdf", "D:\\x", "\\x", ".\\x", "x.\\y", "x \\y", "x:stream", "x\\\\y"):
+            with self.subTest(relative=relative):
+                self.assertTrue(pc_paths.protected(relative, root=self.TEMP, junk_root=self.TEMP))
+        for relative in ("build-1\\x.tmp", "", "build-1/x.tmp"):
+            with self.subTest(exempt=relative):
+                self.assertFalse(pc_paths.protected(relative, root=self.TEMP, junk_root=self.TEMP))
+
+    def test_only_a_plain_long_drive_path_is_a_junk_root(self):
+        # The caller strips a \\?\ prefix and resolves the long name first; any other spelling gives no exemption.
+        temp = self.TEMP
+        self.assertFalse(pc_paths.protected_root(temp + "\\b", junk_root=temp))
+        for junk in ("\\\\?\\" + temp, "\\\\.\\" + temp, "\\\\server\\share" + temp[2:], temp.replace("\\example\\", "\\EXAMPL~1\\"), temp + ".",
+                     temp + " ", temp + ":stream", temp.replace("\\AppData", "\\\\AppData")):
+            with self.subTest(junk=junk):
+                self.assertTrue(pc_paths.protected_root(temp + "\\b", junk_root=junk))
+                self.assertTrue(pc_paths.protected("b", root=temp, junk_root=junk))
+
 
 if __name__ == "__main__":
     unittest.main()

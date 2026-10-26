@@ -455,19 +455,26 @@ class DispatchTests(SessionFixtures):
         self.held_execution(action, self.approve(action))
 
     def test_every_storage_plan_kind_binds_generically(self):
-        # Every storage plan kind binds through the engine's one storage branch: a retention release plan registers and is
-        # approved, and executing it holds in the service until its family code is written.
+        # Every storage plan kind binds through the engine's one storage branch: a retention-forget plan registers and is
+        # approved, and executing it holds in the service until its family code is written. A permanent deletion whose
+        # family is not built yet (retention release) cannot even be planned: its count has no source to come from.
         records = {"fixture": True, "entries": [{"name": "fictional-kept-backup"}]}
-        plan = {"schema": "patchcairn.storage", "schema_version": 1, "kind": "retention_release", "records": records, "fixture": True}
-        payload = {"schema": "patchcairn.storage.adapter", "schema_version": 1, "operation": pc_records.ADAPTER_STORAGE_RETENTION_RELEASE,
-                   "storage_plan": plan, "storage_plan_sha256": digest(plan), "output_root": str(self.output), "mode": "fixture",
-                   "protected_roots": [str(self.output)], "delete_count": 1, "delete_bytes": 0}
-        action = self.service._action(self.state(), action_id="release-kept", adapter_id=payload["operation"], kind="retention_release",
-                                      payload=payload, native_plan=plan, inventory=records, **PROSE)
+        def action_for(adapter_id, kind, **deletion):
+            plan = {"schema": "patchcairn.storage", "schema_version": 1, "kind": kind, "records": records, "fixture": True}
+            payload = {"schema": "patchcairn.storage.adapter", "schema_version": 1, "operation": adapter_id, "storage_plan": plan,
+                       "storage_plan_sha256": digest(plan), "output_root": str(self.output), "mode": "fixture",
+                       "protected_roots": [str(self.output)], **deletion}
+            return self.service._action(self.state(), action_id="kept-" + kind.replace("_", "-"), adapter_id=adapter_id, kind=kind,
+                                        payload=payload, native_plan=plan, inventory=records, **PROSE)
+        release = action_for(pc_records.ADAPTER_STORAGE_RETENTION_RELEASE, "retention_release", delete_count=1, delete_bytes=0)
+        with self.assertRaises(WorkflowRefusal) as caught:
+            self.approve(release)
+        self.assertEqual(caught.exception.code, "storage-payload")
+        action = action_for(pc_records.ADAPTER_STORAGE_RETENTION_FORGET, "retention_forget")
         try:
-            sha = self.approve(action, purge_choice=True)
+            sha = self.approve(action)
         except WorkflowRefusal as error:
-            self.fail("the retention release plan did not register: " + error.code)
+            self.fail("the retention-forget plan did not register: " + error.code)
         self.held_execution(action, sha)
 
     def test_storage_table_names_delete_selected_and_remove_originals(self):

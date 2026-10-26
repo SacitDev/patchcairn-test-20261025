@@ -870,7 +870,8 @@ class IrreversibleApprovalTests(TypedReplyHelpers, WorkflowFixture):
         phrase = self.purge_plan()
         self.warn()
         for number, quote in enumerate(("Yes, " + phrase, phrase + " now", "please " + phrase, phrase + ". " + phrase, "delete 1 file",
-                                        phrase + "!", '"' + phrase + '"')):
+                                        phrase + "!", '"' + phrase + '"', "delete 1 \ufb01les", "delete 1 file\u017f", "de lete 1 fi les",
+                                        "delete 1,1 files")):
             with self.subTest(refused=quote):
                 self.refused("typed-reply-mismatch", lambda: self.approve(quote, "typed-refused-%d" % number))
         self.assertEqual((self.state()["approval"], self.state()["used_message_ids"]), (None, []))
@@ -923,7 +924,9 @@ class IrreversibleApprovalTests(TypedReplyHelpers, WorkflowFixture):
             data = self.warn()
             self.assertEqual((data["phrase"], data["number"], data["bytes"]), ("update firmware on device 2, I have my recovery key", 2, None))
             for number, quote in enumerate(("update firmware on device 3, I have my recovery key", "update firmware on device 2",
-                                            "update firmware on device 12, I have my recovery key", "delete 2 files")):
+                                            "update firmware on device 12, I have my recovery key", "delete 2 files",
+                                            "update \ufb01rmware on device 2, I have my recovery key",
+                                            "update firmware on device 2, I have my recovery \u212aey")):
                 with self.subTest(refused=quote):
                     self.refused("typed-reply-mismatch", lambda: self.approve(quote, "typed-device-%d" % number))
             self.approve("Update firmware on device 2 I have my recovery key.", "typed-device")
@@ -940,6 +943,106 @@ class IrreversibleApprovalTests(TypedReplyHelpers, WorkflowFixture):
         self.assertEqual(self.state()["operations"], {})
         self.approve(phrase, "typed-second")
         self.assertTrue(self.begin_action())
+
+    def test_typed_reply_never_begins_in_a_scheduled_session(self):
+        # A schedule never starts a permanent deletion or a firmware update, even one the owner approved by typed reply.
+        with mock.patch("pc_records.utc_now") as clock:
+            base = datetime.now(timezone.utc)
+            stamp = lambda moment: moment.isoformat().replace("+00:00", "Z")
+            clock.return_value = stamp(base)
+            self.engine.setup(self.sid, control="automatic", timing="scheduled", checkpoints=[])
+            first = base + timedelta(minutes=1)
+            self.engine.configure_schedule(self.sid, schedule={"when_utc": stamp(first), "description": "Fictional first time"},
+                                           owner_quote="Start at the first time.", owner_message_id="typed-schedule-first")
+            clock.return_value = stamp(first + timedelta(seconds=1))
+            self.schedule_trigger("typed-trigger-first")
+            phrase = self.purge_plan()
+            self.warn()
+            self.approve(phrase, "typed-scheduled")
+            second = first + timedelta(hours=2)
+            self.engine.configure_schedule(self.sid, schedule={"when_utc": stamp(second), "description": "Fictional later run"},
+                                           owner_quote="Run the deletion tonight.", owner_message_id="typed-schedule-second")
+            clock.return_value = stamp(second + timedelta(seconds=1))
+            self.schedule_trigger("typed-trigger-second")
+            self.engine.advance_stage(self.sid, evidence_ids=[])
+            self.refused("typed-reply-scheduled", self.begin_action)
+        self.assertEqual(self.state()["operations"], {})
+
+    def test_warning_never_names_a_number_the_plan_does_not_delete(self):
+        # The payload's count and size must be exactly its plan's rows, so the warning and the reply name only that number.
+        self.purge_plan()
+        plan = copy.deepcopy(self.plan)
+        row = self.state()["evidence"][plan["actions"][0]["adapter_payload_evidence_id"]]
+        payload = json.loads((self.engine.work / self.sid / row["path"]).read_bytes())
+        self.assertEqual((payload["delete_count"], payload["delete_bytes"]), (1, 31))
+        for changes in ({"delete_count": 500}, {"delete_bytes": 0}, {"delete_count": 2, "delete_bytes": 62}):
+            forged = dict(payload, **changes)
+            action = dict(plan["actions"][0], adapter_payload_evidence_id=self.raw_evidence("adapter_payload", forged), adapter_payload_sha256=digest(forged))
+            with self.subTest(changes=changes):
+                self.refused("storage-payload", lambda: self.engine.register_plan(self.sid, plan=dict(plan, plan_id="fictional-forged", actions=[action])))
+        self.assertEqual(self.state()["plan"]["sha256"], self.plan_hash)
+
+    def test_typed_approval_waits_for_the_registry_lock(self):
+        phrase = self.purge_plan()
+        self.warn()
+        before = self.state()
+        with self.engine._registry_lock():
+            self.refused("workflow-refusal", lambda: self.approve(phrase, "typed-locked"))
+        self.assertEqual(self.state(), before)
+        self.approve(phrase, "typed-locked")
+        self.assertEqual(self.state()["used_message_ids"], ["typed-locked"])
+
+    def test_warning_covers_one_kind_of_deletion_or_one_firmware_update(self):
+        self.purge_plan(reviewed=False)
+        purge = self.plan["actions"][0]
+        inventory = {"fictional": True, "entries": [{"name": "fictional-selected.tmp", "size": 10}]}
+        selected = {"schema": "patchcairn.storage", "schema_version": 1, "kind": "delete_selected", "inventory": inventory,
+                    "rows_file": {"row_count": 2, "row_bytes": 10}}
+        payload = {"schema": "patchcairn.storage.adapter", "schema_version": 1, "operation": pc_records.ADAPTER_STORAGE_DELETE_SELECTED,
+                   "storage_plan": selected, "storage_plan_sha256": digest(selected), "output_root": str(self.root / "work" / "fictional-selected"),
+                   "mode": "fixture", "protected_roots": [], "delete_count": 2, "delete_bytes": 10}
+        second = dict(purge, action_id="fictional-selected", kind="delete_selected", adapter_id=payload["operation"], requires_recovery=False,
+                      recovery_evidence_ids=[], adapter_payload_evidence_id=self.raw_evidence("adapter_payload", payload), adapter_payload_sha256=digest(payload),
+                      adapter_plan_sha256=digest(selected), target_inventory_evidence_id=self.raw_evidence("inventory", inventory),
+                      target_inventory_sha256=digest(inventory))
+        # Two kinds of permanent deletion in one plan would share one "delete N files" reply, so the warning refuses.
+        self.register(dict(self.plan, actions=[purge, second]))
+        self.refused("typed-reply-plan", self.warn)
+        # A retention release cannot even be planned until its family is built.
+        release = {"schema": "patchcairn.storage", "schema_version": 1, "kind": "retention_release", "records": inventory}
+        released = dict(payload, operation=pc_records.ADAPTER_STORAGE_RETENTION_RELEASE, storage_plan=release, storage_plan_sha256=digest(release))
+        third = dict(second, action_id="fictional-release", kind="retention_release", adapter_id=released["operation"],
+                     adapter_payload_evidence_id=self.raw_evidence("adapter_payload", released), adapter_payload_sha256=digest(released),
+                     adapter_plan_sha256=digest(release))
+        self.refused("storage-payload", lambda: self.engine.register_plan(self.sid, plan=dict(self.plan, plan_id="fictional-release", actions=[purge, third])))
+        # A firmware plan holds exactly one device action.
+        with mock.patch.object(engine_updates, "update_binding"):
+            self.firmware_plan(2)
+            firmware = self.plan["actions"][0]
+            self.register(dict(self.plan, actions=[firmware, dict(firmware, action_id="fictional-action-2")]))
+            self.refused("typed-reply-plan", self.warn)
+        self.assertIsNone(self.state()["irreversible_warning"])
+
+    def test_used_message_id_cap_refuses_a_new_typed_reply(self):
+        phrase = self.purge_plan()
+        self.warn()
+        with mock.patch.object(engine_plans, "MAX_USED_MESSAGE_IDS", 2):
+            self.approve(phrase, "typed-cap-1")
+            self.approve(phrase, "typed-cap-2")
+            before = self.state()
+            self.refused("message-ids-full", lambda: self.approve(phrase, "typed-cap-3"))
+            self.assertEqual(self.state(), before)
+
+    def test_separate_acknowledgement_refused_for_purge_and_firmware(self):
+        def separate():
+            return self.engine.record_irreversible_ack(self.sid, plan_sha256=self.plan_hash, action_ids=["fictional-action"], acknowledge_irreversible_loss=True,
+                                                       owner_quote="I accept this separately.", owner_message_id="separate-" + self.plan_hash[:12])
+        self.purge_plan()
+        self.refused("typed-reply-required", separate)
+        with mock.patch.object(engine_updates, "update_binding"):
+            self.firmware_plan(2)
+            self.refused("typed-reply-required", separate)
+        self.assertIsNone(self.state()["irreversible_ack"])
 
 
 if __name__ == "__main__":

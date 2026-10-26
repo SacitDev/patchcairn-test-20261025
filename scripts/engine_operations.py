@@ -6,13 +6,13 @@ from __future__ import annotations
 import uuid
 
 from engine_journal import OUTCOMES, WorkflowRefusal, bounded_text, outstanding_effects, record_identifier, require_writable, utc_time
-from engine_plans import (TYPED_ACKNOWLEDGMENTS, acknowledgments, action_authorization, action_binding, add_checkpoint, current_plan, next_action_checkpoint,
-                          pending_items, require_reviews)
+from engine_plans import (acknowledgments, action_authorization, action_binding, add_checkpoint, current_plan, next_action_checkpoint, pending_items,
+                          require_reviews)
 import pc_records
-from pc_records import digest
+from pc_records import TYPED_ACKNOWLEDGMENTS, digest
 
 
-def typed_reply_covers(state, action):
+def _typed_reply_covers(state, action):
     """Refuse unless the approval's typed reply covers ``action``: given after the current warning of this exact plan, for
     the warned actions, number and bytes, and of the acknowledgment the action needs."""
     reply, warning = (state["approval"] or {}).get("irreversible") or {}, state["irreversible_warning"] or {}
@@ -46,7 +46,10 @@ def begin_operation(engine, session_id, *, action_id, plan_sha256, precondition_
         authorization = action_authorization(state, action)
         for acknowledgment in acknowledgments(action):
             if acknowledgment in TYPED_ACKNOWLEDGMENTS:
-                typed_reply_covers(state, action)
+                if activation is not None:
+                    raise WorkflowRefusal("A permanent deletion or a firmware update is never started by a schedule; start it with the owner in a "
+                                          "session timed 'now'", code="typed-reply-scheduled")
+                _typed_reply_covers(state, action)
                 continue
             ack = state["irreversible_ack"]
             if (not ack or ack["type"] != acknowledgment or ack["plan_sha256"] != plan_sha256 or action_id not in ack["action_ids"]

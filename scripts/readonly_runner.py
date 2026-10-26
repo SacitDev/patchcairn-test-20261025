@@ -294,11 +294,11 @@ def executable_prefix(kind):
     return EXECUTABLE_PREFIXES[kind]
 
 
-def recheck_executable(kind, path, identity, *, probe=None):
-    """Check ``path`` again with the rule of its kind, just before a run, and return its identity record: "winget" (the App
-    Installer alias, identified by its package folder), "system" (a listed system tool with root-owned ancestry, or a tool
-    in the Windows system folder, identified by its resolved file) or "brew" (Homebrew at its documented prefix, by its
-    resolved file). With ``identity`` None this records the identity; otherwise the identity must be unchanged."""
+def executable_identity(kind, path, *, program=None, probe=None):
+    """At plan time, check that ``path`` is the executable the rule of its kind admits and return the record of where it is:
+    "winget" (the App Installer alias, by its package folder), "system" (``program``, the recipe's own system tool, which
+    must be listed with root-owned ancestry or sit in the Windows system folder, by its path) or "brew" (Homebrew at its
+    documented prefix, by its path). The record binds the location, not the file's content."""
     probe = probe or HostProbe()
     executable_prefix(kind)
     windows = probe.platform == "win32"
@@ -311,10 +311,22 @@ def recheck_executable(kind, path, identity, *, probe=None):
         current = _brew(probe)
         record = {"real_path": probe.realpath(current)}
     else:
-        current = _system_tool((ntpath.basename(path) if windows else path,), probe)
+        if not isinstance(program, str) or not program:
+            raise Refusal("runner-executable", "A system tool is checked against its recipe's program")
+        current = _system_tool((program,), probe)
         record = {"real_path": current if windows else probe.realpath(current)}
-    same = ntpath.normcase(path) == ntpath.normcase(current) if windows else path == current
-    if not same or (identity is not None and identity != record):
+    if not (ntpath.normcase(path) == ntpath.normcase(current) if windows else path == current):
+        raise Refusal("runner-executable-changed", "The executable is not the one the plan bound; the run holds")
+    return record
+
+
+def recheck_executable(kind, path, identity, *, program=None, probe=None):
+    """Just before a run, the same check as executable_identity, and the record must equal ``identity``, the one taken at
+    plan time; a missing identity is refused."""
+    if not isinstance(identity, dict):
+        raise Refusal("runner-executable-changed", "The executable has no recorded identity; the run holds")
+    record = executable_identity(kind, path, program=program, probe=probe)
+    if record != identity:
         raise Refusal("runner-executable-changed", "The executable is not the one the plan bound; the run holds")
     return record
 

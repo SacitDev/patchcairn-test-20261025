@@ -127,6 +127,8 @@ TARGETS = {"whole_device": "the whole computer", "selected_paths": "selected fol
 OPERATIONS = {"metadata": "file and system details", "diagnosis": "problem diagnosis", "content_read": "reading selected file contents"}
 RESTART_CHOICES = {"defer": "Restart later", "authorize": "Restart allowed; you restart the computer yourself"}
 TYPED_REPLIES = {"permanent_data_loss": "Permanent deletion", "firmware_risk": "Firmware update"}
+# The separate acknowledgment's heading by its recorded type; another type is shown as it is.
+ACK_HEADINGS = {"no_component_rollback": "Agreement that a repair cannot be rolled back (separate acknowledgment)"}
 RESOLUTIONS = {"replan_required": "A new plan is needed before anything else changes",
                "effects_accounted": "What changed was accounted for after the session stopped"}
 UNSETTLED = frozenset({"failed", "partial", "unknown"})
@@ -448,6 +450,8 @@ def _typed_reply(record, where):
     if reply is None:
         return ["Typed reply to a warning", "Not needed for these actions"]
     place, size = "typed reply", _count(reply, "bytes", "typed reply")
+    if _value(reply, "type", str, place) not in pc_records.TYPED_ACKNOWLEDGMENTS:
+        raise _refused("The typed reply names an acknowledgment that is never given by a typed reply")
     return ["Typed reply to a warning", _worded(_value(reply, "type", str, place), TYPED_REPLIES) + "; number in the reply: "
             + str(_value(reply, "number", int, place)) + ("" if size is None else "; size: " + _bytes(size))
             + "; actions: " + _joined(_texts(reply, "action_ids", place))]
@@ -460,6 +464,14 @@ def _approval_rows(record, where, current, windows):
 
 def _ack_rows(record, where, current, windows):
     return [["Actions it covers", _joined(_texts(record, "action_ids", where))], _plan_hash(record, where, current)]
+
+
+def _ack_heading(record, where):
+    """The separate acknowledgment's heading, from its recorded type (today's heading when none is recorded)."""
+    kind = None if record is None else _optional(record, "type", str, where)
+    if kind is None:
+        return ACK_HEADINGS["no_component_rollback"]
+    return ACK_HEADINGS.get(kind) or "Separate acknowledgment (" + _shown(kind) + ")"
 
 
 def _policy_rows(record, where, current, windows):
@@ -475,10 +487,10 @@ def _approvals(session, current, windows):
     blocks = [_note(DECISIONS_NOTE)]
     for key, name, where, rows in (
             ("approval", "Plan approval", "plan approval", _approval_rows),
-            ("irreversible_ack", "Agreement that a repair cannot be rolled back (separate acknowledgment)", "separate acknowledgment",
-             _ack_rows),
+            ("irreversible_ack", None, "separate acknowledgment", _ack_rows),
             ("standing_policy", "Standing permission for routine steps (standing policy)", "standing policy", _policy_rows)):
         record = _value(session, key, dict, "session", nullable=True)
+        name = _ack_heading(record, where) if name is None else name
         blocks.append(_note(name + ": " + NOT_RECORDED + ".") if record is None
                       else _decision(record, name, where, rows(record, where, current, windows)))
     return blocks + _other_decisions(session, current)

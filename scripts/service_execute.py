@@ -61,23 +61,12 @@ EXECUTE = {
 }
 
 
-def deletion_size(adapter_id, plan):
-    """(number of items, bytes) that a permanent deletion removes, read from its hash-bound plan rows: the plan's
-    rows_file (row_count, row_bytes), else the size of each row in files, else of each original in the receipt's records.
-    (None, None) for an adapter whose facts list no permanent data loss."""
-    if "permanent_data_loss" not in pc_records.ADAPTERS[adapter_id]["acknowledgments"]:
-        return None, None
+def _deletion_size(adapter_id, plan):
+    """storage_contract.deletion_size, its refusal kept as the service's own (same code and text)."""
     try:
-        if "rows_file" in plan:
-            count, size = plan["rows_file"]["row_count"], plan["rows_file"]["row_bytes"]
-        else:
-            rows = plan["files"] if "files" in plan else [row["original"] for row in plan["receipt"]["records"]]
-            count, size = len(rows), sum(row["size"] for row in rows)
-    except (KeyError, TypeError) as error:
-        raise ServiceRefusal("A permanent deletion's plan must list the items it deletes and their sizes") from error
-    if type(count) is not int or count < 1 or type(size) is not int or size < 0:
-        raise ServiceRefusal("A permanent deletion's plan must list the items it deletes and their sizes")
-    return count, size
+        return storage_contract.deletion_size(adapter_id, plan)
+    except pc_records.Refusal as error:
+        raise ServiceRefusal(str(error), code=error.code) from error
 
 
 class ExecuteMixin:
@@ -120,7 +109,7 @@ class ExecuteMixin:
         if payload["operation"] not in STORAGE or payload["mode"] != state["mode"]:
             raise ServiceRefusal("Unsupported storage adapter or mode")
         # The typed reply named this number and size, so they must be exactly what the reviewed plan deletes.
-        if (payload.get("delete_count"), payload.get("delete_bytes")) != deletion_size(payload["operation"], payload["storage_plan"]):
+        if (payload.get("delete_count"), payload.get("delete_bytes")) != _deletion_size(payload["operation"], payload["storage_plan"]):
             raise ServiceRefusal("The deletion's number of items or size differs from the reviewed plan")
         output = self._owned(payload["output_root"], state=state, existing=True)
         protections = payload["protected_roots"]
@@ -171,7 +160,7 @@ class ExecuteMixin:
                        "output_root": str(output_root), "mode": state["mode"], "protected_roots": protections}
             if restore_probe_destination is not None:
                 payload["restore_probe_destination"] = str(restore_probe_destination)
-            count, size = deletion_size(adapter_id, payload["storage_plan"])
+            count, size = _deletion_size(adapter_id, payload["storage_plan"])
             if count is not None:
                 payload.update(delete_count=count, delete_bytes=size)
             service = self._storage(state, payload)

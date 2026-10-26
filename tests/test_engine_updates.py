@@ -31,7 +31,8 @@ CONDITIONAL_FLAGS = {"install_scripts": "run_install_scripts", "runtime_line_cha
 
 def payload_problem(adapter_id, payload):
     """The refusal code of the first rule of the patchcairn.package payload contract that ``payload`` breaks, or None. The
-    frozen fixtures follow this reading of the contract; the engine's binding gives the same codes for them."""
+    frozen fixtures follow this reading of the contract; the engine's update_binding must give the same codes for them
+    once it checks this contract (it does not yet)."""
     facts = pc_records.ADAPTERS[adapter_id]
     if set(payload) - PACKAGE_COMMON - PACKAGE_RUN - PACKAGE_OPTIONAL or PACKAGE_COMMON - set(payload):
         return "package-payload-unknown-key"
@@ -71,8 +72,11 @@ class PayloadFixtureTests(unittest.TestCase):
                 self.assertEqual(row["encoded"], encoded(payload).decode("ascii"))
                 self.assertEqual(row["sha256"], digest(payload))
                 self.assertEqual(payload["transaction_sha256"], digest(payload["preflight"]))
+                if "environment_sha256" in payload:
+                    self.assertEqual(payload["environment_sha256"], digest(row["inputs"]["environment"]))
+                self.assertLessEqual(set(row), {"name", "adapter_id", "platform", "inputs", "payload", "encoded", "sha256"})
                 self.assertEqual((payload["schema"], payload["schema_version"]), ("patchcairn.package", 1))
-                self.assertIn(payload["schema"], pc_records.PLANNED_SCHEMAS)
+                self.assertIn(payload["schema"], pc_records.SCHEMAS)
                 self.assertIsNone(payload_problem(row["adapter_id"], payload))
                 self.assertNotRegex(row["encoded"], r"(?i)\\\\users\\\\|/home/|/users/")
         firmware = [row for row in variants if row["adapter_id"] == pc_records.ADAPTER_SYSTEM_FIRMWARE_UPDATE]

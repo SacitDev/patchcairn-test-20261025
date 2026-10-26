@@ -24,6 +24,8 @@ import private_workspace as private
 import win32_files
 
 FIXTURES = ROOT / "work" / "test-fixtures"
+NAME_RULE_MESSAGE = ("a folder name on this path is one PatchCairn does not accept (a reserved Windows name, too long, or an "
+                     "unsupported character)")
 
 
 def remove_fixture(path):
@@ -432,6 +434,8 @@ class PathRuleTests(unittest.TestCase):
                 with self.assertRaises(private.PrivateWorkspaceError) as caught:
                     private._absolute(base + name)
                 self.assertTrue(caught.exception.code == "private-path-invalid")
+                # The person learns why: the code stays, the message names the rule.
+                self.assertTrue(str(caught.exception) == NAME_RULE_MESSAGE)
         for name in ("CON", "CONIN$", "CONOUT$", "COM\u00b9", "LPT\u00b3"):
             with self.subTest(reserved=repr(name)), self.assertRaises(pc_paths.PathRefusal) as caught:
                 pc_paths.relative(name)
@@ -440,6 +444,27 @@ class PathRuleTests(unittest.TestCase):
             with self.subTest(accepted=name):
                 self.assertTrue(pc_paths.portable(name))
                 self.assertTrue(private._absolute(base + name) == Path(base + name))
+
+    @unittest.skipUnless(os.name == "nt", "only on windows: Windows containment compares parts through the file system's rule")
+    def test_relative_parts_on_windows_follows_the_file_system_rule(self):
+        root = Path("C:\\fictional\\work")
+        # Windows trims a final dot or space, so such a part could name the root itself or another folder: never inside.
+        for path, limit in ((Path("C:\\fictional\\work\\..."), root), (Path("C:\\fictional\\work\\x."), root),
+                            (Path("C:\\fictional\\work\\x "), root), (Path("C:\\fictional\\work.\\x"), Path("C:\\fictional\\work."))):
+            with self.subTest(trimmed=str(path)):
+                self.assertIsNone(private.relative_parts(path, limit))
+        self.assertEqual(private.relative_parts(root / "x" / "y", root), ("x", "y"))
+        # Without the Windows API there is no way to compare names as Windows does, so nothing is inside.
+        with mock.patch.object(win32_files, "API", None):
+            self.assertIsNone(private.relative_parts(root / "x", root))
+        # The root's parts are compared through win32_files.same_name, not pathlib's lowercase folding.
+        for upper, lower in (("\u03c3", "\u03c2"), ("\u03a3", "\u03c2")):
+            expected = ("run",) if win32_files.same_name(upper, lower) else None
+            with self.subTest(pair=(upper, lower)):
+                self.assertEqual(private.relative_parts(Path("C:\\fictional") / upper / "run", Path("C:\\fictional") / lower), expected)
+        # Where the file system equates two names that pathlib keeps apart, same_name's answer still decides.
+        with mock.patch.object(win32_files, "same_name", lambda left, right: left.upper() == right.upper()):
+            self.assertEqual(private.relative_parts(Path("C:\\fictional\\\u03c3\\run"), Path("C:\\fictional\\\u03c2")), ("run",))
 
 
 @unittest.skipUnless(os.name == "posix", "only on posix: private mode and owner fixtures")

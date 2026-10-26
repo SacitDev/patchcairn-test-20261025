@@ -115,6 +115,19 @@ class HumanMessageTests(unittest.TestCase):
         self.assertIn("retained original 3010 operation only", inspected["message"])
 
 
+class TypedReplyPhraseTests(unittest.TestCase):
+    def test_every_kind_needing_a_typed_reply_has_its_phrase(self):
+        import engine_text
+        kinds = {kind for facts in pc_records.ADAPTERS.values() if pc_records.TYPED_ACKNOWLEDGMENTS & set(facts["acknowledgments"])
+                 for kind in facts["kinds"]}
+        self.assertEqual(kinds, {"permanent_purge", "remove_originals", "retention_release", "session_release", "delete_selected",
+                                 "firmware_update"})
+        for kind in sorted(kinds):
+            with self.subTest(kind=kind):
+                self.assertIn(kind, engine_text.IRREVERSIBLE_REPLIES)
+                self.assertIn("7", engine_text.irreversible_phrase(kind, 7))
+
+
 class WorkflowTests(WorkflowFixture):
     def test_initial_menu_has_attribution_jobs_control_timing_and_every_namespaced_command(self):
         menu = initial_menu()

@@ -52,12 +52,6 @@ def irreversible_phrase(kind, number):
     return IRREVERSIBLE_REPLIES[kind].format(number)
 
 
-def typed_reply(text):
-    """``text`` as typed replies are compared: letter case, spaces, commas and one final full stop do not count."""
-    text = text.strip()
-    return re.sub(r"[\s,]+", "", (text[:-1] if text.endswith(".") else text).casefold())
-
-
 def report_labels():
     """The plain names a session report shows for each job, stage and action kind, copied from the tables above."""
     return {"jobs": {job: row["label"] for job, row in JOBS.items()}, "stages": dict(STAGE_LABELS), "actions": dict(ACTION_LABELS)}
