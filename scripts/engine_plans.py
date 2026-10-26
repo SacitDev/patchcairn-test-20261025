@@ -16,7 +16,7 @@ from engine_journal import (ASSESSMENT_ACCESS, ASSESSMENT_SUMMARY, ASSESSMENT_VE
                             EVIDENCE_MAX_NODES, FIXTURE_ADAPTER, OUTCOMES, SHA, STATE_KEYS, WorkflowRefusal, bounded_text, checked, container,
                             decode_record, exact_fields, fresh, ids, invalidate, no_links, private_directory, private_file, record_identifier, require_writable,
                             typed_record, utc_time, write_private_new)
-from engine_text import CHECKPOINTS, JOBS, STAGE_LABELS, initial_menu, response
+from engine_text import CHECKPOINTS, JOBS, STAGE_LABELS, initial_menu, irreversible_phrase, response, typed_reply
 import pc_paths
 import pc_records
 from pc_records import SCHEMA_VERSION, digest, encoded
@@ -36,6 +36,12 @@ EVIDENCE_KINDS |= {"adapter_payload", "recovery_manifest", "restore_verification
 MAX_FACT_ITEMS = pc_records.MAX_BACKUP_ENTRIES
 # Facts are copied into the journal state, so they stay small; large data belongs in the evidence content.
 FACTS_MAX_BYTES = 65_536
+# One typed reply to the engine's warning approves these and acknowledges them; a session keeps its replies' message ids.
+TYPED_ACKNOWLEDGMENTS = frozenset({"permanent_data_loss", "firmware_risk"})
+MAX_USED_MESSAGE_IDS = 1000
+WARNING_FIELDS = frozenset({"plan_sha256", "kind", "action_ids", "number", "bytes", "revision", "recorded_utc"})
+REPLY_FIELDS = frozenset({"type", "action_ids", "number", "bytes", "warning_revision"})
+CONDITIONAL_FIELDS = frozenset({"action_id", "payload_sha256", "decision", "names", "message_id", "recorded_utc"})
 
 
 def _facts(action):
@@ -176,6 +182,33 @@ def owner_record(state, owner_quote, owner_message_id, owner_id=None, source="cu
             "settings_revision": state["settings_revision"]}
 
 
+def _typed_state(state):
+    """The typed-reply keys: used message ids, the warning (bound to the plan), the approval's reply, conditional decisions."""
+    used, warning, decisions = state["used_message_ids"], state["irreversible_warning"], state["conditional_decisions"]
+    reply = state["approval"].get("irreversible", 0) if state["approval"] else None
+    if (not isinstance(used, list) or len(used) > MAX_USED_MESSAGE_IDS or len(set(map(str, used))) != len(used) or reply == 0
+            or not isinstance(decisions, list) or len(decisions) > 100):
+        raise WorkflowRefusal("Invalid typed-reply state")
+    for message_id in used:
+        record_identifier(message_id, "used message identifier")
+    for record, fields, revision in ((warning, WARNING_FIELDS, "revision"), (reply, REPLY_FIELDS, "warning_revision")):
+        if record is not None:
+            exact_fields(record, fields, fields)
+            ids(record["action_ids"], "typed-reply actions", allow_empty=False)
+            if (type(record["number"]) is not int or record["number"] < 1 or type(record[revision]) is not int
+                    or record["bytes"] is not None and (type(record["bytes"]) is not int or record["bytes"] < 0)):
+                raise WorkflowRefusal("Invalid typed-reply record")
+    if warning is not None and (not state["plan"] or warning["plan_sha256"] != state["plan"]["sha256"] or str(warning["kind"]) not in KINDS
+                                or not 0 < warning["revision"] <= state["revision"] or not utc_time(warning["recorded_utc"])):
+        raise WorkflowRefusal("The irreversible-change warning is not bound to the current exact plan")
+    if reply is not None and str(reply["type"]) not in TYPED_ACKNOWLEDGMENTS:
+        raise WorkflowRefusal("Invalid typed reply")
+    for row in decisions:
+        exact_fields(row, CONDITIONAL_FIELDS, CONDITIONAL_FIELDS)
+        if str(row["decision"]) not in pc_records.CONDITIONAL_DECISIONS or not isinstance(row["names"], list):
+            raise WorkflowRefusal("Invalid conditional decision")
+
+
 def validate_state(engine, state):
     container(state, "session_state")
     exact_fields(state, STATE_KEYS, STATE_KEYS)
@@ -246,6 +279,7 @@ def validate_state(engine, state):
     if (state["approval"] and (not state["plan"] or state["approval"]["plan_sha256"] != state["plan"]["sha256"]
                                or state["approval"]["settings_revision"] != state["settings_revision"])):
         raise WorkflowRefusal("Approval is not bound to the current exact plan")
+    _typed_state(state)
     return state
 
 
@@ -263,7 +297,8 @@ def create_session(engine, *, job="security_updates", control="guided", timing="
              "settings": {"scope": selected, "control": control, "timing": timing,
                           "checkpoints": list(checkpoints if checkpoints is not None else ["scope", "findings", "plan", "before_action", "finish"])},
              "scope_authorization": None, "evidence": {}, "plan": None, "reviews": [], "approval": None, "irreversible_ack": None, "standing_policy": None,
-             "operations": {}, "pending": {}, "schedule": None, "schedule_triggers": [], "last_reconciled_utc": None, "stop_reason": None}
+             "operations": {}, "pending": {}, "schedule": None, "schedule_triggers": [], "last_reconciled_utc": None, "stop_reason": None,
+             "irreversible_warning": None, "used_message_ids": [], "conditional_decisions": []}
     validate_state(engine, state)
     private_directory(engine.work)
     private_file(engine.work / "engine.json")
@@ -529,6 +564,7 @@ def register_plan(engine, session_id, *, plan, expected_revision=None):
         state["reviews"] = []
         state["approval"] = None
         state["irreversible_ack"] = None
+        state["irreversible_warning"], state["conditional_decisions"] = None, []
         return ({"plan_sha256": state["plan"]["sha256"], "action_ids": [a["action_id"] for a in document["actions"]]},
                 "The exact plan is saved. It still needs two independent reviews and your concrete action decision before any change.")
     return engine.change(session_id, "plan_registered", mutate, expected_revision)
@@ -569,8 +605,35 @@ def require_reviews(engine, state):
         engine.evidence_rows(state, row["evidence_ids"], kinds={"review"}, after=state["plan"]["registered_utc"])
 
 
+def used_message_id(engine, message_id):
+    """True when a session in this engine's registry used ``message_id`` for a typed reply; the caller holds the registry lock."""
+    return any(path.is_dir() and path.name.startswith("session-") and message_id in engine.read_session(path.name)["used_message_ids"]
+               for path in engine.work.iterdir())
+
+
+def _typed_reply(engine, state, action_ids, owner_quote, owner_message_id):
+    """The approval's typed reply (all warned actions, the current warning's whole phrase, an unused message id), or None."""
+    typed = [a for a in state["plan"]["document"]["actions"] if a["action_id"] in action_ids and TYPED_ACKNOWLEDGMENTS & set(acknowledgments(a))]
+    if not typed:
+        return None
+    warning = state["irreversible_warning"] or {}
+    if warning.get("plan_sha256") != state["plan"]["sha256"] or set(warning.get("action_ids", ())) != {a["action_id"] for a in typed}:
+        raise WorkflowRefusal("Show this plan's warning first; the typed reply approves all warned actions together", code="typed-reply-warning")
+    phrase = irreversible_phrase(warning.get("kind"), warning.get("number"))
+    if typed_reply(owner_quote) != typed_reply(phrase):
+        raise WorkflowRefusal("This step needs the owner's exact typed reply: " + phrase, code="typed-reply-mismatch")
+    if owner_message_id in state["used_message_ids"] or used_message_id(engine, owner_message_id):
+        raise WorkflowRefusal("This message was already used for a typed reply; ask the owner to reply again", code="message-id-used")
+    if len(state["used_message_ids"]) >= MAX_USED_MESSAGE_IDS:
+        raise WorkflowRefusal("This session has used all its typed replies; start a new session", code="message-ids-full")
+    state["used_message_ids"].append(owner_message_id)
+    return {"type": min(TYPED_ACKNOWLEDGMENTS & set(acknowledgments(typed[0]))), "action_ids": list(warning["action_ids"]),
+            "number": warning["number"], "bytes": warning["bytes"], "warning_revision": warning["revision"]}
+
+
 def approve_plan(engine, session_id, *, plan_sha256, action_ids, owner_quote, owner_message_id, owner_id="owner", source="current_owner_chat",
-                 acknowledge_permanent_loss=False, expected_revision=None):
+                 expected_revision=None):
+    """The owner's approval of exact reviewed actions; a permanent deletion or a firmware update needs the typed reply."""
     ids(action_ids, "approved action identifiers", allow_empty=False)
     def mutate(state):
         require_writable(state)
@@ -580,35 +643,62 @@ def approve_plan(engine, session_id, *, plan_sha256, action_ids, owner_quote, ow
         if set(action_ids) - {a["action_id"] for a in document["actions"]}:
             raise WorkflowRefusal("Approval cannot include actions outside the concrete plan")
         purge_ids = [a["action_id"] for a in document["actions"] if "permanent_data_loss" in acknowledgments(a) and a["action_id"] in action_ids]
-        if purge_ids and acknowledge_permanent_loss is not True:
-            raise WorkflowRefusal("Permanent purge needs separate actual-owner acknowledgement of irreversible loss bound to these exact purge actions")
         record = owner_record(state, owner_quote, owner_message_id, owner_id, source)
-        record.update(plan_sha256=plan_sha256, action_ids=list(action_ids), permanent_loss_action_ids=purge_ids)
+        record.update(plan_sha256=plan_sha256, action_ids=list(action_ids), permanent_loss_action_ids=purge_ids,
+                      irreversible=_typed_reply(engine, state, action_ids, owner_quote, owner_message_id))
         state["approval"] = record
         return ({"action_ids": list(action_ids)},
                 "Your actual instruction is recorded for those exact reviewed actions. Fresh checks and protected system consent still apply.")
-    return engine.change(session_id, "plan_approved", mutate, expected_revision)
+    with engine.journal.registry_lock():  # a typed reply's message id is checked against every session
+        return engine.change(session_id, "plan_approved", mutate, expected_revision)
 
 
 def record_irreversible_ack(engine, session_id, *, plan_sha256, action_ids, acknowledge_irreversible_loss, owner_quote, owner_message_id, owner_id=None,
                             source="current_owner_chat", expected_revision=None):
-    ids(action_ids, "irreversible action identifiers", allow_empty=False)
+    """The owner's separate acknowledgement that no typed reply gives (today a repair without component rollback)."""
+    ids(action_ids, "acknowledged action identifiers", allow_empty=False)
     if acknowledge_irreversible_loss is not True:
-        raise WorkflowRefusal("An explicit separate acknowledgement of permanent data loss is required")
+        raise WorkflowRefusal("An explicit separate acknowledgement is required")
     def mutate(state):
         require_writable(state)
         plan = current_plan(state, plan_sha256)
-        purge = {a["action_id"] for a in plan["actions"] if "permanent_data_loss" in acknowledgments(a)}
-        if set(action_ids) - purge:
-            raise WorkflowRefusal("Irreversible-loss acknowledgement binds only exact current permanent-purge actions")
+        chosen = [a for a in plan["actions"] if a["action_id"] in action_ids]
+        needed = {acknowledgment for action in chosen for acknowledgment in acknowledgments(action)}
+        if needed & TYPED_ACKNOWLEDGMENTS:
+            raise WorkflowRefusal("A permanent deletion or a firmware update needs the typed reply to its warning", code="typed-reply-required")
+        if len(chosen) != len(action_ids) or len(needed) != 1 or not all(acknowledgments(action) for action in chosen):
+            raise WorkflowRefusal("A separate acknowledgement binds only exact current actions that all need the same one")
         record = owner_record(state, owner_quote, owner_message_id, owner_id, source)
-        record.update(type="permanent_data_loss", plan_sha256=plan_sha256, action_ids=list(action_ids), scope_sha256=digest(state["settings"]["scope"]),
+        record.update(type=needed.pop(), plan_sha256=plan_sha256, action_ids=list(action_ids), scope_sha256=digest(state["settings"]["scope"]),
                       acknowledge_irreversible_loss=True)
         state["irreversible_ack"] = record
         return ({"action_ids": action_ids},
-                "Your separate acknowledgement of irreversible loss is bound to these exact purge actions, current scope and plan. It cannot authorize another "
-                "deletion.")
+                "Your separate acknowledgement is bound to these exact actions, the current scope and plan. It cannot authorize another change.")
     return engine.change(session_id, "irreversible_loss_acknowledged", mutate, expected_revision)
+
+
+def issue_irreversible_warning(engine, session_id, *, plan_sha256, expected_revision=None):
+    """After both reviews, record the warning that the owner's typed reply answers: actions, number and bytes."""
+    def mutate(state):
+        require_writable(state)
+        document = current_plan(state, plan_sha256)
+        require_reviews(engine, state)
+        typed = [a for a in document["actions"] if TYPED_ACKNOWLEDGMENTS & set(acknowledgments(a))]
+        firmware = bool(typed) and "firmware_risk" in acknowledgments(typed[0])
+        if not typed or len({a["adapter_id"] for a in typed}) != 1 or firmware and len(typed) != 1:
+            raise WorkflowRefusal("A typed reply covers one kind of permanent deletion, or one firmware update, per plan", code="typed-reply-plan")
+        payloads = [action_binding(engine, state, action) for action in typed]
+        if firmware:
+            device = payloads[0].get("device") if isinstance(payloads[0], dict) else None
+            number, size = (device.get("number") if isinstance(device, dict) else None), None
+        else:
+            number, size = sum(payload["delete_count"] for payload in payloads), sum(payload["delete_bytes"] for payload in payloads)
+        phrase = irreversible_phrase(typed[0]["kind"], number)
+        state["irreversible_warning"] = warning = {"plan_sha256": plan_sha256, "kind": typed[0]["kind"], "action_ids": [a["action_id"] for a in typed],
+                                                   "number": number, "bytes": size, "revision": state["revision"] + 1, "recorded_utc": pc_records.utc_now()}
+        return ({"phrase": phrase, "action_ids": warning["action_ids"], "number": number, "bytes": size},
+                "This cannot be undone. To go ahead, the owner replies with exactly: " + phrase)
+    return engine.change(session_id, "irreversible_warning_recorded", mutate, expected_revision)
 
 
 def set_standing_policy(engine, session_id, *, action_kinds, max_actions, expires_utc, owner_quote, owner_message_id, targets=None, action_bindings=None,
@@ -767,6 +857,7 @@ def resolve(engine, session_id, *, pending_id=None, evidence_ids=None, choice=No
                     state["plan"] = None
                     state["approval"] = None
                     state["reviews"] = []
+                    state["irreversible_warning"], state["conditional_decisions"] = None, []
                     state["stage"] = "plan"
                 state["status"] = "stopped" if was_stopped else "held"
             elif choice in {"keep_held", None}:

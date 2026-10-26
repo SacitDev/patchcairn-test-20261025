@@ -83,7 +83,8 @@ EVIDENCE_MAX_NODES = EVIDENCE_MAX_BYTES
 CREATION_KEYS = ("session_id", "engine_id", "backend", "mode", "platform", "created_utc", "creation_scope_sha256", "owner_id", "job")
 STATE_KEYS = {"schema_version", "session_id", "engine_id", "backend", "mode", "platform", "created_utc", "updated_utc", "creation_scope_sha256", "owner_id",
               "revision", "settings_revision", "job", "stage", "status", "settings", "scope_authorization", "evidence", "plan", "reviews", "approval",
-              "irreversible_ack", "standing_policy", "operations", "pending", "schedule", "schedule_triggers", "last_reconciled_utc", "stop_reason"}
+              "irreversible_ack", "standing_policy", "operations", "pending", "schedule", "schedule_triggers", "last_reconciled_utc", "stop_reason",
+              "irreversible_warning", "used_message_ids", "conditional_decisions"}
 
 
 class WorkflowRefusal(pc_records.Refusal):
@@ -475,9 +476,12 @@ def require_writable(state):
 
 
 def invalidate(state):
+    """Clear every decision bound to the plan, scope or settings; the used message ids stay, so a reply is never reused."""
     state["plan"] = None
     state["approval"] = None
     state["irreversible_ack"] = None
+    state["irreversible_warning"] = None
+    state["conditional_decisions"] = []
     state["reviews"] = []
     state["standing_policy"] = None
     state["scope_authorization"] = None

@@ -18,8 +18,72 @@ from unittest import mock
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).absolute().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
-from workflow_core import WorkflowEngine, WorkflowRefusal
+import engine_operations
+import engine_updates
+from workflow_core import WorkflowEngine, WorkflowRefusal, digest
 from test_engine_journal import WorkflowFixture
+from test_engine_plans import TypedReplyHelpers
+
+
+class AcknowledgmentTests(TypedReplyHelpers, WorkflowFixture):
+    """The acknowledgments begin checks: the typed reply for a permanent deletion or a firmware update, the separate
+    acknowledgement for the rest (today a repair without component rollback)."""
+
+    def test_repair_acknowledgment_still_recorded_and_checked_at_begin(self):
+        self.plan_ready()
+        payload, inventory = {"fictional_repair": True}, {"fictional": True, "component": "example"}
+        plan = copy.deepcopy(self.plan)
+        plan["actions"][0].update(kind="repair", adapter_id="system.repair", requires_os_consent=True, requires_recovery=True,
+                                  recovery_evidence_ids=[self.verified_recovery()], adapter_payload_evidence_id=self.raw_evidence("adapter_payload", payload),
+                                  adapter_payload_sha256=digest(payload), adapter_plan_sha256=digest({"fictional": "repair plan"}),
+                                  target_inventory_evidence_id=self.raw_evidence("inventory", inventory), target_inventory_sha256=digest(inventory))
+        with mock.patch.object(engine_updates, "update_binding"):
+            self.register(plan)
+            self.approve("Apply this exact fictional repair.", "fictional-repair-plan")
+            self.assertIsNone(self.state()["approval"]["irreversible"])
+            self.engine.advance_stage(self.sid, evidence_ids=[])
+            with self.assertRaisesRegex(WorkflowRefusal, "separate acknowledgment: no component rollback"):
+                self.begin_action()
+            self.engine.record_irreversible_ack(self.sid, plan_sha256=self.plan_hash, action_ids=["fictional-action"], acknowledge_irreversible_loss=True,
+                                                owner_quote="I accept that this fictional repair cannot be rolled back.", owner_message_id="fictional-rollback")
+            self.assertEqual(self.state()["irreversible_ack"]["type"], "no_component_rollback")
+            # Past the acknowledgment, begin stops at its next check, the operating system's own consent.
+            with self.assertRaisesRegex(WorkflowRefusal, "protected OS consent"):
+                self.begin_action()
+        self.assertEqual(self.state()["operations"], {})
+
+    def test_typed_approval_satisfies_begin_for_its_ids_only(self):
+        phrase = self.purge_plan()
+        self.warn()
+        self.approve(phrase, "typed-ids")
+        state = self.state()
+        action = state["plan"]["document"]["actions"][0]
+        self.assertIsNone(engine_operations.typed_reply_covers(state, action))
+        # Another action id, with every other field of the reply and the warning unchanged, is not covered; nor is a plain approval.
+        other, plain = copy.deepcopy(state), copy.deepcopy(state)
+        for record in (other["approval"]["irreversible"], other["irreversible_warning"]):
+            record["action_ids"] = ["fictional-other-action"]
+        plain["approval"]["irreversible"] = None
+        for label, changed in (("other ids", other), ("plain approval", plain)):
+            with self.subTest(label), self.assertRaises(WorkflowRefusal) as caught:
+                engine_operations.typed_reply_covers(changed, action)
+            self.assertEqual(caught.exception.code, "typed-reply-required")
+        self.engine.advance_stage(self.sid, evidence_ids=[])
+        self.assertTrue(self.begin_action())
+
+    def test_typed_reply_approve_then_begin_end_to_end(self):
+        phrase = self.purge_plan()
+        data = self.engine.issue_irreversible_warning(self.sid, plan_sha256=self.plan_hash)["data"]
+        self.assertEqual(data["phrase"], phrase)
+        try:
+            self.engine.approve_plan(self.sid, plan_sha256=self.plan_hash, action_ids=["fictional-action"], owner_quote=data["phrase"],
+                                     owner_message_id="typed-end-to-end")
+        except WorkflowRefusal as error:
+            self.fail("the typed reply to the engine's warning was refused: " + error.code)
+        self.engine.advance_stage(self.sid, evidence_ids=[])
+        operation_id = self.begin_action()
+        operation = self.state()["operations"][operation_id]
+        self.assertEqual((operation["authorization"]["kind"], operation["authorization"]["message_id"]), ("exact_plan", "typed-end-to-end"))
 
 
 class WorkflowTests(WorkflowFixture):

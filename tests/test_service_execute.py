@@ -25,6 +25,7 @@ from workflow_service import WorkflowService, ServiceRefusal, verify_storage_art
 from storage_ops import StorageRefusal
 from scoped_fs import ScopedFSError
 from private_workspace import PrivateWorkspaceError, ensure_private_directory, write_private_new
+import storage_contract
 from service_execute import EXECUTE, STORAGE
 from service_reconcile import RECONCILE
 from test_service_state import ServiceFixtures, SessionFixtures, PROSE, PRIVATE_CAPABILITY_HOLDS, broad_namespace_fixture
@@ -35,7 +36,9 @@ class PauseBeforeEffectTests(ServiceFixtures):
     def test_pause_or_stop_after_intent_finishes_failed_before_any_storage_or_diagnostic_effect(self):
         # An owner pause or stop that lands between begin and the first effect finishes the consumed operation "failed":
         # _begin_adapter's stop response, never None, is what _run_adapter returns, with no effect boundary and no effect.
-        for adapter_id in [*STORAGE, pc_records.ADAPTER_DIAGNOSTIC_COLLECT]:
+        # STORAGE ids whose family is not written yet hold in their target before anything begins (DispatchTests).
+        written = [adapter_id for adapter_id in STORAGE if getattr(WorkflowService, EXECUTE[adapter_id]).__code__.co_names != ("_execute_held",)]
+        for adapter_id in [*written, pc_records.ADAPTER_DIAGNOSTIC_COLLECT]:
             for status in ("paused", "stopped"):
                 with self.subTest(adapter_id=adapter_id, status=status):
                     service, state, operation, events, written, arguments = self.prepared()
@@ -162,6 +165,46 @@ class BindingTests(ServiceFixtures):
                         "failure_code": "fictional-code" if label == "refusal" else None,
                         "instruction": "Preserve exact intent, native attempt/mapping and outputs; inspect actual state before any new plan."})
                     self.assertNotIn("private", str(result))
+
+
+class PrepareTests(ServiceFixtures):
+    """Fictional service objects: the payload prepare_storage_action builds; no files, engine or storage."""
+
+    def prepared(self, adapter_id, plan):
+        """(service, payload or None): prepare_storage_action with every dependency replaced by a mock."""
+        service = object.__new__(WorkflowService)
+        state = {"mode": "fixture"}
+        service._lock, service._state = mock.Mock(side_effect=nullcontext), mock.Mock(return_value=state)
+        service.protected_roots, service._storage = mock.Mock(return_value=[]), mock.Mock()
+        service._action = mock.Mock(return_value={"action_id": "prepared", "recovery_evidence_ids": []})
+        service.engine = types.SimpleNamespace(verify_recovery=mock.Mock(), read_session=mock.Mock(return_value=state))
+        service.prepare_storage_action("session-fixture", action_id="prepared", adapter_id=adapter_id, storage_plan=plan,
+                                       output_root=str(ROOT / "work" / "fictional-output"), **PROSE)
+        return service._action.call_args.kwargs["payload"]
+
+    def test_prepare_storage_action_fills_count_and_bytes_from_plan_rows(self):
+        purge = {"kind": "purge", "receipt": {"records": [{"original": {"size": 5}}, {"original": {"size": 7}}]}}
+        selected = {"kind": "delete_selected", "rows_file": {"row_count": 3, "row_bytes": 4096}}
+        originals = {"kind": "remove_originals", "files": [{"size": 0}, {"size": 9}, {"size": 1}]}
+        for adapter_id, plan, expected in ((pc_records.ADAPTER_STORAGE_PURGE, purge, (2, 12)), (pc_records.ADAPTER_STORAGE_DELETE_SELECTED, selected, (3, 4096)),
+                                           (pc_records.ADAPTER_STORAGE_REMOVE_ORIGINALS, originals, (3, 10))):
+            with self.subTest(adapter_id=adapter_id):
+                payload = self.prepared(adapter_id, plan)
+                self.assertEqual((payload["delete_count"], payload["delete_bytes"]), expected)
+        self.assertFalse(storage_contract.DELETION_FIELDS & set(self.prepared(pc_records.ADAPTER_STORAGE_BACKUP_CREATE, {"kind": "backup", "files": [{"size": 5}]})))
+        # A plan that lists nothing to delete, or no size for each item, is refused before anything is recorded.
+        for plan in ({"kind": "purge", "receipt": {"records": []}}, {"kind": "purge", "receipt": {}}, {"kind": "remove_originals", "files": [{"name": "x"}]},
+                     {"kind": "remove_originals", "files": [{"size": 1.5}]}, {"kind": "delete_selected", "rows_file": {"row_count": 0, "row_bytes": 0}},
+                     {"kind": "delete_selected", "rows_file": {"row_count": 2, "row_bytes": -1}}, {"kind": "delete_selected", "rows_file": []}):
+            with self.subTest(refused=plan), self.assertRaises(ServiceRefusal):
+                self.prepared(pc_records.ADAPTER_STORAGE_PURGE if plan["kind"] == "purge" else
+                              pc_records.ADAPTER_STORAGE_REMOVE_ORIGINALS if plan["kind"] == "remove_originals" else pc_records.ADAPTER_STORAGE_DELETE_SELECTED, plan)
+        # At execution the payload's count and size must still be exactly the plan's.
+        service = object.__new__(WorkflowService)
+        for changes in ({"delete_count": 2, "delete_bytes": 0}, {"delete_count": 3, "delete_bytes": 12}, {}):
+            payload = {"operation": pc_records.ADAPTER_STORAGE_PURGE, "mode": "fixture", "storage_plan": purge, **changes}
+            with self.subTest(executed=changes), self.assertRaises(ServiceRefusal):
+                WorkflowService._storage(service, {"mode": "fixture"}, payload)
 
 
 class WorkflowServiceTests(SessionFixtures):
@@ -418,7 +461,7 @@ class DispatchTests(SessionFixtures):
         plan = {"schema": "patchcairn.storage", "schema_version": 1, "kind": "retention_release", "records": records, "fixture": True}
         payload = {"schema": "patchcairn.storage.adapter", "schema_version": 1, "operation": pc_records.ADAPTER_STORAGE_RETENTION_RELEASE,
                    "storage_plan": plan, "storage_plan_sha256": digest(plan), "output_root": str(self.output), "mode": "fixture",
-                   "protected_roots": [str(self.output)]}
+                   "protected_roots": [str(self.output)], "delete_count": 1, "delete_bytes": 0}
         action = self.service._action(self.state(), action_id="release-kept", adapter_id=payload["operation"], kind="retention_release",
                                       payload=payload, native_plan=plan, inventory=records, **PROSE)
         try:
@@ -426,6 +469,26 @@ class DispatchTests(SessionFixtures):
         except WorkflowRefusal as error:
             self.fail("the retention release plan did not register: " + error.code)
         self.held_execution(action, sha)
+
+    def test_storage_table_names_delete_selected_and_remove_originals(self):
+        # Both permanent deletions have their storage rows (engine action kind, outcome-file name), so their family code
+        # needs no edit here; until it is written, each target holds before anything begins.
+        self.assertEqual(STORAGE.get(pc_records.ADAPTER_STORAGE_DELETE_SELECTED), ("delete_selected", "deletion"))
+        self.assertEqual(STORAGE.get(pc_records.ADAPTER_STORAGE_REMOVE_ORIGINALS), ("remove_originals", "removal"))
+        for adapter_id, (kind, _outcome) in STORAGE.items():
+            with self.subTest(adapter_id=adapter_id):
+                self.assertEqual(pc_records.ADAPTERS[adapter_id]["kinds"], (kind,))
+                self.assertIn(adapter_id, storage_contract.PLAN_KINDS)
+        self.assertEqual(len({outcome for _kind, outcome in STORAGE.values()}), len(STORAGE))
+        state = self.state()
+        for adapter_id in (pc_records.ADAPTER_STORAGE_DELETE_SELECTED, pc_records.ADAPTER_STORAGE_REMOVE_ORIGINALS):
+            with self.subTest(held=adapter_id), mock.patch.object(self.engine, "begin_operation") as begin:
+                with self.assertRaises(ServiceRefusal) as caught:
+                    getattr(self.service, EXECUTE[adapter_id])(self.sid, state, {"action_id": "held", "adapter_id": adapter_id}, {}, action_id="held",
+                                                               plan_sha256="a" * 64, precondition_evidence_ids=[], owner_consent_evidence_id=None,
+                                                               diagnostic_fixture_runner=None, diagnostic_fixture_result=None)
+                self.assertEqual((caught.exception.code, str(caught.exception)), BindingTests.HELD)
+                begin.assert_not_called()
 
 
 class CompositionTests(unittest.TestCase):

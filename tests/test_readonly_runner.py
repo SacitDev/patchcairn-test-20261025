@@ -285,6 +285,54 @@ class ReadonlyRunnerTests(unittest.TestCase):
             with self.assertRaises(Refusal):
                 readonly_runner.winget_executable(probe)
 
+    def test_recheck_executable_uses_the_kind_rules(self):
+        alias = routes.winget_alias_path(LOCAL_APPDATA)
+        target = ntpath.join("C:\\Program Files", "WindowsApps", APP_FOLDER, "winget.exe")
+        good = FakeProbe(platform="win32", aliases={alias: appexec_buffer([routes.WINGET_PACKAGE, routes.WINGET_PACKAGE + "!winget", target])})
+        record = readonly_runner.recheck_executable("winget", alias, None, probe=good)
+        self.assertEqual(record, {"package": APP_FOLDER})
+        self.assertEqual(readonly_runner.recheck_executable("winget", alias.upper(), record, probe=good), record)
+        other_family = FakeProbe(platform="win32", aliases={alias: appexec_buffer(["Contoso.Notes_abc123", "Contoso.Notes_abc123!App", target])})
+        for probe, path, identity in ((other_family, alias, None), (other_family, alias, record), (good, alias, {"package": "Microsoft.DesktopAppInstaller_9.9.9.9_x64__8wekyb3d8bbwe"}),
+                                      (good, "D:\\PatchCairnTest\\Other\\winget.exe", None), (FakeProbe(platform="win32", tags={alias: 0}), alias, None)):
+            with self.subTest(winget=(path, identity)), self.assertRaises(Refusal):
+                readonly_runner.recheck_executable("winget", path, identity, probe=probe)
+        # A POSIX system tool: listed folder, root-owned ancestry, identified by its resolved file.
+        self.assertEqual(readonly_runner.recheck_executable("system", "/usr/bin/apt-cache", None, probe=FakeProbe()), {"real_path": "/usr/bin/apt-cache"})
+        self.assertEqual(readonly_runner.recheck_executable("system", "/usr/bin/dnf", {"real_path": "/usr/bin/dnf5"}, probe=FakeProbe()),
+                         {"real_path": "/usr/bin/dnf5"})
+        for probe, path, identity in ((FakeProbe(files={"/usr/bin/apt-cache": regular(1000)}), "/usr/bin/apt-cache", None),
+                                      (FakeProbe(files=OUTSIDE), "/usr/local/bin/uname", None), (FakeProbe(), "/usr/bin/dnf", {"real_path": "/usr/bin/dnf4"}),
+                                      (FakeProbe(), "apt-cache", None)):
+            with self.subTest(system=(path, identity)), self.assertRaises(Refusal):
+                readonly_runner.recheck_executable("system", path, identity, probe=probe)
+        # A Windows system tool is a plain file in the system folder.
+        whoami = ntpath.join(SYSTEM_DIR, "whoami.exe")
+        self.assertEqual(readonly_runner.recheck_executable("system", whoami, None, probe=FakeProbe(platform="win32")), {"real_path": whoami})
+        with self.assertRaises(Refusal):
+            readonly_runner.recheck_executable("system", "C:\\Tools\\whoami.exe", None, probe=FakeProbe(platform="win32"))
+        # Homebrew at its documented prefix, owned by this account.
+        mac = FakeProbe(platform="darwin")
+        self.assertEqual(readonly_runner.recheck_executable("brew", "/opt/homebrew/bin/brew", None, probe=mac), {"real_path": "/opt/homebrew/bin/brew"})
+        for probe, path in ((FakeProbe(platform="darwin", files={"/opt/homebrew/bin/brew": regular(0)}), "/opt/homebrew/bin/brew"),
+                            (mac, "/usr/local/bin/brew"), (FakeProbe(platform="linux"), "/opt/homebrew/bin/brew")):
+            with self.subTest(brew=path), self.assertRaises(Refusal):
+                readonly_runner.recheck_executable("brew", path, None, probe=probe)
+        for kind, path in (("python", "/usr/bin/python3"), ("node", "/usr/bin/node"), (None, "/usr/bin/apt-cache"), ("system", None), ("system", "")):
+            with self.subTest(kind=kind, path=path), self.assertRaises(Refusal):
+                readonly_runner.recheck_executable(kind, path, None, probe=FakeProbe())
+
+    def test_executable_prefix_empty_for_existing_kinds(self):
+        for kind in ("winget", "system", "brew"):
+            with self.subTest(kind=kind):
+                self.assertEqual(readonly_runner.executable_prefix(kind), ())
+        for kind in ("python", "node", "sudo", "", None, ["winget"]):
+            with self.subTest(refused=kind), self.assertRaises(Refusal) as caught:
+                readonly_runner.executable_prefix(kind)
+            self.assertEqual(caught.exception.code, "runner-executable-kind")
+        with self.assertRaises(TypeError):
+            readonly_runner.EXECUTABLE_PREFIXES["winget"] = ("--extra",)
+
     def test_winget_output_file_goes_only_into_a_private_run_folder(self):
         alias = routes.winget_alias_path(LOCAL_APPDATA)
         target = ntpath.join("C:\\Program Files", "WindowsApps", APP_FOLDER, "winget.exe")

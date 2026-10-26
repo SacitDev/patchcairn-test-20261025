@@ -33,6 +33,8 @@ STORAGE = {
     pc_records.ADAPTER_STORAGE_QUARANTINE: ("cleanup_quarantine", "quarantine"),
     pc_records.ADAPTER_STORAGE_QUARANTINE_RESTORE: ("backup_restore", "quarantine-restore"),
     pc_records.ADAPTER_STORAGE_PURGE: ("permanent_purge", "purge"),
+    pc_records.ADAPTER_STORAGE_DELETE_SELECTED: ("delete_selected", "deletion"),
+    pc_records.ADAPTER_STORAGE_REMOVE_ORIGINALS: ("remove_originals", "removal"),
 }
 # Every adapter id's execute target: the name of a private WorkflowService method defined in the module of the
 # id's family (pc_records.ADAPTERS[id]["family"]). Each takes (session_id, state, action, payload, **arguments)
@@ -47,13 +49,35 @@ EXECUTE = {
     pc_records.ADAPTER_STORAGE_RETENTION_RELEASE: "_execute_storage_retention_release",
     pc_records.ADAPTER_STORAGE_RETENTION_FORGET: "_execute_storage_retention_forget",
     pc_records.ADAPTER_STORAGE_SESSION_RELEASE: "_execute_storage_session_release",
+    pc_records.ADAPTER_STORAGE_DELETE_SELECTED: "_execute_storage_delete_selected",
     pc_records.ADAPTER_PACKAGE_UPGRADE: "_execute_package_upgrade",
     pc_records.ADAPTER_PACKAGE_REINSTALL: "_execute_package_reinstall",
     pc_records.ADAPTER_SYSTEM_REPAIR: "_execute_system_repair",
+    pc_records.ADAPTER_SYSTEM_UPDATE_HANDOFF: "_execute_system_update_handoff",
+    pc_records.ADAPTER_SYSTEM_FIRMWARE_UPDATE: "_execute_system_firmware_update",
     pc_records.ADAPTER_DIAGNOSTIC_COLLECT: "_execute_diagnostic_collect",
     pc_records.ADAPTER_FIXTURE_ASSESSMENT: "_execute_fixture_assessment",
     pc_records.ADAPTER_SYSTEM_REVIEWED_EXTERNAL: "_execute_system_reviewed_external",
 }
+
+
+def deletion_size(adapter_id, plan):
+    """(number of items, bytes) that a permanent deletion removes, read from its hash-bound plan rows: the plan's
+    rows_file (row_count, row_bytes), else the size of each row in files, else of each original in the receipt's records.
+    (None, None) for an adapter whose facts list no permanent data loss."""
+    if "permanent_data_loss" not in pc_records.ADAPTERS[adapter_id]["acknowledgments"]:
+        return None, None
+    try:
+        if "rows_file" in plan:
+            count, size = plan["rows_file"]["row_count"], plan["rows_file"]["row_bytes"]
+        else:
+            rows = plan["files"] if "files" in plan else [row["original"] for row in plan["receipt"]["records"]]
+            count, size = len(rows), sum(row["size"] for row in rows)
+    except (KeyError, TypeError) as error:
+        raise ServiceRefusal("A permanent deletion's plan must list the items it deletes and their sizes") from error
+    if type(count) is not int or count < 1 or type(size) is not int or size < 0:
+        raise ServiceRefusal("A permanent deletion's plan must list the items it deletes and their sizes")
+    return count, size
 
 
 class ExecuteMixin:
@@ -95,6 +119,9 @@ class ExecuteMixin:
     def _storage(self, state, payload):
         if payload["operation"] not in STORAGE or payload["mode"] != state["mode"]:
             raise ServiceRefusal("Unsupported storage adapter or mode")
+        # The typed reply named this number and size, so they must be exactly what the reviewed plan deletes.
+        if (payload.get("delete_count"), payload.get("delete_bytes")) != deletion_size(payload["operation"], payload["storage_plan"]):
+            raise ServiceRefusal("The deletion's number of items or size differs from the reviewed plan")
         output = self._owned(payload["output_root"], state=state, existing=True)
         protections = payload["protected_roots"]
         if not isinstance(protections, list) or len(set(protections)) != len(protections) or not set(self.protected_roots()) <= set(protections):
@@ -144,6 +171,9 @@ class ExecuteMixin:
                        "output_root": str(output_root), "mode": state["mode"], "protected_roots": protections}
             if restore_probe_destination is not None:
                 payload["restore_probe_destination"] = str(restore_probe_destination)
+            count, size = deletion_size(adapter_id, payload["storage_plan"])
+            if count is not None:
+                payload.update(delete_count=count, delete_bytes=size)
             service = self._storage(state, payload)
             service.check_preconditions(plan=payload["storage_plan"], expected_plan_sha256=payload["storage_plan_sha256"])
             if adapter_id == pc_records.ADAPTER_STORAGE_QUARANTINE_RESTORE:

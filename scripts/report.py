@@ -126,6 +126,7 @@ TARGETS = {"whole_device": "the whole computer", "selected_paths": "selected fol
            "specific_problem": "one specific problem"}
 OPERATIONS = {"metadata": "file and system details", "diagnosis": "problem diagnosis", "content_read": "reading selected file contents"}
 RESTART_CHOICES = {"defer": "Restart later", "authorize": "Restart allowed; you restart the computer yourself"}
+TYPED_REPLIES = {"permanent_data_loss": "Permanent deletion", "firmware_risk": "Firmware update"}
 RESOLUTIONS = {"replan_required": "A new plan is needed before anything else changes",
                "effects_accounted": "What changed was accounted for after the session stopped"}
 UNSETTLED = frozenset({"failed", "partial", "unknown"})
@@ -441,8 +442,20 @@ def _other_decisions(session, current):
     return blocks + [block for _, _, block in sorted(restarts, key=lambda entry: entry[:2])]
 
 
+def _typed_reply(record, where):
+    """The approval's typed reply to the warning of a permanent deletion or a firmware update, as one row."""
+    reply = _value(record, "irreversible", dict, where, nullable=True)
+    if reply is None:
+        return ["Typed reply to a warning", "Not needed for these actions"]
+    place, size = "typed reply", _count(reply, "bytes", "typed reply")
+    return ["Typed reply to a warning", _worded(_value(reply, "type", str, place), TYPED_REPLIES) + "; number in the reply: "
+            + str(_value(reply, "number", int, place)) + ("" if size is None else "; size: " + _bytes(size))
+            + "; actions: " + _joined(_texts(reply, "action_ids", place))]
+
+
 def _approval_rows(record, where, current, windows):
-    return [["Approved actions", _joined(_texts(record, "action_ids", where))], _plan_hash(record, where, current)]
+    rows = [["Approved actions", _joined(_texts(record, "action_ids", where))], _plan_hash(record, where, current)]
+    return rows + ([_typed_reply(record, where)] if "irreversible" in record else [])
 
 
 def _ack_rows(record, where, current, windows):
@@ -457,12 +470,13 @@ def _policy_rows(record, where, current, windows):
 
 
 def _approvals(session, current, windows):
-    """The plan approval, the irreversible-loss acknowledgment and the standing policy, each in its place, then the
+    """The plan approval (with its typed reply), the separate acknowledgment and the standing policy, each in its place, then the
     other owner decisions."""
     blocks = [_note(DECISIONS_NOTE)]
     for key, name, where, rows in (
             ("approval", "Plan approval", "plan approval", _approval_rows),
-            ("irreversible_ack", "Agreement to a permanent deletion (irreversible-loss acknowledgment)", "irreversible-loss acknowledgment", _ack_rows),
+            ("irreversible_ack", "Agreement that a repair cannot be rolled back (separate acknowledgment)", "separate acknowledgment",
+             _ack_rows),
             ("standing_policy", "Standing permission for routine steps (standing policy)", "standing policy", _policy_rows)):
         record = _value(session, key, dict, "session", nullable=True)
         blocks.append(_note(name + ": " + NOT_RECORDED + ".") if record is None

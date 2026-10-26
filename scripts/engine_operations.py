@@ -6,10 +6,20 @@ from __future__ import annotations
 import uuid
 
 from engine_journal import OUTCOMES, WorkflowRefusal, bounded_text, outstanding_effects, record_identifier, require_writable, utc_time
-from engine_plans import (acknowledgments, action_authorization, action_binding, add_checkpoint, current_plan, next_action_checkpoint, pending_items,
-                          require_reviews)
+from engine_plans import (TYPED_ACKNOWLEDGMENTS, acknowledgments, action_authorization, action_binding, add_checkpoint, current_plan, next_action_checkpoint,
+                          pending_items, require_reviews)
 import pc_records
 from pc_records import digest
+
+
+def typed_reply_covers(state, action):
+    """Refuse unless the approval's typed reply covers ``action``: given after the current warning of this exact plan, for
+    the warned actions, number and bytes, and of the acknowledgment the action needs."""
+    reply, warning = (state["approval"] or {}).get("irreversible") or {}, state["irreversible_warning"] or {}
+    if (action["action_id"] not in reply.get("action_ids", ()) or reply.get("type") not in acknowledgments(action)
+            or warning.get("plan_sha256") != state["plan"]["sha256"] or reply.get("warning_revision") != warning.get("revision")
+            or [reply.get(key) for key in ("action_ids", "number", "bytes")] != [warning.get(key) for key in ("action_ids", "number", "bytes")]):
+        raise WorkflowRefusal("This exact action needs the owner's typed reply to its current warning", code="typed-reply-required")
 
 
 def begin_operation(engine, session_id, *, action_id, plan_sha256, precondition_evidence_ids, owner_consent_evidence_id=None, expected_revision=None):
@@ -35,6 +45,9 @@ def begin_operation(engine, session_id, *, action_id, plan_sha256, precondition_
             raise WorkflowRefusal("An action is already active or consumed; no automatic retry")
         authorization = action_authorization(state, action)
         for acknowledgment in acknowledgments(action):
+            if acknowledgment in TYPED_ACKNOWLEDGMENTS:
+                typed_reply_covers(state, action)
+                continue
             ack = state["irreversible_ack"]
             if (not ack or ack["type"] != acknowledgment or ack["plan_sha256"] != plan_sha256 or action_id not in ack["action_ids"]
                     or ack["settings_revision"] != state["settings_revision"] or ack["scope_sha256"] != digest(state["settings"]["scope"])):

@@ -39,7 +39,8 @@ HOSTILE = ("</script><script>globalThis.injected=1</script><!-- <img src=x onerr
 SUMMARY = "patchcairn.assessment.summary"
 OPERATION = "operation-" + "0" * 32
 # The record digest of report_session() rendered at CLOCK (PLAN.md 4.4 step 6: the report record layout).
-GOLDEN_SHA256 = "7512daed5dfcaaced5cbae637582828dbe6ab610413a25f3ad4cd94b62aaac87"
+# Changed by the approval's typed-reply row and the relabelled separate acknowledgment (was 7512daed5dfc...).
+GOLDEN_SHA256 = "7d0939feda41d3c7794df452437fa5d8b0935f1942e18c356d6eb70d577e0e65"
 
 
 def owner(quote, message_id, **extra):
@@ -73,8 +74,8 @@ def report_session(**changes):
         "reviews": [dict(review, reviewer_id="fictional-reviewer-a", role="compatibility_data"),
                     dict(review, reviewer_id="fictional-reviewer-b", role="evidence_security")],
         "approval": owner("Apply this exact fictional action.", "fictional-plan", plan_sha256=plan_sha256, action_ids=["fictional-action"],
-                          permanent_loss_action_ids=[]),
-        "irreversible_ack": None, "standing_policy": None,
+                          permanent_loss_action_ids=[], irreversible=None),
+        "irreversible_ack": None, "standing_policy": None, "irreversible_warning": None, "used_message_ids": [], "conditional_decisions": [],
         "operations": {OPERATION: {"operation_id": OPERATION, "action_id": "fictional-action", "plan_sha256": plan_sha256,
                                    "settings_revision": 0, "started_utc": CLOCK, "finished_utc": CLOCK, "outcome": "succeeded",
                                    "evidence_ids": [], "summary": "Fictional outcome as recorded", "authorization": {},
@@ -580,7 +581,7 @@ class ReportTests(unittest.TestCase):
                                                      "Evidence: not recorded."])
         self.assertIn("That does not mean the computer has none", report.NO_FINDINGS)
         self.assertEqual(notes(record, "approvals"), [report.DECISIONS_NOTE, "Plan approval: not recorded.",
-                                                      "Agreement to a permanent deletion (irreversible-loss acknowledgment): not recorded.",
+                                                      "Agreement that a repair cannot be rolled back (separate acknowledgment): not recorded.",
                                                       "Standing permission for routine steps (standing policy): not recorded."])
         self.assertEqual(record["scope"][-2:], [["note", "Scope decision: not recorded."], ["note", report.SCOPE_NOTE]])
         for key in ("plan", "reviews", "outcomes", "free_space", "packages", "retained"):
@@ -638,6 +639,22 @@ class ReportTests(unittest.TestCase):
         for text in (report.DECISIONS_NOTE, report.SCOPE_NOTE, report.REVIEWS_NOTE, report.OWNER_ATTESTED, report.REVIEW_ATTESTED, report.UNLABELLED):
             self.assertIsNone(re.search(r"(?i)proves? (that )?(a|the) (human|person|owner)|independent|verified by", text))
 
+    def test_typed_reply_has_its_own_row_in_the_approval(self):
+        plan_sha256 = report_session()["plan"]["sha256"]
+        reply = {"type": "permanent_data_loss", "action_ids": ["fictional-action"], "number": 3, "bytes": 2048, "warning_revision": 7}
+
+        def row(value):
+            approval = owner("delete 3 files", "fictional-typed", plan_sha256=plan_sha256, action_ids=["fictional-action"],
+                             permanent_loss_action_ids=["fictional-action"], irreversible=value)
+            return decision(rendered(report_session(approval=approval)), "Plan approval")["Typed reply to a warning"]
+        self.assertEqual(row(reply), "Permanent deletion (permanent_data_loss); number in the reply: 3; size: 2,048 bytes; actions: fictional-action")
+        self.assertEqual(row(dict(reply, type="firmware_risk", number=2, bytes=None)),
+                         "Firmware update (firmware_risk); number in the reply: 2; actions: fictional-action")
+        self.assertEqual(row(None), "Not needed for these actions")
+        for bad in (dict(reply, number="3"), dict(reply, action_ids="fictional-action"), dict(reply, bytes=-1), "delete 3 files"):
+            with self.subTest(bad=bad), self.assertRaises(pc_records.Refusal):
+                row(bad)
+
     def test_every_owner_decision_is_shown(self):
         plan_sha256 = report_session()["plan"]["sha256"]
         operation = dict(report_session()["operations"][OPERATION], restart_decision=owner(
@@ -648,7 +665,7 @@ class ReportTests(unittest.TestCase):
             return dict(owner(quote, message_id, **extra), recorded_utc=f"2026-01-02T03:04:{seconds:02d}Z")
 
         session = report_session(
-            irreversible_ack=owner("I accept the fictional loss.", "fictional-ack", type="permanent_data_loss", plan_sha256=plan_sha256,
+            irreversible_ack=owner("I accept the fictional loss.", "fictional-ack", type="no_component_rollback", plan_sha256=plan_sha256,
                                    action_ids=["fictional-action"], scope_sha256="b" * 64, acknowledge_irreversible_loss=True),
             standing_policy=owner("Allow fictional routine steps.", "fictional-policy", action_kinds=["backup_create"], targets=["Fictional A"],
                                   action_bindings=[], max_actions=3, used_actions=1, expires_utc=CLOCK, scope_sha256="b" * 64),
@@ -680,7 +697,7 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(list(session["pending"])[:3], ["assessment-finish-x", "checkpoint-open", "checkpoint-plan"])
         record = rendered(session)
         names = [dict(item)["Decision"] for item in items(record, "approvals")]
-        self.assertEqual(names, ["Plan approval", "Agreement to a permanent deletion (irreversible-loss acknowledgment)",
+        self.assertEqual(names, ["Plan approval", "Agreement that a repair cannot be rolled back (separate acknowledgment)",
                                  "Standing permission for routine steps (standing policy)", "Go-ahead at a checkpoint",
                                  "Choice after an unfinished step (reconciliation)",
                                  "Operating-system permission prompt handled (protected consent)", "Assessment closed (assessment completion)",

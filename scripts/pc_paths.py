@@ -325,7 +325,36 @@ def _root_names(abs_path):
     return parts[_temporary_length(parts):] if flavor == "posix" else parts
 
 
-def _matches(names, *, selected_root=False):
+def _same_name(left, right):
+    """Equal names, letter case ignored one character at a time (as NTFS compares), so a look-alike that Unicode case
+    folding would equate, such as U+212A (Kelvin sign) for "k", stays a different name."""
+    return len(left) == len(right) and all(a == b or a.upper() == b.upper() for a, b in zip(left, right))
+
+
+def _temp_exemption(abs_path, junk_root):
+    """The position of the one AppData component of ``abs_path`` that the Windows temp exemption admits, or None.
+
+    ``junk_root`` must be a plain absolute Windows drive path whose last three components are AppData, Local and Temp;
+    the exempt component is its third-from-last, by position. ``abs_path`` must be on the same drive and equal to
+    ``junk_root`` or below it, compared component by component with letter case ignored. Anything else is no exemption.
+    """
+    try:
+        raws = [os.fspath(abs_path), os.fspath(junk_root)]
+    except TypeError:
+        return None
+    if not all(isinstance(raw, str) and _DRIVE.match(raw) for raw in raws) or raws[0][0].upper() != raws[1][0].upper():
+        return None
+    path, temp = _split_absolute(raws[0]), _split_absolute(raws[1])
+    if path is None or temp is None:
+        return None
+    path, temp = path[1], temp[1]
+    if (len(temp) < 3 or not all(map(_same_name, temp[-3:], ("appdata", "local", "temp"))) or len(path) < len(temp)
+            or not all(map(_same_name, path, temp))):
+        return None
+    return len(temp) - 3
+
+
+def _matches(names, *, selected_root=False, exempt=None):
     folded = []
     for name in names:
         name = _IGNORABLE.sub("", name)
@@ -333,7 +362,9 @@ def _matches(names, *, selected_root=False):
             return True
         # Windows ignores trailing dots and spaces and treats ':' as a stream separator, so compare the base name.
         folded.append(name.split(":", 1)[0].rstrip(". ").casefold())
-    for name in folded:
+    for index, name in enumerate(folded):
+        if index == exempt and name == "appdata":
+            continue
         dashed = name.replace(" ", "-")
         if (name in PROTECTED_COMPONENTS or name in PROTECTED_FILES or name.startswith(PROTECTED_PREFIXES)
                 or any(dashed == prefix or dashed.startswith(prefix + "-") for prefix in BROWSER_PREFIXES)):
@@ -352,25 +383,27 @@ def _matches(names, *, selected_root=False):
     return bool(folded) and PurePosixPath(folded[-1]).suffix in PROTECTED_SUFFIXES
 
 
-def protected(rel, *, root=None):
+def protected(rel, *, root=None, junk_root=None):
     """True if a path relative to the selected root names private data.
 
     With ``root``, the root's own components count too, so a name pair such as
     Library/Messages is found when the selection is the Library folder itself.
+    ``junk_root`` is the Windows temp folder (...\\AppData\\Local\\Temp) as the operating system reports it: when the root
+    is that folder or below it, its AppData component is not counted as private. Every other rule still applies.
     """
     rel = os.fspath(rel)
     if not isinstance(rel, str):
         raise TypeError("protected needs a text path")
-    names = _SEPARATORS.split(rel)
+    names, exempt = _SEPARATORS.split(rel), None
     if root is not None:
         prefix = _root_names(root)
         if prefix is None:
             return True
-        names = prefix + names
-    return _matches(names)
+        names, exempt = prefix + names, _temp_exemption(root, junk_root)
+    return _matches(names, exempt=exempt)
 
 
-def protected_root(abs_path):
+def protected_root(abs_path, *, junk_root=None):
     """True if an owner-selected source or restore target must be refused: a system root, a protected
     name anywhere in its absolute path, or a domain controller's NTDS folder (Windows/NTDS, WINNT/NTDS)
     or anything below one.
@@ -378,7 +411,8 @@ def protected_root(abs_path):
     Only the harmless temporary prefixes in TEMPORARY_PREFIXES and /run/user/<uid> are skipped before
     matching; anything that is not a plain absolute path is refused. Generic names match too broadly
     (a clone under ~/git, a folder named vault), so backup destinations and PatchCairn's own work folder
-    are checked with is_system_root instead.
+    are checked with is_system_root instead. ``junk_root`` admits the Windows temp folder and what is below it, as in
+    protected().
     """
     names = _root_names(abs_path)
-    return names is None or is_system_root(abs_path) or _matches(names, selected_root=True)
+    return names is None or is_system_root(abs_path) or _matches(names, selected_root=True, exempt=_temp_exemption(abs_path, junk_root))

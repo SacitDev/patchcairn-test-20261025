@@ -5,6 +5,7 @@ Cleanup family (scripts/service_cleanup.py): quarantine reservations and the bac
 from __future__ import annotations
 import copy
 from contextlib import nullcontext
+import json
 import os
 from pathlib import Path
 import sys
@@ -31,13 +32,17 @@ class WorkflowServiceTests(SessionFixtures):
         recovery = self.service.register_recovery(sid, output_root=str(self.output), backup_receipt=backup, restore_receipt=restore)
         plan = self.storage().plan_purge(receipt=receipt)
         action = self.service.prepare_storage_action(sid, action_id="purge-selected", adapter_id="storage.purge", storage_plan=plan, output_root=str(self.output), recovery_evidence_ids=[recovery["evidence_id"]], **PROSE)
-        sha = self.approve(action, sid=sid, purge_choice=True)
-        with self.assertRaises(WorkflowRefusal):
-            self.execute(action, sha, sid=sid)
+        # The plan's count and size travel in the payload that the owner's typed reply names: one file.
+        row = self.state(sid)["evidence"][action["adapter_payload_evidence_id"]]
+        payload = json.loads((self.engine.work / sid / row["path"]).read_bytes())
+        self.assertEqual((payload["delete_count"], payload["delete_bytes"]), (1, plan["receipt"]["records"][0]["original"]["size"]))
+        # A plain approval is refused; nothing is deleted and no operation begins.
+        with self.assertRaises(WorkflowRefusal) as caught:
+            self.approve(action, sid=sid)
+        self.assertEqual(caught.exception.code, "typed-reply-warning")
         self.assertEqual(self.state(sid)["operations"], {})
         self.assertTrue((self.output / "quarantine" / "000001").exists())
-        self.engine.record_irreversible_ack(sid, plan_sha256=sha, action_ids=[action["action_id"]], acknowledge_irreversible_loss=True,
-                    owner_quote="I acknowledge irreversible loss for this exact synthetic purge.", owner_message_id="separate-purge-loss")
+        sha = self.approve(action, sid=sid, purge_choice=True)
         result = self.execute(action, sha, sid=sid)
         self.assertEqual(result["outcome"], "succeeded")
         self.assertFalse((self.output / "quarantine" / "000001").exists())
@@ -69,7 +74,8 @@ class ServicePrivacyTests(ServiceFixtures):
             lower.assert_not_called()
         service._storage = mock.Mock()
         action = {"action_id": "purge-fixture", "adapter_id": "storage.purge", "recovery_evidence_ids": ["unrelated-backup"]}
-        plan = {"kind": "purge", "receipt": {"recovery_required": True, "recovery_backup": {}, "recovery_verification": {}}}
+        plan = {"kind": "purge", "receipt": {"recovery_required": True, "recovery_backup": {}, "recovery_verification": {},
+                                             "records": [{"original": {"size": 7}}]}}
         service._action = mock.Mock(return_value=action)
         with self.assertRaises(WorkflowRefusal):
             service.prepare_storage_action("session-fixture", action_id=action["action_id"], adapter_id=action["adapter_id"],

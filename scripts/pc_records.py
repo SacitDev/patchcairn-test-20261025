@@ -56,10 +56,14 @@ SCHEMAS = frozenset({
     "patchcairn.restart.pending", "patchcairn.restart.verification", "patchcairn.service", "patchcairn.storage",
     "patchcairn.storage.adapter", "patchcairn.windows.boot.observation",
     "patchcairn.package", "patchcairn.schedule", "patchcairn.report", "patchcairn.review",
+    "patchcairn.deletion.attempt", "patchcairn.deletion.receipt", "patchcairn.handoff.receipt", "patchcairn.firmware.receipt",
+    "patchcairn.boot.observation",
 })
 # Names whose family is not written yet. They may not have a reader; each leaves this set when its
 # family's reader is registered, and the set is empty in a finished release.
-PLANNED_SCHEMAS = frozenset({"patchcairn.package", "patchcairn.schedule", "patchcairn.review"})
+PLANNED_SCHEMAS = frozenset({"patchcairn.package", "patchcairn.schedule", "patchcairn.review", "patchcairn.deletion.attempt",
+                             "patchcairn.deletion.receipt", "patchcairn.handoff.receipt", "patchcairn.firmware.receipt",
+                             "patchcairn.boot.observation"})
 CONTAINERS = frozenset({
     "engine_marker", "session_state", "session_creation", "response_envelope",
     "workflows_template", "tool_catalog", "toolkit_marker",
@@ -350,19 +354,40 @@ def bounded_text(value, name="text", limit=4000):
     return value
 
 
-ACKNOWLEDGMENTS = frozenset({"permanent_data_loss", "no_component_rollback", "non_private_destination"})
+ACKNOWLEDGMENTS = frozenset({"permanent_data_loss", "no_component_rollback", "non_private_destination", "firmware_risk"})
 FAMILIES = frozenset({"backup", "restore", "cleanup", "retention", "update", "repair", "assessment"})
 OS_CONSENT = ("never", "per_route", "always")
 BACKUP_RECEIPT = ("none", "optional", "required")
+# Decisions the owner gives in their own message for one action and payload (never a policy or a fired run).
+CONDITIONAL_DECISIONS = frozenset({"run_install_scripts", "runtime_line_change"})
+# How an update runs: a process PatchCairn starts, a terminal the person sees, or a Settings page the person uses.
+RUN_KINDS = ("process", "terminal", "settings")
+# The flags a package route may put on a planned item.
+ROUTE_FLAGS = frozenset({"adds_packages", "downgrades", "major_jump", "runtime_line_change", "install_scripts", "restart_likely",
+                         "host_package", "own_runtime", "high_risk", "firmware", "needs_mains_power", "device_unusable_during_update",
+                         "dual_image", "verify_after_restart"})
+# Update results only (package rows, system update hand-offs and firmware updates): each result has one category,
+# and each row is shown in one group.
+OUTCOME_CATEGORIES = ("updated_checked", "need_restart", "did_not_update", "skipped_by_you", "update_yourself", "waiting_decision",
+                      "needs_check")
+OUTCOME_GROUPS = ("system_drivers", "apps", "programming_tools", "update_yourself", "your_decision")
+UPDATE_RESULTS = MappingProxyType({
+    "updated": "updated_checked", "restart_needed": "need_restart", "waiting_for_you": "waiting_decision",
+    "conditional_pending": "waiting_decision", "did_not_update": "did_not_update", "not_installed_power": "did_not_update",
+    "not_run": "did_not_update", "excluded": "skipped_by_you", "update_yourself": "update_yourself", "integrity_failure": "needs_check",
+    "could_not_check": "needs_check", "device_not_responding": "needs_check", "differs_from_plan": "needs_check", "unknown": "needs_check",
+})
 
 
 def _facts(family, kinds, *, acknowledgments=(), conditional=(), backup_receipt="none", policy_coverable=False,
-           scheduled_policy_coverable=False, os_consent="never", irreversible=False, transitional=False):
+           scheduled_policy_coverable=False, os_consent="never", irreversible=False, transitional=False, conditional_decisions=(),
+           run_kinds=(), independent_failures=False):
     return MappingProxyType({
         "family": family, "kinds": kinds, "acknowledgments": acknowledgments, "conditional_acknowledgments": conditional,
         "backup_receipt": backup_receipt, "policy_coverable": policy_coverable,
         "scheduled_policy_coverable": scheduled_policy_coverable, "os_consent": os_consent,
-        "irreversible": irreversible, "transitional": transitional})
+        "irreversible": irreversible, "transitional": transitional, "conditional_decisions": conditional_decisions,
+        "run_kinds": run_kinds, "independent_failures": independent_failures})
 
 
 ADAPTER_STORAGE_BACKUP_CREATE = "storage.backup_create"
@@ -374,9 +399,12 @@ ADAPTER_STORAGE_REMOVE_ORIGINALS = "storage.remove_originals"
 ADAPTER_STORAGE_RETENTION_RELEASE = "storage.retention_release"
 ADAPTER_STORAGE_RETENTION_FORGET = "storage.retention_forget"
 ADAPTER_STORAGE_SESSION_RELEASE = "storage.session_release"
+ADAPTER_STORAGE_DELETE_SELECTED = "storage.delete_selected"
 ADAPTER_PACKAGE_UPGRADE = "package.upgrade"
 ADAPTER_PACKAGE_REINSTALL = "package.reinstall"
 ADAPTER_SYSTEM_REPAIR = "system.repair"
+ADAPTER_SYSTEM_UPDATE_HANDOFF = "system.update_handoff"
+ADAPTER_SYSTEM_FIRMWARE_UPDATE = "system.firmware_update"
 ADAPTER_DIAGNOSTIC_COLLECT = "diagnostic.collect"
 ADAPTER_FIXTURE_ASSESSMENT = "fixture.assessment"
 ADAPTER_SYSTEM_REVIEWED_EXTERNAL = "system.reviewed_external"
@@ -392,6 +420,9 @@ ADAPTER_SYSTEM_REVIEWED_EXTERNAL = "system.reviewed_external"
 # - storage.retention_forget forgets folders that were deleted outside PatchCairn; its executor refuses
 #   if any target still exists, so it needs no loss acknowledgment.
 # - "transitional": today's local-installer route, kept only until the package routes replace it.
+# - "conditional_decisions": decisions a flagged payload of the adapter needs in their own owner message;
+#   "run_kinds": the ways it may run (RUN_KINDS); "independent_failures": a failure with a verified postcondition
+#   stops only the failed action's dependents, not the other actions of the plan.
 ADAPTERS = MappingProxyType({
     ADAPTER_STORAGE_BACKUP_CREATE: _facts("backup", ("backup_create",), conditional=("non_private_destination",),
                                           policy_coverable=True, scheduled_policy_coverable=True),
@@ -408,10 +439,18 @@ ADAPTERS = MappingProxyType({
     ADAPTER_STORAGE_RETENTION_FORGET: _facts("retention", ("retention_forget",)),
     ADAPTER_STORAGE_SESSION_RELEASE: _facts("retention", ("session_release",), acknowledgments=("permanent_data_loss",),
                                             irreversible=True),
-    ADAPTER_PACKAGE_UPGRADE: _facts("update", ("update",), policy_coverable=True, os_consent="per_route"),
-    ADAPTER_PACKAGE_REINSTALL: _facts("repair", ("repair",), os_consent="per_route"),
+    ADAPTER_STORAGE_DELETE_SELECTED: _facts("cleanup", ("delete_selected",), acknowledgments=("permanent_data_loss",), irreversible=True,
+                                            independent_failures=True),
+    ADAPTER_PACKAGE_UPGRADE: _facts("update", ("update",), policy_coverable=True, os_consent="per_route",
+                                    conditional_decisions=("run_install_scripts", "runtime_line_change"), run_kinds=("process", "terminal"),
+                                    independent_failures=True),
+    ADAPTER_PACKAGE_REINSTALL: _facts("repair", ("repair",), os_consent="per_route", run_kinds=("process", "terminal")),
     ADAPTER_SYSTEM_REPAIR: _facts("repair", ("repair",), acknowledgments=("no_component_rollback",), os_consent="always",
-                                  irreversible=True),
+                                  irreversible=True, run_kinds=("process", "terminal")),
+    ADAPTER_SYSTEM_UPDATE_HANDOFF: _facts("update", ("system_update",), os_consent="per_route", run_kinds=("settings",),
+                                          independent_failures=True),
+    ADAPTER_SYSTEM_FIRMWARE_UPDATE: _facts("update", ("firmware_update",), acknowledgments=("firmware_risk",), os_consent="per_route",
+                                           irreversible=True, run_kinds=("terminal", "settings")),
     ADAPTER_DIAGNOSTIC_COLLECT: _facts("assessment", ("assessment",)),
     ADAPTER_FIXTURE_ASSESSMENT: _facts("assessment", ("assessment",)),
     ADAPTER_SYSTEM_REVIEWED_EXTERNAL: _facts("update", ("update", "repair"), os_consent="always", transitional=True),

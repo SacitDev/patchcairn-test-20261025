@@ -27,6 +27,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import private_workspace
 import workflow_core
 import engine_journal
+import engine_plans
 from workflow_core import JOBS, WorkflowEngine, WorkflowRefusal, PrivacyCapabilityHold, digest, encoded
 import pc_records
 from clock_helpers import start_forward_only_clock
@@ -412,7 +413,36 @@ class WorkflowFixture(unittest.TestCase):
         return self.evidence("reconciliation", {"scope_matches": True, "no_changes_detected": True, "operation_outcomes": {key: value["outcome"] for key, value in state["operations"].items()}, "plan_sha256": state["plan"]["sha256"] if state["plan"] else None})
 
 
+class StateLayoutTests(unittest.TestCase):
+    """The session state's keys and the layout of the typed-reply records, pinned; no session is created."""
+
+    def test_new_state_keys_golden(self):
+        self.assertEqual(sorted(engine_journal.STATE_KEYS), [
+            "approval", "backend", "conditional_decisions", "created_utc", "creation_scope_sha256", "engine_id", "evidence", "irreversible_ack",
+            "irreversible_warning", "job", "last_reconciled_utc", "mode", "operations", "owner_id", "pending", "plan", "platform", "reviews",
+            "revision", "schedule", "schedule_triggers", "schema_version", "scope_authorization", "session_id", "settings", "settings_revision",
+            "stage", "standing_policy", "status", "stop_reason", "updated_utc", "used_message_ids"])
+        self.assertEqual(sorted(engine_plans.WARNING_FIELDS), ["action_ids", "bytes", "kind", "number", "plan_sha256", "recorded_utc", "revision"])
+        self.assertEqual(sorted(engine_plans.REPLY_FIELDS), ["action_ids", "bytes", "number", "type", "warning_revision"])
+        self.assertEqual(sorted(engine_plans.CONDITIONAL_FIELDS), ["action_id", "decision", "message_id", "names", "payload_sha256", "recorded_utc"])
+        self.assertEqual(engine_plans.MAX_USED_MESSAGE_IDS, 1000)
+        # invalidate clears the warning, the conditional decisions and the approval, never the used message ids.
+        state = dict.fromkeys(engine_journal.STATE_KEYS, "kept")
+        state.update(pending={}, used_message_ids=["typed-reply-1"], irreversible_warning={"fictional": True},
+                     conditional_decisions=[{"fictional": True}], approval={"fictional": True})
+        engine_journal.invalidate(state)
+        self.assertEqual(set(state), engine_journal.STATE_KEYS)
+        self.assertEqual((state["irreversible_warning"], state["conditional_decisions"], state["approval"], state["used_message_ids"]),
+                         (None, [], None, ["typed-reply-1"]))
+
+
 class WorkflowTests(WorkflowFixture):
+    def test_new_sessions_start_with_the_typed_reply_keys_empty(self):
+        state = self.state()
+        self.assertEqual(set(state), engine_journal.STATE_KEYS)
+        self.assertEqual(encoded({key: state[key] for key in ("irreversible_warning", "used_message_ids", "conditional_decisions")}),
+                         b'{"conditional_decisions":[],"irreversible_warning":null,"used_message_ids":[]}')
+
     def test_backend_mode_creation_and_version_are_bound(self):
         directory = self.engine.work / self.sid
         record = json.loads((directory / "creation.json").read_text())

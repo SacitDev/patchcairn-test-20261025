@@ -418,6 +418,8 @@ class WorkflowTests(WorkflowFixture):
         self.assertFalse(self.state()["operations"])
 
     def test_permanent_purge_needs_separate_typed_exact_irreversible_ack(self):
+        # The purge is approved only by the owner's typed reply to the engine's warning, given after both reviews: a plain
+        # approval, an inexact quote and a separate acknowledgement never count, and begin re-checks the reply.
         self.plan_ready()
         recovery_id = self.verified_recovery()
         plan = copy.deepcopy(self.plan)
@@ -425,21 +427,27 @@ class WorkflowTests(WorkflowFixture):
         binding = self.recovery_binding(recovery_id)
         inventory = self.purge_receipt_for(binding)
         lower = {"schema": "patchcairn.storage", "schema_version": 1, "kind": "purge", "receipt": inventory, "irreversible": True}
-        payload = {"schema": "patchcairn.storage.adapter", "schema_version": 1, "operation": "storage.purge", "storage_plan": lower, "storage_plan_sha256": digest(lower), "output_root": binding["output_root"], "mode": "fixture", "protected_roots": []}
+        rows = [row["original"] for row in inventory["records"]]
+        payload = {"schema": "patchcairn.storage.adapter", "schema_version": 1, "operation": "storage.purge", "storage_plan": lower, "storage_plan_sha256": digest(lower), "output_root": binding["output_root"], "mode": "fixture", "protected_roots": [], "delete_count": len(rows), "delete_bytes": sum(row["size"] for row in rows)}
         action.update(kind="permanent_purge", adapter_id=payload["operation"], adapter_payload_evidence_id=self.raw_evidence("adapter_payload", payload), adapter_payload_sha256=digest(payload), adapter_plan_sha256=digest(lower), target_inventory_evidence_id=self.raw_evidence("inventory", inventory), target_inventory_sha256=digest(inventory), requires_recovery=True, recovery_evidence_ids=[recovery_id])
         self.plan = plan
         self.plan_hash = self.engine.register_plan(self.sid, plan=plan)["data"]["plan_sha256"]
         for reviewer, role in (("purge-review-a", "compatibility_data"), ("purge-review-b", "evidence_security")):
             self.engine.record_review(self.sid, plan_sha256=self.plan_hash, reviewer_id=reviewer, role=role, verdict="approved", evidence_ids=[self.evidence("review", {"checked": True})], notes="Fictional exact purge review")
-        with self.assertRaises(WorkflowRefusal):
+        with self.assertRaises(WorkflowRefusal) as caught:
             self.engine.approve_plan(self.sid, plan_sha256=self.plan_hash, action_ids=["fictional-action"], owner_quote="Apply this plan.", owner_message_id="fictional-purge-plan")
-        self.engine.approve_plan(self.sid, plan_sha256=self.plan_hash, action_ids=["fictional-action"], acknowledge_permanent_loss=True, owner_quote="Approve only this exact fictional purge plan.", owner_message_id="fictional-purge-plan")
+        self.assertEqual(caught.exception.code, "typed-reply-warning")
+        phrase = self.engine.issue_irreversible_warning(self.sid, plan_sha256=self.plan_hash)["data"]["phrase"]
+        self.assertEqual(phrase, "delete 1 files")
+        with self.assertRaises(WorkflowRefusal) as caught:
+            self.engine.approve_plan(self.sid, plan_sha256=self.plan_hash, action_ids=["fictional-action"], owner_quote="Approve only this exact fictional purge plan.", owner_message_id="fictional-purge-plan")
+        self.assertEqual(caught.exception.code, "typed-reply-mismatch")
+        for plan_sha256 in ("0" * 64, self.plan_hash):
+            with self.assertRaises(WorkflowRefusal):
+                self.engine.record_irreversible_ack(self.sid, plan_sha256=plan_sha256, action_ids=["fictional-action"], acknowledge_irreversible_loss=True, owner_quote="I separately acknowledge irreversible loss of the exact fictional purge contents.", owner_message_id="fictional-loss-ack")
+        self.assertIsNone(self.state()["irreversible_ack"])
+        self.engine.approve_plan(self.sid, plan_sha256=self.plan_hash, action_ids=["fictional-action"], owner_quote=phrase, owner_message_id="fictional-purge-plan")
         self.engine.advance_stage(self.sid, evidence_ids=[])
-        with self.assertRaises(WorkflowRefusal):
-            self.engine.begin_operation(self.sid, action_id="fictional-action", plan_sha256=self.plan_hash, precondition_evidence_ids=[self.precondition(recovery_verified=True)])
-        with self.assertRaises(WorkflowRefusal):
-            self.engine.record_irreversible_ack(self.sid, plan_sha256="0" * 64, action_ids=["fictional-action"], acknowledge_irreversible_loss=True, owner_quote="Wrong plan cannot reuse loss acknowledgement.", owner_message_id="fictional-wrong-ack")
-        self.engine.record_irreversible_ack(self.sid, plan_sha256=self.plan_hash, action_ids=["fictional-action"], acknowledge_irreversible_loss=True, owner_quote="I separately acknowledge irreversible loss of the exact fictional purge contents.", owner_message_id="fictional-loss-ack")
         operation = self.engine.begin_operation(self.sid, action_id="fictional-action", plan_sha256=self.plan_hash, precondition_evidence_ids=[self.precondition(recovery_verified=True)])
         self.assertTrue(operation["data"]["operation_id"])
 
@@ -768,6 +776,170 @@ class InventoryEvidenceTests(WorkflowFixture):
             self.register(sid, self.collector_result(), evidence_id="fictional-collector-inventory")
             decoder.assert_called_once()
         self.assertEqual(locked, [False])  # a collector result is decoded before the session lock is taken
+
+
+class TypedReplyHelpers:
+    """Fictional plans whose actions the owner's typed reply approves (mixed into WorkflowFixture classes; defines no test)."""
+
+    def register(self, plan, reviewed=True):
+        self.plan = plan
+        self.plan_hash = self.engine.register_plan(self.sid, plan=plan)["data"]["plan_sha256"]
+        if reviewed:
+            for reviewer, role in (("typed-review-a", "compatibility_data"), ("typed-review-b", "evidence_security")):
+                self.engine.record_review(self.sid, plan_sha256=self.plan_hash, reviewer_id=reviewer, role=role, verdict="approved",
+                                          evidence_ids=[self.evidence("review", {"reviewed": True})], notes="Fictional review of the exact plan")
+
+    def purge_plan(self, *, reviewed=True):
+        """Register a one-action purge plan with verified recovery (one 31-byte file); returns its typed reply."""
+        self.plan_ready()
+        recovery_id = self.verified_recovery()
+        binding = self.recovery_binding(recovery_id)
+        inventory = self.purge_receipt_for(binding)
+        lower = {"schema": "patchcairn.storage", "schema_version": 1, "kind": "purge", "receipt": inventory, "irreversible": True}
+        rows = [row["original"] for row in inventory["records"]]
+        payload = {"schema": "patchcairn.storage.adapter", "schema_version": 1, "operation": "storage.purge", "storage_plan": lower,
+                   "storage_plan_sha256": digest(lower), "output_root": binding["output_root"], "mode": "fixture", "protected_roots": [],
+                   "delete_count": len(rows), "delete_bytes": sum(row["size"] for row in rows)}
+        plan = copy.deepcopy(self.plan)
+        plan["actions"][0].update(kind="permanent_purge", adapter_id=payload["operation"], adapter_payload_evidence_id=self.raw_evidence("adapter_payload", payload),
+                                  adapter_payload_sha256=digest(payload), adapter_plan_sha256=digest(lower),
+                                  target_inventory_evidence_id=self.raw_evidence("inventory", inventory), target_inventory_sha256=digest(inventory),
+                                  requires_recovery=True, recovery_evidence_ids=[recovery_id])
+        self.register(plan, reviewed)
+        return "delete %d files" % len(rows)
+
+    def firmware_plan(self, number):
+        """Register a one-action firmware plan whose payload names device ``number`` (update_binding patched by the caller)."""
+        payload = {"fictional_firmware": True, "device": {"id": "fictional-device", "number": number, "target_version": "1.2.3"}}
+        inventory = {"fictional": True, "devices": 1}
+        plan = copy.deepcopy(self.plan)
+        plan["actions"][0].update(kind="firmware_update", adapter_id=pc_records.ADAPTER_SYSTEM_FIRMWARE_UPDATE, requires_os_consent=False,
+                                  requires_recovery=False, recovery_evidence_ids=[], adapter_payload_evidence_id=self.raw_evidence("adapter_payload", payload),
+                                  adapter_payload_sha256=digest(payload), adapter_plan_sha256=digest({"fictional": "firmware plan"}),
+                                  target_inventory_evidence_id=self.raw_evidence("inventory", inventory), target_inventory_sha256=digest(inventory))
+        self.register(plan)
+
+    def warn(self):
+        return self.engine.issue_irreversible_warning(self.sid, plan_sha256=self.plan_hash)["data"]
+
+    def approve(self, quote, message_id):
+        return self.engine.approve_plan(self.sid, plan_sha256=self.plan_hash, action_ids=["fictional-action"], owner_quote=quote, owner_message_id=message_id)
+
+    def begin_action(self):
+        return self.engine.begin_operation(self.sid, action_id="fictional-action", plan_sha256=self.plan_hash,
+                                           precondition_evidence_ids=[self.precondition(recovery_verified=True)])["data"]["operation_id"]
+
+    def refused(self, code, call):
+        with self.assertRaises(WorkflowRefusal) as caught:
+            call()
+        self.assertEqual(caught.exception.code, code)
+
+
+class IrreversibleApprovalTests(TypedReplyHelpers, WorkflowFixture):
+    """The owner's typed reply to the engine's warning, the one approval of a permanent deletion or a firmware update."""
+
+    def test_typed_reply_needs_current_warning_and_both_reviews(self):
+        phrase = self.purge_plan(reviewed=False)
+        self.refused("workflow-refusal", self.warn)  # both reviews come first
+        self.register(self.plan)
+        self.refused("typed-reply-warning", lambda: self.approve(phrase, "typed-before-warning"))
+        data = self.warn()
+        warning = self.state()["irreversible_warning"]
+        self.assertEqual((data["phrase"], data["number"], data["bytes"], data["action_ids"]), (phrase, 1, 31, ["fictional-action"]))
+        self.assertEqual((warning["plan_sha256"], warning["kind"], warning["revision"]), (self.plan_hash, "permanent_purge", self.state()["revision"]))
+        self.approve(phrase, "typed-after-warning")
+        state = self.state()
+        self.assertEqual(state["approval"]["irreversible"], {"type": "permanent_data_loss", "action_ids": ["fictional-action"], "number": 1,
+                                                             "bytes": 31, "warning_revision": warning["revision"]})
+        self.assertEqual(state["used_message_ids"], ["typed-after-warning"])
+
+    def test_used_message_id_never_accepted_again(self):
+        phrase = self.purge_plan()
+        self.warn()
+        self.approve(phrase, "typed-once")
+        self.refused("message-id-used", lambda: self.approve(phrase, "typed-once"))
+        first, self.sid = self.sid, self.engine.create_session(scope=self.scope, checkpoints=[])["session_id"]
+        other = self.purge_plan()
+        self.warn()
+        # Another session of the same engine never accepts a message id that a typed reply already used.
+        self.refused("message-id-used", lambda: self.approve(other, "typed-once"))
+        self.approve(other, "typed-twice")
+        self.assertEqual((self.engine.read_session(first)["used_message_ids"], self.state()["used_message_ids"]), (["typed-once"], ["typed-twice"]))
+
+    def test_whole_quote_must_equal_phrase(self):
+        phrase = self.purge_plan()
+        self.warn()
+        for number, quote in enumerate(("Yes, " + phrase, phrase + " now", "please " + phrase, phrase + ". " + phrase, "delete 1 file",
+                                        phrase + "!", '"' + phrase + '"')):
+            with self.subTest(refused=quote):
+                self.refused("typed-reply-mismatch", lambda: self.approve(quote, "typed-refused-%d" % number))
+        self.assertEqual((self.state()["approval"], self.state()["used_message_ids"]), (None, []))
+        # Letter case, spaces, commas and one final full stop do not count.
+        for number, quote in enumerate(("Delete 1 Files.", "  delete  1\tfiles ", "DELETE 1 FILES", "delete 1, files")):
+            with self.subTest(accepted=quote):
+                self.approve(quote, "typed-accepted-%d" % number)
+                self.assertEqual(self.state()["approval"]["quote"], quote)
+
+    def test_plain_yes_never_approves_irreversible_plan(self):
+        self.purge_plan()
+        plain = ("yes", "Yes.", "Yes, go ahead", "I approve this plan", "approve", "OK")
+        for number, quote in enumerate(plain):
+            with self.subTest(before_warning=quote):
+                self.refused("typed-reply-warning", lambda: self.approve(quote, "plain-before-%d" % number))
+        self.warn()
+        for number, quote in enumerate(plain):
+            with self.subTest(after_warning=quote):
+                self.refused("typed-reply-mismatch", lambda: self.approve(quote, "plain-after-%d" % number))
+        self.assertIsNone(self.state()["approval"])
+
+    def test_replan_clears_the_warning(self):
+        phrase = self.purge_plan()
+        self.warn()
+        replacement = dict(copy.deepcopy(self.plan), plan_id="fictional-replacement-plan")
+        self.register(replacement)
+        self.assertIsNone(self.state()["irreversible_warning"])
+        self.refused("typed-reply-warning", lambda: self.approve(phrase, "typed-replaced"))
+        self.warn()
+        self.approve(phrase, "typed-current")
+        # A settings change clears the warning, the approval and the conditional decisions; the used message ids stay.
+        try:
+            self.engine.setup(self.sid, control="automatic")
+        except WorkflowRefusal as error:
+            self.fail("the settings change was refused: " + error.code)
+        state = self.state()
+        self.assertEqual((state["irreversible_warning"], state["approval"], state["conditional_decisions"], state["used_message_ids"]),
+                         (None, None, [], ["typed-current"]))
+
+    def test_reply_with_other_count_or_device_refused(self):
+        phrase = self.purge_plan()
+        self.warn()
+        for number, quote in enumerate(("delete 2 files", "delete 11 files", "delete 0 files", "delete 1 backups", "delete one files")):
+            with self.subTest(refused=quote):
+                self.refused("typed-reply-mismatch", lambda: self.approve(quote, "typed-count-%d" % number))
+        self.approve(phrase, "typed-count")
+        # A firmware update's reply names its device.
+        with mock.patch.object(engine_updates, "update_binding"):
+            self.firmware_plan(2)
+            data = self.warn()
+            self.assertEqual((data["phrase"], data["number"], data["bytes"]), ("update firmware on device 2, I have my recovery key", 2, None))
+            for number, quote in enumerate(("update firmware on device 3, I have my recovery key", "update firmware on device 2",
+                                            "update firmware on device 12, I have my recovery key", "delete 2 files")):
+                with self.subTest(refused=quote):
+                    self.refused("typed-reply-mismatch", lambda: self.approve(quote, "typed-device-%d" % number))
+            self.approve("Update firmware on device 2 I have my recovery key.", "typed-device")
+        self.assertEqual(self.state()["approval"]["irreversible"]["type"], "firmware_risk")
+
+    def test_reply_recorded_before_the_warning_refused(self):
+        phrase = self.purge_plan()
+        self.warn()
+        self.approve(phrase, "typed-first")
+        self.engine.advance_stage(self.sid, evidence_ids=[])
+        # The warning is shown again: a reply recorded before the current warning does not count at begin.
+        self.warn()
+        self.refused("typed-reply-required", self.begin_action)
+        self.assertEqual(self.state()["operations"], {})
+        self.approve(phrase, "typed-second")
+        self.assertTrue(self.begin_action())
 
 
 if __name__ == "__main__":

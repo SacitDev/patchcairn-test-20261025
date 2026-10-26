@@ -210,11 +210,14 @@ class SessionFixtures(ServiceFixtures):
                       "reviewer_id": reviewer, "attestation": "coordinator-attested"}
             self.engine.record_review(sid, plan_sha256=sha, reviewer_id=reviewer, role=role, verdict="approved",
                         evidence_ids=[self.evidence("review", {"reviewed": True}, sid=sid, content=encoded(review))], notes="Independent synthetic review of this exact bounded plan")
-        self.engine.approve_plan(sid, plan_sha256=sha, action_ids=[action["action_id"]], owner_quote="Apply only this exact synthetic action.",
-                    owner_message_id="fixture-plan-choice", acknowledge_permanent_loss=purge_choice)
+        quote, message_id = "Apply only this exact synthetic action.", "fixture-plan-choice"
+        if purge_choice:
+            # A permanent deletion is approved by the owner's typed reply to the engine's warning, in a message never used before.
+            quote, message_id = self.engine.issue_irreversible_warning(sid, plan_sha256=sha)["data"]["phrase"], "fixture-typed-reply-" + uuid.uuid4().hex
+        self.engine.approve_plan(sid, plan_sha256=sha, action_ids=[action["action_id"]], owner_quote=quote, owner_message_id=message_id)
         if ack:
             self.engine.record_irreversible_ack(sid, plan_sha256=sha, action_ids=[action["action_id"]],
-                        acknowledge_irreversible_loss=True, owner_quote="I acknowledge permanent irreversible loss of these exact fictional quarantined files.", owner_message_id="fixture-loss-ack")
+                        acknowledge_irreversible_loss=True, owner_quote="I acknowledge the separate risk of these exact fictional actions.", owner_message_id="fixture-loss-ack")
         self.engine.advance_stage(sid, evidence_ids=[])
         return sha
 
@@ -269,7 +272,7 @@ class SessionFixtures(ServiceFixtures):
         return result["receipt"]["native_receipt"], backup, restore
 
     def approved_purge(self):
-        """An approved, acknowledged purge whose recovery is a real verified backup and restoration probe."""
+        """A purge approved by the typed reply whose recovery is a real verified backup and restoration probe."""
         if not self.native_move_supported:
             self.skipTest("only on posix: the selected mounted filesystem refuses the native no-overwrite quarantine prerequisite; no fallback")
         receipt, backup, restore = self.make_recovery_and_quarantine()
@@ -278,7 +281,7 @@ class SessionFixtures(ServiceFixtures):
         action = self.service.prepare_storage_action(sid, action_id="purge-selected", adapter_id="storage.purge",
                     storage_plan=self.storage().plan_purge(receipt=receipt), output_root=str(self.output),
                     recovery_evidence_ids=[recovery["evidence_id"]], **PROSE)
-        sha = self.approve(action, sid=sid, purge_choice=True, ack=True)
+        sha = self.approve(action, sid=sid, purge_choice=True)
         return sid, action, sha, backup, restore
 
     def begin(self, sid, action, sha, *, code=None):

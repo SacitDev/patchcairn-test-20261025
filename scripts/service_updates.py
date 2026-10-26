@@ -320,8 +320,8 @@ class UpdatesMixin:
 
     # Dispatch targets (service_execute.EXECUTE, service_reconcile.RECONCILE; reached only through execute_action and
     # reconcile_operation): the reviewed handoff keeps its own preconditions, begins through service_execute's shared
-    # begin step, writes its handoff without an effect boundary and completes through complete_external; the package and
-    # repair adapters are not written yet.
+    # begin step, writes its handoff without an effect boundary and completes through complete_external; the package,
+    # repair, system update hand-off and firmware adapters are not written yet.
     def _execute_package_upgrade(self, session_id, state, action, payload, **arguments):
         return self._execute_held(session_id, state, action, payload, **arguments)
 
@@ -329,6 +329,12 @@ class UpdatesMixin:
         return self._execute_held(session_id, state, action, payload, **arguments)
 
     def _execute_system_repair(self, session_id, state, action, payload, **arguments):
+        return self._execute_held(session_id, state, action, payload, **arguments)
+
+    def _execute_system_update_handoff(self, session_id, state, action, payload, **arguments):
+        return self._execute_held(session_id, state, action, payload, **arguments)
+
+    def _execute_system_firmware_update(self, session_id, state, action, payload, **arguments):
         return self._execute_held(session_id, state, action, payload, **arguments)
 
     def _execute_system_reviewed_external(self, session_id, state, action, payload, **arguments):
@@ -359,6 +365,12 @@ class UpdatesMixin:
         return self._reconcile_held(session_id, operation, intent, payload, **arguments)
 
     def _reconcile_system_repair(self, session_id, operation, intent, payload, **arguments):
+        return self._reconcile_held(session_id, operation, intent, payload, **arguments)
+
+    def _reconcile_system_update_handoff(self, session_id, operation, intent, payload, **arguments):
+        return self._reconcile_held(session_id, operation, intent, payload, **arguments)
+
+    def _reconcile_system_firmware_update(self, session_id, operation, intent, payload, **arguments):
         return self._reconcile_held(session_id, operation, intent, payload, **arguments)
 
     def _reconcile_system_reviewed_external(self, session_id, operation, intent, payload, **arguments):

@@ -24,13 +24,17 @@ PLAN_KINDS = MappingProxyType({
     pc_records.ADAPTER_STORAGE_RETENTION_RELEASE: "retention_release",
     pc_records.ADAPTER_STORAGE_RETENTION_FORGET: "retention_forget",
     pc_records.ADAPTER_STORAGE_SESSION_RELEASE: "session_release",
+    pc_records.ADAPTER_STORAGE_DELETE_SELECTED: "delete_selected",
 })
 # Every storage record is a kind of patchcairn.storage: each plan kind above, and the records around the plans.
 KINDS = frozenset(PLAN_KINDS.values()) | frozenset({
     "inventory", "storage_preconditions", "duplicates", "attempt", "backup_manifest", "backup_receipt", "restore_receipt",
     "quarantine_receipt", "quarantine_restore_receipt", "purge_receipt", "storage_outcome_verification", "capabilities"})
 PAYLOAD_REQUIRED = frozenset({"operation", "storage_plan", "storage_plan_sha256", "output_root", "mode", "protected_roots"})
-PAYLOAD_OPTIONAL = frozenset({"restore_probe_destination"})
+# The number of files or backups and their bytes that the owner's typed reply names: required for, and only for, an
+# adapter whose facts list permanent data loss.
+DELETION_FIELDS = frozenset({"delete_count", "delete_bytes"})
+PAYLOAD_OPTIONAL = frozenset({"restore_probe_destination"}) | DELETION_FIELDS
 # Above the service's 10,000 retention rows plus its own namespaces, so retained recovery never locks a
 # new plan out (#1); D-015 later narrows the roots to one per destination.
 MAX_PROTECTED_ROOTS = 16_384
@@ -97,4 +101,10 @@ def validate_payload(payload, *, adapter_id, mode, plan_sha256):
         if adapter_id != pc_records.ADAPTER_STORAGE_BACKUP_CREATE:
             _refuse("Only a reviewed backup can include a restore-probe destination")
         absolute_path(payload["restore_probe_destination"], "The restore-probe destination")
+    if "permanent_data_loss" not in pc_records.ADAPTERS[adapter_id]["acknowledgments"]:
+        if DELETION_FIELDS & set(payload):
+            _refuse("Only a permanent deletion carries a deletion count and size")
+    elif (not DELETION_FIELDS <= set(payload) or type(payload["delete_count"]) is not int or payload["delete_count"] < 1
+          or type(payload["delete_bytes"]) is not int or payload["delete_bytes"] < 0):
+        _refuse("A permanent deletion needs its number of items (at least 1) and their bytes (0 or more)")
     return payload

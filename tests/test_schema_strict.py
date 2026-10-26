@@ -258,7 +258,7 @@ class RecordLayoutTests(unittest.TestCase):
                          b'"creation_scope_sha256":"e0d6f92dd37e983c0f1922a6ed8637ca225d64bb923ca76f270900a1dc157729",'
                          b'"engine_id":"00000000000000000000000000001111","job":"security_updates","mode":"fixture","owner_id":"owner",'
                          b'"platform":"unknown","schema_version":1,"session_id":"session-00000000000000000000000000002222"}')
-        self.assertEqual(workflow_core.digest(engine.read_session(session_id)), "6309a1085c6eb83a9e1a9fea0c63c6d11e918a0200066e9716a048a26d704f42")
+        self.assertEqual(workflow_core.digest(engine.read_session(session_id)), "2a059bbee7ffcd2db46769acb725e9f98c5b1c637725118d16c9fa03a3d38ba2")
 
     def test_journal_events_keep_digests_of_changes(self):
         # D-017: a journal event names each changed field with the digest of its new value, never the value.
@@ -269,7 +269,7 @@ class RecordLayoutTests(unittest.TestCase):
         self.assertIn(b'"details":{"changes":{"status":"d2f88d9c865e0709761ef96771df45593cc185ac902cfe3ecbb9578129edcf1c"},'
                       b'"settings_revision":0}', data)
         self.assertEqual(workflow_core.digest("paused"), "d2f88d9c865e0709761ef96771df45593cc185ac902cfe3ecbb9578129edcf1c")
-        self.assertEqual(hashlib.sha256(data).hexdigest(), "281da1b6ce86e7d3e006ae4e1e7b071d6f771740640bd82fb4fa145247ca56fb")
+        self.assertEqual(hashlib.sha256(data).hexdigest(), "dc9940db4c64939073cd6ceb03eddb98568fde49115b729b18cf83ad87c124fd")
 
     def test_storage_attempt_record_keeps_digest_plan_file_and_count(self):
         # D-017: the exact plan is a separate hash-bound file; the attempt record keeps its digest and entry count.

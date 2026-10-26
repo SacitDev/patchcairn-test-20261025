@@ -19,6 +19,8 @@ def payload(adapter_id=pc_records.ADAPTER_STORAGE_BACKUP_CREATE, **changes):
     plan = {"schema": storage_contract.PLAN, "schema_version": 1, "kind": storage_contract.plan_kind(adapter_id), "fixture": True}
     value = {"schema": storage_contract.PAYLOAD, "schema_version": 1, "operation": adapter_id, "storage_plan": plan,
              "storage_plan_sha256": pc_records.digest(plan), "output_root": OUTPUT, "mode": "fixture", "protected_roots": [OUTPUT]}
+    if "permanent_data_loss" in pc_records.ADAPTERS[adapter_id]["acknowledgments"]:
+        value.update(delete_count=2, delete_bytes=0)
     value.update(changes)
     return value
 
@@ -98,6 +100,45 @@ class StorageContractTests(unittest.TestCase):
         products = {path.stem for path in (ROOT / "scripts").glob("*.py")}
         self.assertEqual(names & products, {"pc_records"})
         self.assertTrue(names - products <= set(sys.stdlib_module_names) | {"__future__"}, names - products)
+
+
+class ContractTests(unittest.TestCase):
+    """The deletion count and size that the owner's typed reply names (pure data checks)."""
+
+    def check(self, value):
+        return storage_contract.validate_payload(value, adapter_id=value["operation"], mode="fixture",
+                                                 plan_sha256=pc_records.digest(value["storage_plan"]))
+
+    def test_permanent_loss_kinds_require_count_and_bytes(self):
+        loss = {adapter_id for adapter_id in storage_contract.PLAN_KINDS
+                if "permanent_data_loss" in pc_records.ADAPTERS[adapter_id]["acknowledgments"]}
+        self.assertEqual(loss, {pc_records.ADAPTER_STORAGE_PURGE, pc_records.ADAPTER_STORAGE_REMOVE_ORIGINALS,
+                                pc_records.ADAPTER_STORAGE_RETENTION_RELEASE, pc_records.ADAPTER_STORAGE_SESSION_RELEASE,
+                                pc_records.ADAPTER_STORAGE_DELETE_SELECTED})
+        for adapter_id in sorted(loss):
+            base = {key: value for key, value in payload(adapter_id).items() if key not in storage_contract.DELETION_FIELDS}
+            with self.subTest(adapter_id=adapter_id):
+                accepted = dict(base, delete_count=1, delete_bytes=0)
+                self.assertIs(self.check(accepted), accepted)
+                large = dict(base, delete_count=100_000, delete_bytes=64 * 2 ** 30)
+                self.assertIs(self.check(large), large)
+                for changes in ({}, {"delete_count": 1}, {"delete_bytes": 0}, {"delete_count": 0, "delete_bytes": 0},
+                                {"delete_count": -1, "delete_bytes": 0}, {"delete_count": True, "delete_bytes": 0},
+                                {"delete_count": "3", "delete_bytes": 0}, {"delete_count": 1.0, "delete_bytes": 0},
+                                {"delete_count": None, "delete_bytes": 0}, {"delete_count": 1, "delete_bytes": -1},
+                                {"delete_count": 1, "delete_bytes": False}, {"delete_count": 1, "delete_bytes": None},
+                                {"delete_count": 1, "delete_bytes": 1.5}):
+                    with self.subTest(adapter_id=adapter_id, changes=changes), self.assertRaises(pc_records.Refusal) as caught:
+                        self.check(dict(base, **changes))
+                    self.assertEqual(caught.exception.code, "storage-payload")
+        # Every other storage kind carries neither field.
+        for adapter_id in sorted(set(storage_contract.PLAN_KINDS) - loss):
+            value = payload(adapter_id)
+            self.assertIs(self.check(value), value)
+            for changes in ({"delete_count": 1, "delete_bytes": 0}, {"delete_count": 1}, {"delete_bytes": 0}):
+                with self.subTest(adapter_id=adapter_id, changes=changes), self.assertRaises(pc_records.Refusal) as caught:
+                    self.check(dict(value, **changes))
+                self.assertEqual(caught.exception.code, "storage-payload")
 
 
 if __name__ == "__main__":

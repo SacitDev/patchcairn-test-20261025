@@ -35,8 +35,27 @@ ACTION_LABELS = {"update": "Install the selected update", "cleanup_quarantine": 
                  "os_transition": "Review a system release change", "security_policy": "Review a security setting change", "assessment": "Read-only assessment",
                  "remove_originals": "Permanently delete the original files after a checked backup",
                  "retention_release": "Permanently delete kept backups and recovery files", "retention_forget": "Forget kept backups that are already gone",
-                 "session_release": "Permanently delete a finished session's kept files"}
+                 "session_release": "Permanently delete a finished session's kept files", "delete_selected": "Permanently delete the selected files",
+                 "system_update": "Open the system update for you to install", "firmware_update": "Update the device's firmware"}
 CHECKPOINTS = {"scope", "findings", "plan", "before_action", "after_action", "finish"}
+# The exact reply that approves a permanent deletion or a firmware update, by action kind: {} is the number of files or
+# backups, or the device number.
+IRREVERSIBLE_REPLIES = {"permanent_purge": "delete {} files", "remove_originals": "delete {} files", "delete_selected": "delete {} files",
+                        "retention_release": "delete {} backups", "session_release": "delete {} backups",
+                        "firmware_update": "update firmware on device {}, I have my recovery key"}
+
+
+def irreversible_phrase(kind, number):
+    """The exact reply the owner types to approve a permanent deletion or a firmware update of action ``kind``."""
+    if not isinstance(kind, str) or kind not in IRREVERSIBLE_REPLIES or type(number) is not int or number < 1:
+        raise WorkflowRefusal("This action has no typed reply for that number", code="typed-reply-plan")
+    return IRREVERSIBLE_REPLIES[kind].format(number)
+
+
+def typed_reply(text):
+    """``text`` as typed replies are compared: letter case, spaces, commas and one final full stop do not count."""
+    text = text.strip()
+    return re.sub(r"[\s,]+", "", (text[:-1] if text.endswith(".") else text).casefold())
 
 
 def report_labels():

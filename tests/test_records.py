@@ -274,7 +274,10 @@ class SchemaTests(unittest.TestCase):
                  "patchcairn.assessment.access", "patchcairn.assessment.summary", "patchcairn.assessment.verification",
                  "patchcairn.restart.pending", "patchcairn.restart.verification", "patchcairn.windows.boot.observation"}
         self.assertLessEqual(today, pc_records.SCHEMAS - pc_records.PLANNED_SCHEMAS)
-        self.assertEqual(pc_records.PLANNED_SCHEMAS, {"patchcairn.package", "patchcairn.schedule", "patchcairn.review"})
+        self.assertEqual(pc_records.PLANNED_SCHEMAS, {"patchcairn.package", "patchcairn.schedule", "patchcairn.review",
+                                                      "patchcairn.deletion.attempt", "patchcairn.deletion.receipt",
+                                                      "patchcairn.handoff.receipt", "patchcairn.firmware.receipt",
+                                                      "patchcairn.boot.observation"})
         self.assertEqual(pc_records.CONTAINERS, {"engine_marker", "session_state", "session_creation",
                                                  "response_envelope", "workflows_template", "tool_catalog", "toolkit_marker"})
         # One name per family: new storage records are kinds of patchcairn.storage, so no second name may
@@ -447,8 +450,10 @@ TODAY_ADAPTER_KINDS = {
     "diagnostic.collect": ("assessment",), "system.reviewed_external": ("update", "repair"),
 }
 FACT_KEYS = {"family", "kinds", "acknowledgments", "conditional_acknowledgments", "backup_receipt",
-             "policy_coverable", "scheduled_policy_coverable", "os_consent", "irreversible", "transitional"}
-BOOLEAN_FACTS = {"policy_coverable", "scheduled_policy_coverable", "irreversible", "transitional"}
+             "policy_coverable", "scheduled_policy_coverable", "os_consent", "irreversible", "transitional",
+             "conditional_decisions", "run_kinds", "independent_failures"}
+BOOLEAN_FACTS = {"policy_coverable", "scheduled_policy_coverable", "irreversible", "transitional", "independent_failures"}
+NEW_ADAPTERS = {"storage.delete_selected", "system.update_handoff", "system.firmware_update"}
 
 
 def with_fact(name, value=True):
@@ -460,7 +465,7 @@ class AdapterFactsTests(unittest.TestCase):
         ids = {"storage.backup_create", "storage.restore", "storage.quarantine", "storage.quarantine_restore",
                "storage.purge", "storage.remove_originals", "storage.retention_release", "storage.retention_forget",
                "storage.session_release", "package.upgrade", "package.reinstall", "system.repair", "diagnostic.collect",
-               "fixture.assessment", "system.reviewed_external"}
+               "fixture.assessment", "system.reviewed_external"} | NEW_ADAPTERS
         self.assertEqual(set(pc_records.ADAPTERS), ids)
         self.assertEqual(with_fact("transitional"), {"system.reviewed_external"})
 
@@ -475,7 +480,8 @@ class AdapterFactsTests(unittest.TestCase):
                     "storage.retention_release": "retention", "storage.retention_forget": "retention",
                     "storage.session_release": "retention", "package.upgrade": "update", "package.reinstall": "repair",
                     "system.repair": "repair", "diagnostic.collect": "assessment", "fixture.assessment": "assessment",
-                    "system.reviewed_external": "update"}
+                    "system.reviewed_external": "update", "storage.delete_selected": "cleanup", "system.update_handoff": "update",
+                    "system.firmware_update": "update"}
         self.assertEqual({key: facts["family"] for key, facts in pc_records.ADAPTERS.items()}, families)
         self.assertLessEqual(set(families.values()), pc_records.FAMILIES)
         for adapter_id in pc_records.ADAPTERS:
@@ -487,10 +493,12 @@ class AdapterFactsTests(unittest.TestCase):
             with self.subTest(adapter_id=adapter_id):
                 self.assertEqual(set(facts), FACT_KEYS)
                 self.assertTrue(facts["kinds"] and all(type(kind) is str for kind in facts["kinds"]))
-                for key in ("kinds", "acknowledgments", "conditional_acknowledgments"):
+                for key in ("kinds", "acknowledgments", "conditional_acknowledgments", "conditional_decisions", "run_kinds"):
                     self.assertIs(type(facts[key]), tuple)
                 for key in ("acknowledgments", "conditional_acknowledgments"):
                     self.assertLessEqual(set(facts[key]), pc_records.ACKNOWLEDGMENTS)
+                self.assertLessEqual(set(facts["conditional_decisions"]), pc_records.CONDITIONAL_DECISIONS)
+                self.assertLessEqual(set(facts["run_kinds"]), set(pc_records.RUN_KINDS))
                 self.assertFalse(set(facts["acknowledgments"]) & set(facts["conditional_acknowledgments"]))
                 for key in BOOLEAN_FACTS:
                     self.assertIs(type(facts[key]), bool)
@@ -510,6 +518,8 @@ class AdapterFactsTests(unittest.TestCase):
                                            "storage.remove_originals": ("permanent_data_loss",),
                                            "storage.retention_release": ("permanent_data_loss",),
                                            "storage.session_release": ("permanent_data_loss",),
+                                           "storage.delete_selected": ("permanent_data_loss",),
+                                           "system.firmware_update": ("firmware_risk",),
                                            "system.repair": ("no_component_rollback",)})
         conditional = {key: facts["conditional_acknowledgments"] for key, facts in pc_records.ADAPTERS.items()
                        if facts["conditional_acknowledgments"]}
@@ -517,7 +527,8 @@ class AdapterFactsTests(unittest.TestCase):
 
     def test_irreversible_actions_need_an_acknowledgment_and_no_policy_covers_them(self):
         self.assertEqual(with_fact("irreversible"), {"storage.purge", "storage.remove_originals", "storage.retention_release",
-                                                     "storage.session_release", "system.repair"})
+                                                     "storage.session_release", "system.repair", "storage.delete_selected",
+                                                     "system.firmware_update"})
         for adapter_id in with_fact("irreversible"):
             with self.subTest(adapter_id=adapter_id):
                 facts = pc_records.ADAPTERS[adapter_id]
@@ -539,7 +550,47 @@ class AdapterFactsTests(unittest.TestCase):
         self.assertEqual(with_fact("backup_receipt", "required"), {"storage.restore", "storage.remove_originals"})
         self.assertEqual(with_fact("backup_receipt", "optional"), {"storage.quarantine", "storage.purge"})
         self.assertEqual(with_fact("os_consent", "always"), {"system.repair", "system.reviewed_external"})
-        self.assertEqual(with_fact("os_consent", "per_route"), {"package.upgrade", "package.reinstall"})
+        self.assertEqual(with_fact("os_consent", "per_route"), {"package.upgrade", "package.reinstall", "system.update_handoff",
+                                                                "system.firmware_update"})
+
+    def test_new_adapters_never_policy_or_schedule_covered(self):
+        # Deleting selected files, a system update hand-off and a firmware update each need the owner's own decision.
+        self.assertEqual(NEW_ADAPTERS & with_fact("policy_coverable"), set())
+        self.assertEqual(NEW_ADAPTERS & with_fact("scheduled_policy_coverable"), set())
+        facts = {adapter_id: pc_records.ADAPTERS[adapter_id] for adapter_id in sorted(NEW_ADAPTERS)}
+        self.assertEqual({adapter_id: (row["family"], row["kinds"], row["run_kinds"], row["independent_failures"])
+                          for adapter_id, row in facts.items()},
+                         {"storage.delete_selected": ("cleanup", ("delete_selected",), (), True),
+                          "system.update_handoff": ("update", ("system_update",), ("settings",), True),
+                          "system.firmware_update": ("update", ("firmware_update",), ("terminal", "settings"), False)})
+        self.assertEqual({adapter_id: row["run_kinds"] for adapter_id, row in pc_records.ADAPTERS.items() if row["run_kinds"]},
+                         {"package.upgrade": ("process", "terminal"), "package.reinstall": ("process", "terminal"),
+                          "system.repair": ("process", "terminal"), "system.update_handoff": ("settings",),
+                          "system.firmware_update": ("terminal", "settings")})
+        self.assertEqual({adapter_id: row["conditional_decisions"] for adapter_id, row in pc_records.ADAPTERS.items() if row["conditional_decisions"]},
+                         {"package.upgrade": ("run_install_scripts", "runtime_line_change")})
+        self.assertEqual(with_fact("independent_failures"), {"storage.delete_selected", "package.upgrade", "system.update_handoff"})
+        self.assertEqual(pc_records.CONDITIONAL_DECISIONS, {"run_install_scripts", "runtime_line_change"})
+        self.assertEqual(pc_records.RUN_KINDS, ("process", "terminal", "settings"))
+        self.assertEqual(pc_records.ROUTE_FLAGS, {"adds_packages", "downgrades", "major_jump", "runtime_line_change", "install_scripts",
+                                                  "restart_likely", "host_package", "own_runtime", "high_risk", "firmware",
+                                                  "needs_mains_power", "device_unusable_during_update", "dual_image",
+                                                  "verify_after_restart"})
+
+    def test_update_results_map_to_the_seven_categories(self):
+        self.assertEqual(pc_records.OUTCOME_CATEGORIES, ("updated_checked", "need_restart", "did_not_update", "skipped_by_you",
+                                                         "update_yourself", "waiting_decision", "needs_check"))
+        self.assertEqual(pc_records.OUTCOME_GROUPS, ("system_drivers", "apps", "programming_tools", "update_yourself", "your_decision"))
+        self.assertEqual(dict(pc_records.UPDATE_RESULTS), {
+            "updated": "updated_checked", "restart_needed": "need_restart", "waiting_for_you": "waiting_decision",
+            "conditional_pending": "waiting_decision", "did_not_update": "did_not_update", "not_installed_power": "did_not_update",
+            "not_run": "did_not_update", "excluded": "skipped_by_you", "update_yourself": "update_yourself",
+            "integrity_failure": "needs_check", "could_not_check": "needs_check", "device_not_responding": "needs_check",
+            "differs_from_plan": "needs_check", "unknown": "needs_check"})
+        self.assertEqual(len(pc_records.UPDATE_RESULTS), 14)
+        self.assertEqual(set(pc_records.UPDATE_RESULTS.values()), set(pc_records.OUTCOME_CATEGORIES))
+        with self.assertRaises(TypeError):
+            pc_records.UPDATE_RESULTS["updated"] = "needs_check"
 
     def test_actions_must_match_the_os_consent_fact(self):
         for adapter_id, facts in pc_records.ADAPTERS.items():

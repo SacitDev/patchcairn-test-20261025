@@ -22,6 +22,7 @@ import subprocess
 import sys
 import threading
 import time
+from types import MappingProxyType
 
 import diagnostic_core
 import package_routes
@@ -39,6 +40,8 @@ KILL_WAIT_SECONDS = 5
 _LOCAL_APPDATA = "F1B32785-6FBA-4FCF-9D55-7B8E7F157091"  # FOLDERID_LocalAppData
 _PROGRAM_FILES = "905E63B6-C1BF-494E-B29C-65B732D3D21A"  # FOLDERID_ProgramFiles
 WORK_FOLDER = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "work")
+# The fixed arguments a run puts between the executable of each kind and the recipe's own; none for today's kinds.
+EXECUTABLE_PREFIXES = MappingProxyType({"winget": (), "system": (), "brew": ()})
 
 
 def recipes():
@@ -282,6 +285,38 @@ def winget_executable(probe=None):
             or link[2].lower() != ntpath.join(probe.program_files(), "WindowsApps", folder, "winget.exe").lower()):
         raise Refusal("runner-executable", "The winget alias is missing or does not point to App Installer's winget")
     return {"path": path, "package": folder}
+
+
+def executable_prefix(kind):
+    """The fixed arguments between an executable of ``kind`` and its recipe: () for winget, system tools and Homebrew."""
+    if not isinstance(kind, str) or kind not in EXECUTABLE_PREFIXES:
+        raise Refusal("runner-executable-kind", "Not an executable kind PatchCairn runs")
+    return EXECUTABLE_PREFIXES[kind]
+
+
+def recheck_executable(kind, path, identity, *, probe=None):
+    """Check ``path`` again with the rule of its kind, just before a run, and return its identity record: "winget" (the App
+    Installer alias, identified by its package folder), "system" (a listed system tool with root-owned ancestry, or a tool
+    in the Windows system folder, identified by its resolved file) or "brew" (Homebrew at its documented prefix, by its
+    resolved file). With ``identity`` None this records the identity; otherwise the identity must be unchanged."""
+    probe = probe or HostProbe()
+    executable_prefix(kind)
+    windows = probe.platform == "win32"
+    if not isinstance(path, str) or not path:
+        raise Refusal("runner-executable", "The bound executable path is missing")
+    if kind == "winget":
+        found = winget_executable(probe)
+        current, record = found["path"], {"package": found["package"]}
+    elif kind == "brew":
+        current = _brew(probe)
+        record = {"real_path": probe.realpath(current)}
+    else:
+        current = _system_tool((ntpath.basename(path) if windows else path,), probe)
+        record = {"real_path": current if windows else probe.realpath(current)}
+    same = ntpath.normcase(path) == ntpath.normcase(current) if windows else path == current
+    if not same or (identity is not None and identity != record):
+        raise Refusal("runner-executable-changed", "The executable is not the one the plan bound; the run holds")
+    return record
 
 
 def _prepare(recipe_id, values, probe, run_folder):

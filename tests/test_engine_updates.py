@@ -21,6 +21,78 @@ import pc_records
 from clock_helpers import utc_now
 from test_engine_journal import WorkflowFixture
 
+FIXTURES = ROOT / "tests" / "fixtures"
+PACKAGE_COMMON = {"schema", "schema_version", "manager", "operation", "id", "version", "source", "group", "flags", "preflight",
+                  "transaction_sha256", "run_kind"}
+PACKAGE_RUN = {"dependencies", "agreements", "recipe", "run_files", "executable", "environment_sha256"}
+PACKAGE_OPTIONAL = {"depends_on", "update", "device", "conditional", "settings_page"}
+CONDITIONAL_FLAGS = {"install_scripts": "run_install_scripts", "runtime_line_change": "runtime_line_change"}
+
+
+def payload_problem(adapter_id, payload):
+    """The refusal code of the first rule of the patchcairn.package payload contract that ``payload`` breaks, or None. The
+    frozen fixtures follow this reading of the contract; the engine's binding gives the same codes for them."""
+    facts = pc_records.ADAPTERS[adapter_id]
+    if set(payload) - PACKAGE_COMMON - PACKAGE_RUN - PACKAGE_OPTIONAL or PACKAGE_COMMON - set(payload):
+        return "package-payload-unknown-key"
+    if payload["run_kind"] not in facts["run_kinds"]:
+        return "package-payload-run-kind"
+    if payload["run_kind"] == "settings" and (PACKAGE_RUN & set(payload) or "settings_page" not in payload):
+        return "package-payload-settings"
+    if payload["run_kind"] != "settings" and ("settings_page" in payload or PACKAGE_RUN - set(payload)):
+        return "package-payload-settings-page"
+    firmware = adapter_id == pc_records.ADAPTER_SYSTEM_FIRMWARE_UPDATE
+    if ("device" in payload) != firmware or firmware and not isinstance(payload["device"], dict):
+        return "package-payload-device"
+    if not set(payload["flags"]) <= pc_records.ROUTE_FLAGS:
+        return "package-payload-flags"
+    if firmware and not {"firmware", "high_risk"} <= set(payload["flags"]):
+        return "package-payload-firmware-flags"
+    expected = {CONDITIONAL_FLAGS[flag] for flag in payload["flags"] if flag in CONDITIONAL_FLAGS}
+    if ("conditional" in payload) != bool(expected) or set(payload.get("conditional", {})) != expected:
+        return "package-payload-conditional"
+    return None
+
+
+class PayloadFixtureTests(unittest.TestCase):
+    """The frozen package payload fixtures: canonical bytes, one variant per run kind, one case per invalid combination."""
+
+    def load(self, name):
+        return json.loads((FIXTURES / name).read_text(encoding="ascii"))
+
+    def test_valid_payload_variants_follow_the_contract(self):
+        variants = self.load("package-payload.json")["variants"]
+        self.assertEqual([row["name"] for row in variants], ["process_winget_upgrade", "terminal_apt_kernel_through_sudo",
+                                                             "settings_windows_driver_handoff", "firmware_fwupd_device"])
+        self.assertEqual({row["payload"]["run_kind"] for row in variants}, set(pc_records.RUN_KINDS))
+        for row in variants:
+            payload = row["payload"]
+            with self.subTest(variant=row["name"]):
+                self.assertEqual(row["encoded"], encoded(payload).decode("ascii"))
+                self.assertEqual(row["sha256"], digest(payload))
+                self.assertEqual(payload["transaction_sha256"], digest(payload["preflight"]))
+                self.assertEqual((payload["schema"], payload["schema_version"]), ("patchcairn.package", 1))
+                self.assertIn(payload["schema"], pc_records.PLANNED_SCHEMAS)
+                self.assertIsNone(payload_problem(row["adapter_id"], payload))
+                self.assertNotRegex(row["encoded"], r"(?i)\\\\users\\\\|/home/|/users/")
+        firmware = [row for row in variants if row["adapter_id"] == pc_records.ADAPTER_SYSTEM_FIRMWARE_UPDATE]
+        self.assertEqual([row["payload"]["device"]["number"] for row in firmware], [1])
+
+    def test_each_invalid_payload_breaks_exactly_its_rule(self):
+        cases = self.load("package-payload-invalid.json")["cases"]
+        self.assertEqual({row["rule"] for row in cases}, {
+            "settings with recipe", "settings with executable", "settings with run_files", "process with settings_page",
+            "terminal with settings_page", "device on any other adapter", "firmware without exactly one device",
+            "a run_kind outside the adapter's", "flags outside ROUTE_FLAGS", "firmware without the firmware and high_risk flags",
+            "conditional not matching the flags", "unknown keys"})
+        self.assertEqual({row["code"] for row in cases}, {
+            "package-payload-settings", "package-payload-settings-page", "package-payload-device", "package-payload-run-kind",
+            "package-payload-flags", "package-payload-firmware-flags", "package-payload-conditional", "package-payload-unknown-key"})
+        self.assertEqual(len({row["name"] for row in cases}), len(cases))
+        for row in cases:
+            with self.subTest(case=row["name"]):
+                self.assertEqual(payload_problem(row["adapter_id"], row["payload"]), row["code"])
+
 
 class WorkflowTests(WorkflowFixture):
     def test_protected_os_consent_cannot_be_bypassed_by_approval_or_evidence_alone(self):

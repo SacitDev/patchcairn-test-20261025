@@ -503,5 +503,66 @@ class ModuleLayerTests(unittest.TestCase):
         self.assertLessEqual(imported, {"__future__", "os", "pathlib", "re", "unicodedata"})
 
 
+class JunkRootTests(unittest.TestCase):
+    """The Windows temp exemption: only the AppData component of the exact AppData\\Local\\Temp shape, only at or below it."""
+
+    TEMP = profile("windows", "AppData", "Local", "Temp")
+
+    def test_temp_root_and_files_below_admitted_only_with_exact_shape(self):
+        # Without the junk root the profile's AppData is protected as always.
+        self.assertTrue(pc_paths.protected_root(self.TEMP))
+        self.assertTrue(pc_paths.protected("build-1\\x.tmp", root=self.TEMP))
+        for path in (self.TEMP, self.TEMP + "\\build-1", self.TEMP + "\\build-1\\cache"):
+            with self.subTest(admitted=path):
+                self.assertFalse(pc_paths.protected_root(path, junk_root=self.TEMP))
+        self.assertFalse(pc_paths.protected("build-1\\x.tmp", root=self.TEMP, junk_root=self.TEMP))
+        self.assertFalse(pc_paths.protected("x.tmp", root=self.TEMP + "\\build-1", junk_root=self.TEMP))
+        # A junk root of any other shape is ignored, so AppData stays protected.
+        for shape in (profile("windows", "AppData", "Local"), profile("windows", "AppData", "Local", "Temp", "Sub"),
+                      profile("windows", "AppData", "LocalLow", "Temp"), profile("windows", "Local", "Temp"), "relative\\AppData\\Local\\Temp",
+                      "/home/example/AppData/Local/Temp", None):
+            with self.subTest(shape=shape):
+                self.assertTrue(pc_paths.protected_root(self.TEMP + "\\build-1", junk_root=shape))
+                self.assertTrue(pc_paths.protected("x.tmp", root=self.TEMP, junk_root=shape))
+
+    def test_roaming_or_other_appdata_never_admitted_even_when_passed(self):
+        other_user = "C:\\" + "Users" + "\\other\\AppData\\Local\\Temp"
+        for path in (profile("windows", "AppData", "Roaming", "Example"), profile("windows", "AppData", "Local", "Packages"),
+                     profile("windows", "AppData", "Local"), profile("windows", "AppData"), other_user + "\\build-1",
+                     "D:" + self.TEMP[2:] + "\\build-1"):
+            with self.subTest(path=path):
+                self.assertTrue(pc_paths.protected_root(path, junk_root=self.TEMP))
+        self.assertTrue(pc_paths.protected("Roaming\\Example\\x", root=profile("windows", "AppData"), junk_root=self.TEMP))
+        # A junk root whose shape is right but that names Roaming is not Local\Temp.
+        roaming = profile("windows", "AppData", "Roaming", "Temp")
+        self.assertTrue(pc_paths.protected_root(roaming + "\\x", junk_root=roaming))
+
+    def test_protected_names_below_temp_stay_protected(self):
+        for relative in (".ssh\\id_ed25519", "id_rsa", "Google\\Chrome\\Default", "Mozilla\\Firefox\\x.default", "Microsoft\\Protect\\key",
+                         "export\\secrets.json", "keys\\server.pem", "PROGRA~1\\x", "copy\\.env", "Library\\Messages\\chat.db"):
+            with self.subTest(relative=relative):
+                self.assertTrue(pc_paths.protected(relative, root=self.TEMP, junk_root=self.TEMP))
+                self.assertTrue(pc_paths.protected_root(self.TEMP + "\\" + relative, junk_root=self.TEMP))
+
+    def test_comparison_is_case_insensitive_and_componentwise(self):
+        lower = self.TEMP.lower()
+        self.assertFalse(pc_paths.protected_root(self.TEMP.upper() + "\\BUILD", junk_root=lower))
+        self.assertFalse(pc_paths.protected_root(self.TEMP.replace("\\", "/") + "/build", junk_root=self.TEMP))
+        self.assertFalse(pc_paths.protected("build", root=self.TEMP, junk_root=self.TEMP.replace("\\", "/")))
+        # A longer name is a different component, not a text prefix.
+        self.assertTrue(pc_paths.protected_root(self.TEMP + "X\\build", junk_root=self.TEMP))
+        self.assertTrue(pc_paths.protected_root(self.TEMP + "\\b", junk_root=profile("windows", "AppDataX", "Local", "Temp")))
+        # A look-alike that Unicode case folding would equate (U+212A KELVIN SIGN folds to "k") is another folder.
+        kate = "C:\\" + "Users" + "\\kate\\AppData\\Local\\Temp"
+        self.assertFalse(pc_paths.protected_root(kate + "\\b", junk_root=kate))
+        self.assertTrue(pc_paths.protected_root("C:\\" + "Users" + "\\\u212aate\\AppData\\Local\\Temp\\b", junk_root=kate))
+
+    def test_appdata_below_temp_stays_protected(self):
+        # Only the AppData component at the junk root's own position is exempt.
+        for relative in ("AppData", "AppData\\Local\\x", "sub\\appdata\\y"):
+            with self.subTest(relative=relative):
+                self.assertTrue(pc_paths.protected(relative, root=self.TEMP, junk_root=self.TEMP))
+                self.assertTrue(pc_paths.protected_root(self.TEMP + "\\" + relative, junk_root=self.TEMP))
+
 if __name__ == "__main__":
     unittest.main()

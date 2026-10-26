@@ -98,7 +98,7 @@ class WorkflowTests(WorkflowFixture):
             plan = copy.deepcopy(self.plan)
             action = plan["actions"][0]
             lower = {"schema": "patchcairn.storage", "schema_version": 1, "kind": "purge", "receipt": receipt, "irreversible": True}
-            payload = {"schema": "patchcairn.storage.adapter", "schema_version": 1, "operation": "storage.purge", "storage_plan": lower, "storage_plan_sha256": digest(lower), "output_root": output_root, "mode": "fixture", "protected_roots": []}
+            payload = {"schema": "patchcairn.storage.adapter", "schema_version": 1, "operation": "storage.purge", "storage_plan": lower, "storage_plan_sha256": digest(lower), "output_root": output_root, "mode": "fixture", "protected_roots": [], "delete_count": len(receipt["records"]), "delete_bytes": sum(row["original"]["size"] for row in receipt["records"])}
             action.update(kind="permanent_purge", adapter_id=payload["operation"], adapter_payload_evidence_id=self.raw_evidence("adapter_payload", payload), adapter_payload_sha256=digest(payload), adapter_plan_sha256=digest(lower), target_inventory_evidence_id=self.raw_evidence("inventory", receipt), target_inventory_sha256=digest(receipt), requires_recovery=True, recovery_evidence_ids=[recovery_id])
             return plan
 

@@ -132,6 +132,7 @@ class WorkflowEngine:
     record_review = _forward(engine_plans.record_review)
     approve_plan = _forward(engine_plans.approve_plan)
     record_irreversible_ack = _forward(engine_plans.record_irreversible_ack)
+    issue_irreversible_warning = _forward(engine_plans.issue_irreversible_warning)
     set_standing_policy = _forward(engine_plans.set_standing_policy)
     pending_items = _static(engine_plans.pending_items)
     advance_stage = _forward(engine_plans.advance_stage)
