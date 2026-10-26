@@ -275,16 +275,16 @@ class WorkflowFixture(unittest.TestCase):
         clock.return_value = base.isoformat().replace("+00:00", "Z")
         self.engine.setup(self.sid, control="automatic", timing="scheduled")
         due = base + timedelta(minutes=1)
-        first = self.engine.configure_schedule(self.sid, schedule={"when_utc": due.isoformat().replace("+00:00", "Z"), "description": "Fictional first schedule"}, owner_quote="Begin this fictional job at the first agreed time.", owner_message_id="fictional-schedule-first")["data"]
+        first = self.engine.configure_schedule(self.sid, schedule={"when_utc": due.isoformat().replace("+00:00", "Z"), "description": "Fictional first schedule"}, owner_quote="Begin this fictional job at the first agreed time.", owner_message_id="fictional-schedule-first-" + uuid.uuid4().hex)["data"]
         clock.return_value = (due + timedelta(seconds=1)).isoformat().replace("+00:00", "Z")
         self.schedule_trigger("fictional-first-trigger")
         self.plan_ready(automatic=True)
-        self.engine.approve_plan(self.sid, plan_sha256=self.plan_hash, action_ids=["fictional-action"], owner_quote="Approve the exact fictional action.", owner_message_id="fictional-scheduled-plan")
+        self.engine.approve_plan(self.sid, plan_sha256=self.plan_hash, action_ids=["fictional-action"], owner_quote="Approve the exact fictional action.", owner_message_id="fictional-scheduled-plan-" + uuid.uuid4().hex)
         self.engine.advance_stage(self.sid, evidence_ids=[])
         return first, due + timedelta(minutes=5)
 
     def assessment_ready(self):
-        self.engine.authorize_scope(self.sid, owner_quote="Assess only this exact fictional scope; no changes.", owner_message_id="fictional-assessment-scope")
+        self.engine.authorize_scope(self.sid, owner_quote="Assess only this exact fictional scope; no changes.", owner_message_id="fictional-assessment-scope-" + uuid.uuid4().hex)
         facts = {"scope": ("scope_confirmation", {"scope_confirmed": True}), "inventory": ("inventory", {"complete": True, "item_count": 0}), "research": ("research", {"applicability_checked": True, "official_sources_checked": True}), "candidates": ("candidates", {"candidates_reviewed": True, "excluded_private": True}), "symptom": ("symptom", {"symptom_recorded": True, "relevant_scope": True}), "hypotheses": ("hypotheses", {"alternatives_considered": True, "distinguishing_checks": True}), "recovery_plan": ("recovery_plan", {"contents_reviewed": True, "restore_check_planned": True, "exclusions_explicit": True})}
         ids = []
         job = self.state()["job"]
@@ -308,7 +308,7 @@ class WorkflowFixture(unittest.TestCase):
         return summary_id, verification_id, summary, verification
 
     def finish_assessment(self, summary_id, verification_id, **extra):
-        return self.engine.complete_assessment(self.sid, summary_evidence_id=summary_id, verification_evidence_ids=[verification_id], owner_quote="I reviewed the findings and limitations; finish this assessment without changes.", owner_message_id="fictional-assessment-finish", **extra)
+        return self.engine.complete_assessment(self.sid, summary_evidence_id=summary_id, verification_evidence_ids=[verification_id], owner_quote="I reviewed the findings and limitations; finish this assessment without changes.", owner_message_id="fictional-assessment-finish-" + uuid.uuid4().hex, **extra)
 
     def valid_draft_plan(self, evidence_ids):
         inventory = {"fictional": True, "entries": [{"name": "fictional-new-b.data", "size": 1}]}
@@ -361,7 +361,7 @@ class WorkflowFixture(unittest.TestCase):
         return {"schema": "patchcairn.storage", "schema_version": 1, "kind": "quarantine_receipt", "plan_sha256": digest({"fictional": "original-quarantine", "backup": binding["backup_receipt"]["plan_sha256"]}), "source_roots": manifest["source_roots"], "records": [{"original": {key: file[key] for key in ("root_id", "relative_path", "sha256", "size")}} for file in manifest["files"]], "recovery_required": True, "recovery_backup": binding["backup_receipt"], "recovery_verification": binding["restore_receipt"]}
 
     def scope_ready(self):
-        self.engine.authorize_scope(self.sid, owner_quote="Assess only this fictional selected folder.", owner_message_id="fictional-owner-scope")
+        self.engine.authorize_scope(self.sid, owner_quote="Assess only this fictional selected folder.", owner_message_id="fictional-owner-scope-" + uuid.uuid4().hex)
         eid = self.evidence("scope_confirmation", {"scope_confirmed": True})
         self.engine.advance_stage(self.sid, evidence_ids=[eid])
 
@@ -389,7 +389,7 @@ class WorkflowFixture(unittest.TestCase):
 
     def apply_ready(self, **kwargs):
         self.plan_ready(**kwargs)
-        self.engine.approve_plan(self.sid, plan_sha256=self.plan_hash, action_ids=["fictional-action"], owner_quote="Apply this exact fictional action.", owner_message_id="fictional-owner-plan")
+        self.engine.approve_plan(self.sid, plan_sha256=self.plan_hash, action_ids=["fictional-action"], owner_quote="Apply this exact fictional action.", owner_message_id="fictional-owner-plan-" + uuid.uuid4().hex)
         self.engine.advance_stage(self.sid, evidence_ids=[])
 
     def precondition(self, **overrides):

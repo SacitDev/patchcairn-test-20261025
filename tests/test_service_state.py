@@ -166,7 +166,7 @@ class SessionFixtures(ServiceFixtures):
 
     def session(self, job="backup_recovery", platform=None):
         sid = self.engine.create_session(job=job, platform=platform or native_platform(), mode="fixture", scope=self.scope, checkpoints=[])["session_id"]
-        self.engine.authorize_scope(sid, owner_quote="Use only this selected synthetic folder.", owner_message_id="fictional-scope")
+        self.engine.authorize_scope(sid, owner_quote="Use only this selected synthetic folder.", owner_message_id="fictional-scope-" + uuid.uuid4().hex)
         return sid
 
     def state(self, sid=None):
@@ -210,14 +210,14 @@ class SessionFixtures(ServiceFixtures):
                       "reviewer_id": reviewer, "attestation": "coordinator-attested"}
             self.engine.record_review(sid, plan_sha256=sha, reviewer_id=reviewer, role=role, verdict="approved",
                         evidence_ids=[self.evidence("review", {"reviewed": True}, sid=sid, content=encoded(review))], notes="Independent synthetic review of this exact bounded plan")
-        quote, message_id = "Apply only this exact synthetic action.", "fixture-plan-choice"
+        quote, message_id = "Apply only this exact synthetic action.", "fixture-plan-choice-" + uuid.uuid4().hex
         if purge_choice:
             # A permanent deletion is approved by the owner's typed reply to the engine's warning, in a message never used before.
             quote, message_id = self.engine.issue_irreversible_warning(sid, plan_sha256=sha)["data"]["phrase"], "fixture-typed-reply-" + uuid.uuid4().hex
         self.engine.approve_plan(sid, plan_sha256=sha, action_ids=[action["action_id"]], owner_quote=quote, owner_message_id=message_id)
         if ack:
             self.engine.record_irreversible_ack(sid, plan_sha256=sha, action_ids=[action["action_id"]],
-                        acknowledge_irreversible_loss=True, owner_quote="I acknowledge the separate risk of these exact fictional actions.", owner_message_id="fixture-loss-ack")
+                        acknowledge_irreversible_loss=True, owner_quote="I acknowledge the separate risk of these exact fictional actions.", owner_message_id="fixture-loss-ack-" + uuid.uuid4().hex)
         self.engine.advance_stage(sid, evidence_ids=[])
         return sha
 
@@ -250,7 +250,7 @@ class SessionFixtures(ServiceFixtures):
             selected_sid = sid or self.sid
             consent = self.evidence("protected_consent", {"action_id": action["action_id"], "plan_sha256": sha, "actual_os_consent": True}, sid=selected_sid)
             self.engine.record_protected_consent(selected_sid, action_id=action["action_id"], plan_sha256=sha, evidence_id=consent,
-                        owner_quote="Synthetic owner handled the selected fixture consent step; no OS installer runs.", owner_message_id="fixture-native-consent")
+                        owner_quote="Synthetic owner handled the selected fixture consent step; no OS installer runs.", owner_message_id="fixture-native-consent-" + uuid.uuid4().hex)
             kwargs["owner_consent_evidence_id"] = consent
         return self.service.execute_action(sid or self.sid, action_id=action["action_id"], plan_sha256=sha,
                     precondition_evidence_ids=[self.precondition(action, sha, sid=sid)], **kwargs)
