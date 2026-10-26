@@ -83,6 +83,14 @@ class StorageContractTests(unittest.TestCase):
         self.refused(lambda: storage_contract.read_storage(dict(record, kind="fictional")), "storage-refusal")
         self.refused(lambda: storage_contract.read_storage(dict(record, schema_version=2)), "schema-version")
 
+    def test_storage_record_kinds_cover_plan_kinds(self):
+        # The record kinds come from the plan kinds, so a storage plan of every adapter reads back as a storage record.
+        self.assertLessEqual(set(storage_contract.PLAN_KINDS.values()), storage_contract.KINDS)
+        for adapter_id, kind in storage_contract.PLAN_KINDS.items():
+            record = {"schema": storage_contract.PLAN, "schema_version": 1, "kind": kind}
+            with self.subTest(adapter_id=adapter_id):
+                self.assertIs(storage_contract.read_storage(record), record)
+
     def test_module_imports_only_layer_zero_and_the_standard_library(self):
         tree = ast.parse((ROOT / "scripts" / "storage_contract.py").read_text(encoding="utf-8"))
         names = {alias.name.split(".")[0] for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names}

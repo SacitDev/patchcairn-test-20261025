@@ -25,10 +25,10 @@ PLAN_KINDS = MappingProxyType({
     pc_records.ADAPTER_STORAGE_RETENTION_FORGET: "retention_forget",
     pc_records.ADAPTER_STORAGE_SESSION_RELEASE: "session_release",
 })
-# Every storage record is a kind of patchcairn.storage.
-KINDS = frozenset({"inventory", "backup", "restore", "quarantine", "quarantine_restore", "purge", "storage_preconditions",
-                   "duplicates", "attempt", "backup_manifest", "backup_receipt", "restore_receipt", "quarantine_receipt",
-                   "quarantine_restore_receipt", "purge_receipt", "storage_outcome_verification", "capabilities"})
+# Every storage record is a kind of patchcairn.storage: each plan kind above, and the records around the plans.
+KINDS = frozenset(PLAN_KINDS.values()) | frozenset({
+    "inventory", "storage_preconditions", "duplicates", "attempt", "backup_manifest", "backup_receipt", "restore_receipt",
+    "quarantine_receipt", "quarantine_restore_receipt", "purge_receipt", "storage_outcome_verification", "capabilities"})
 PAYLOAD_REQUIRED = frozenset({"operation", "storage_plan", "storage_plan_sha256", "output_root", "mode", "protected_roots"})
 PAYLOAD_OPTIONAL = frozenset({"restore_probe_destination"})
 # Above the service's 10,000 retention rows plus its own namespaces, so retained recovery never locks a

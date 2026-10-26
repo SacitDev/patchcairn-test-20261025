@@ -32,8 +32,16 @@ CHECKPOINT_LABELS = {"scope": "the agreed scope", "findings": "the assessment fi
 ACTION_LABELS = {"update": "Install the selected update", "cleanup_quarantine": "Move selected files to quarantine",
                  "backup_create": "Create the reviewed backup", "backup_restore": "Restore the reviewed backup", "repair": "Apply the reviewed repair",
                  "permanent_purge": "Permanently delete the selected quarantined files", "restart": "Restart", "firmware": "Review a firmware change",
-                 "os_transition": "Review a system release change", "security_policy": "Review a security setting change", "assessment": "Read-only assessment"}
+                 "os_transition": "Review a system release change", "security_policy": "Review a security setting change", "assessment": "Read-only assessment",
+                 "remove_originals": "Permanently delete the original files after a checked backup",
+                 "retention_release": "Permanently delete kept backups and recovery files", "retention_forget": "Forget kept backups that are already gone",
+                 "session_release": "Permanently delete a finished session's kept files"}
 CHECKPOINTS = {"scope", "findings", "plan", "before_action", "after_action", "finish"}
+
+
+def report_labels():
+    """The plain names a session report shows for each job, stage and action kind, copied from the tables above."""
+    return {"jobs": {job: row["label"] for job, row in JOBS.items()}, "stages": dict(STAGE_LABELS), "actions": dict(ACTION_LABELS)}
 
 
 def decision_card(*, meaning, benefits, drawbacks, cost, reversibility, recommendation, options):

@@ -15,6 +15,7 @@ import re
 import stat
 import sys
 
+import pc_paths
 import win32_files as w32
 
 
@@ -26,6 +27,26 @@ class PrivateWorkspaceError(ValueError):
 
 def _hold(code):
     raise PrivateWorkspaceError(code)
+
+
+def relative_parts(path, root):
+    """The parts of ``path`` below ``root``: () for ``root`` itself and None when ``path`` is outside it.
+
+    Both are absolute paths compared as text; nothing is opened or resolved, so callers pass paths whose links are
+    already refused. A relative path or a ".." part is None (outside). pathlib folds letter case with str.lower(); on
+    Windows each part is also compared with the file system's own rule (win32_files.same_name), so a look-alike part
+    such as one with U+212A (Kelvin sign) is not "k".
+    """
+    path, root = Path(path), Path(root)
+    if not (path.is_absolute() and root.is_absolute()) or ".." in path.parts or ".." in root.parts:
+        return None
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        return None
+    if os.name == "nt" and w32.API is not None and not all(map(w32.same_name, path.parts, root.parts)):
+        return None
+    return relative.parts
 
 
 def _absolute(path, boundary=None):
@@ -41,24 +62,16 @@ def _absolute(path, boundary=None):
     if os.name == "nt":
         if not re.match(r"\A[A-Za-z]:\\", raw) or raw.startswith("\\\\") or len(raw) > 240:
             _hold("private-local-path-required")
-        for part in value.parts[1:]:
-            if (not part or part in {".", ".."} or part[-1:] in {".", " "}
-                    or re.search(r'[/:*?<>|"\x00-\x1f]', part)
-                    or re.fullmatch(r"(?i:CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])(?:\..*)?", part)):
-                _hold("private-path-invalid")
+        # pc_paths' one name rule: no empty, dot or trailing-dot-or-space name, no control, separator, stream or wildcard
+        # character, and no reserved device name (CONIN$, CONOUT$ and COM/LPT with a superscript digit included).
+        if not all(map(pc_paths.portable, value.parts[1:])):
+            _hold("private-path-invalid")
     value = value.absolute()
     if value == value.parent:
         _hold("private-root-refused")
-    if boundary is not None:
-        limit = _absolute(boundary)
-        try:
-            value.relative_to(limit)
-        except ValueError:
-            _hold("private-boundary-escape")
-        # Strictly below; pathlib folds case with str.lower(), NTFS with its own table (U+212A is not "k").
-        if value == limit or (os.name == "nt" and w32.API is not None
-                              and not all(map(w32.same_name, value.parts, limit.parts))):
-            _hold("private-boundary-escape")
+    # Strictly below the boundary: the boundary itself is refused too.
+    if boundary is not None and not relative_parts(value, _absolute(boundary)):
+        _hold("private-boundary-escape")
     return value
 
 

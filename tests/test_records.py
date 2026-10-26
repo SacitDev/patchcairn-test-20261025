@@ -274,7 +274,7 @@ class SchemaTests(unittest.TestCase):
                  "patchcairn.assessment.access", "patchcairn.assessment.summary", "patchcairn.assessment.verification",
                  "patchcairn.restart.pending", "patchcairn.restart.verification", "patchcairn.windows.boot.observation"}
         self.assertLessEqual(today, pc_records.SCHEMAS - pc_records.PLANNED_SCHEMAS)
-        self.assertEqual(pc_records.PLANNED_SCHEMAS, {"patchcairn.package", "patchcairn.schedule"})
+        self.assertEqual(pc_records.PLANNED_SCHEMAS, {"patchcairn.package", "patchcairn.schedule", "patchcairn.review"})
         self.assertEqual(pc_records.CONTAINERS, {"engine_marker", "session_state", "session_creation",
                                                  "response_envelope", "workflows_template", "tool_catalog", "toolkit_marker"})
         # One name per family: new storage records are kinds of patchcairn.storage, so no second name may

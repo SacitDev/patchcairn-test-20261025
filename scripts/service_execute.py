@@ -23,7 +23,7 @@ from diagnostic_core import DiagnosticRefusal
 from private_workspace import ensure_private_directory
 from service_state import DEFAULT_ROOT, ServiceRefusal, decoded, private_read, read_service, service_value, within, without_version
 from service_backup import verify_storage_artifact
-from service_diagnostics import DIAGNOSTIC_ADAPTER_ID, DiagnosticStore
+from service_diagnostics import DiagnosticStore
 
 # The service's storage adapters: the engine action kind and the outcome-file name of each (the storage plan
 # kind is storage_contract.PLAN_KINDS).
@@ -170,7 +170,8 @@ class ExecuteMixin:
             raise ServiceRefusal("Exact current action required")
         action = actions[0]
         payload = self.engine.action_binding(state, action)
-        if action["adapter_id"] not in STORAGE and action["adapter_id"] not in {DIAGNOSTIC_ADAPTER_ID, pc_records.ADAPTER_SYSTEM_REVIEWED_EXTERNAL}:
+        # Every id with an execute target binds here; a family whose code is not written yet holds in its target.
+        if action["adapter_id"] not in EXECUTE:
             raise ServiceRefusal("No fixed service adapter exists for this action")
         if digest(payload) != action["adapter_payload_sha256"]:
             raise ServiceRefusal("Actual payload bytes differ from approved adapter payload")

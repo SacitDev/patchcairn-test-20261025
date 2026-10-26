@@ -206,8 +206,10 @@ class SessionFixtures(ServiceFixtures):
                 "evidence_ids": [action["target_inventory_evidence_id"]], "actions": [action]}
         sha = self.engine.register_plan(sid, plan=plan)["data"]["plan_sha256"]
         for reviewer, role in (("fixture-reviewer-data", "compatibility_data"), ("fixture-reviewer-security", "evidence_security")):
+            review = {"schema": "patchcairn.review", "schema_version": 1, "plan_sha256": sha, "role": role, "verdict": "approved",
+                      "reviewer_id": reviewer, "attestation": "coordinator-attested"}
             self.engine.record_review(sid, plan_sha256=sha, reviewer_id=reviewer, role=role, verdict="approved",
-                        evidence_ids=[self.evidence("review", {"reviewed": True}, sid=sid)], notes="Independent synthetic review of this exact bounded plan")
+                        evidence_ids=[self.evidence("review", {"reviewed": True}, sid=sid, content=encoded(review))], notes="Independent synthetic review of this exact bounded plan")
         self.engine.approve_plan(sid, plan_sha256=sha, action_ids=[action["action_id"]], owner_quote="Apply only this exact synthetic action.",
                     owner_message_id="fixture-plan-choice", acknowledge_permanent_loss=purge_choice)
         if ack:
@@ -314,6 +316,23 @@ class SessionFixtures(ServiceFixtures):
 
 
 class WorkflowServiceTests(SessionFixtures):
+    def test_action_binds_the_lower_level_plan_each_caller_names(self):
+        # Each caller names the plan inside its payload that the action's adapter_plan_sha256 binds: the storage plan, the
+        # diagnostic request and the reviewed external plan, whose hashes the engine's binding compares with it.
+        storage, _native = self.backup_action()
+        diagnostic_sid = self.session(job="diagnosis_repair", platform="macos")
+        diagnostic = self.service.prepare_diagnostic_action(diagnostic_sid, action_id="read-version", recipe_id="macos.os_version",
+                                                            symptom="Fictional error E42", diagnostic_scope=["os_metadata"], **PROSE)
+        external_sid, external, _plan = self.external()
+        for sid, action, field, bound in ((self.sid, storage, "storage_plan", "storage_plan_sha256"),
+                                          (diagnostic_sid, diagnostic, "request", "request_sha256"),
+                                          (external_sid, external, "external_plan", "external_plan_sha256")):
+            with self.subTest(field=field):
+                row = self.state(sid)["evidence"][action["adapter_payload_evidence_id"]]
+                payload = json.loads((self.engine.work / sid / row["path"]).read_bytes())
+                self.assertEqual(action["adapter_plan_sha256"], digest(payload[field]))
+                self.assertEqual(action["adapter_plan_sha256"], payload[bound])
+
     def test_service_intent_tamper_missing_marker_and_foreign_ids_refuse(self):
         action, native = self.backup_action()
         result = self.execute(action, self.approve(action))

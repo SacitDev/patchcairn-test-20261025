@@ -36,7 +36,9 @@ from engine_journal import (BACKEND, DIAGNOSTIC_ADAPTER, EVIDENCE_MAX_BYTES, EVI
                             RECOVERY_BINDING, RECOVERY_RETENTION, RESTART_PENDING, RESTART_VERIFICATION, SERVICE_RECORD, STORAGE_ADAPTER,
                             WINDOWS_BOOT, Journal, PrivacyCapabilityHold, WorkflowRefusal, atomic_replace, decode_record, exact_fields, no_links,
                             older_folder, older_format_message, read_record_bytes, record_identifier, typed_record, utc_time)
-from engine_text import CHECKPOINTS, COMMANDS, JOBS, initial_menu, parse_command
+# The label tables sit next to JOBS and CHECKPOINTS so the service reads them here, never from an engine module.
+from engine_text import (ACTION_LABELS, CHECKPOINT_LABELS, CHECKPOINTS, COMMANDS, JOBS, STAGE_LABELS, initial_menu, parse_command,
+                         report_labels)
 from pc_records import SCHEMA_VERSION, digest, encoded
 
 

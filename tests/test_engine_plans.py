@@ -6,6 +6,7 @@ No test collects host inventory, creates a schedule, executes a plan or cleans a
 """
 from __future__ import annotations
 
+import ast
 import copy
 from datetime import datetime, timedelta, timezone
 import json
@@ -19,9 +20,54 @@ ROOT = Path(__file__).absolute().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 import diagnostic_core
 import engine_plans
+import engine_text
+import engine_updates
 import pc_records
+import workflow_core
 from workflow_core import JOBS, WorkflowEngine, WorkflowRefusal, digest, encoded
 from test_engine_journal import WorkflowFixture
+
+
+class KindAndLabelTests(unittest.TestCase):
+    """The engine's kind and label tables and the binding route, read from the code; no session."""
+
+    def test_every_adapter_kind_has_engine_kind_and_label(self):
+        # A plan for any registered adapter registers, and options and the report can name its action.
+        for adapter_id, facts in pc_records.ADAPTERS.items():
+            for kind in facts["kinds"]:
+                with self.subTest(adapter_id=adapter_id, kind=kind):
+                    self.assertIn(kind, engine_plans.KINDS)
+                    self.assertTrue(isinstance(engine_text.ACTION_LABELS.get(kind), str) and engine_text.ACTION_LABELS[kind].strip())
+        self.assertEqual(set(engine_text.ACTION_LABELS), engine_plans.KINDS)
+
+    def test_report_labels_cover_every_job_stage_and_action_kind(self):
+        labels = workflow_core.report_labels()
+        self.assertEqual(set(labels), {"jobs", "stages", "actions"})
+        self.assertEqual(labels["jobs"], {job: row["label"] for job, row in JOBS.items()})
+        self.assertEqual(set(labels["stages"]), {stage for row in JOBS.values() for stage in row["stages"]})
+        self.assertEqual(set(labels["actions"]), engine_plans.KINDS)
+        self.assertTrue(all(isinstance(text, str) and text.strip() for table in labels.values() for text in table.values()))
+        # Each call returns copies, so a caller cannot change what the engine shows.
+        labels["actions"]["update"] = labels["stages"]["scope"] = "changed"
+        self.assertNotEqual(workflow_core.ACTION_LABELS["update"], "changed")
+        self.assertNotEqual(workflow_core.report_labels()["stages"]["scope"], "changed")
+
+    def test_facade_re_exports_the_label_tables(self):
+        # The service reads the labels from the facade module and never imports an engine module.
+        for name in ("ACTION_LABELS", "STAGE_LABELS", "CHECKPOINT_LABELS", "JOBS", "CHECKPOINTS", "report_labels"):
+            with self.subTest(name=name):
+                self.assertIs(getattr(workflow_core, name), getattr(engine_text, name))
+
+    def test_engine_plans_never_imports_engine_updates(self):
+        # engine_updates imports engine_plans, so the update family is reached through the engine, never by import.
+        tree = ast.parse((ROOT / "scripts" / "engine_plans.py").read_text(encoding="utf-8"))
+        imported = {alias.name.split(".")[0] for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names}
+        imported |= {node.module.split(".")[0] for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.module}
+        imported |= {node.args[0].value.split(".")[0] for node in ast.walk(tree) if isinstance(node, ast.Call) and node.args
+                     and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str)
+                     and getattr(node.func, "attr", getattr(node.func, "id", None)) in ("import_module", "__import__")}
+        self.assertIn("engine_journal", imported)
+        self.assertNotIn("engine_updates", imported)
 
 
 class AssessmentAccessTests(unittest.TestCase):
@@ -288,6 +334,34 @@ class WorkflowTests(WorkflowFixture):
             if code:
                 self.assertEqual(caught.exception.code, code)
         self.assertEqual(self.state()["revision"], before)
+
+    def test_update_and_repair_families_route_to_update_binding(self):
+        # Routing is by family: each update or repair adapter reaches engine.update_binding once with the decoded payload
+        # and inventory, after the payload and inventory hash checks; no other family reaches it.
+        self.plan_ready()
+        inventory = {"fictional": True, "entries": [{"name": "fictional.data", "size": 1}]}
+        inventory_id = self.raw_evidence("inventory", inventory)
+        routed = sorted(adapter_id for adapter_id, facts in pc_records.ADAPTERS.items() if facts["family"] in {"update", "repair"})
+        self.assertLessEqual({pc_records.ADAPTER_PACKAGE_UPGRADE, pc_records.ADAPTER_SYSTEM_REPAIR}, set(routed))
+        for adapter_id in routed:
+            payload = {"fictional_payload": adapter_id}
+            action = dict(self.plan["actions"][0], adapter_id=adapter_id, kind=pc_records.ADAPTERS[adapter_id]["kinds"][0],
+                          adapter_payload_evidence_id=self.raw_evidence("adapter_payload", payload), adapter_payload_sha256=digest(payload),
+                          target_inventory_evidence_id=inventory_id, target_inventory_sha256=digest(inventory))
+            state = self.state()
+            with self.subTest(adapter_id=adapter_id), mock.patch.object(engine_updates, "update_binding") as binding:
+                try:
+                    self.assertEqual(self.engine.action_binding(state, action), payload)
+                except WorkflowRefusal as error:
+                    self.fail("the action did not reach update_binding: " + error.code)
+                binding.assert_called_once_with(self.engine, state, action, payload, inventory)
+                for field in ("adapter_payload_sha256", "target_inventory_sha256"):
+                    with self.assertRaises(WorkflowRefusal):
+                        self.engine.action_binding(state, dict(action, **{field: "0" * 64}))
+                binding.assert_called_once()
+        with mock.patch.object(engine_updates, "update_binding") as binding:
+            self.engine.action_binding(self.state(), self.plan["actions"][0])
+        binding.assert_not_called()
 
     def test_standing_policy_covers_only_policy_coverable_adapters(self):
         self.plan_ready(automatic=True)

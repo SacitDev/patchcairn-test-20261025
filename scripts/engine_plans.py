@@ -25,15 +25,14 @@ import storage_contract
 
 KINDS = {"update", "cleanup_quarantine", "backup_create", "backup_restore", "repair", "permanent_purge", "restart", "firmware", "os_transition",
          "security_policy", "assessment"}
+# Every action kind a registered adapter may carry (pc_records.ADAPTERS) is a plan kind.
+KINDS |= {kind for facts in pc_records.ADAPTERS.values() for kind in facts["kinds"]}
 # Only the action kinds of adapters that pc_records lets a standing policy cover.
 POLICY_KINDS = frozenset(kind for facts in pc_records.ADAPTERS.values() if facts["policy_coverable"] for kind in facts["kinds"])
 ROLES = {"compatibility_data", "evidence_security"}
 EVIDENCE_KINDS = {"scope_confirmation", "inventory", "research", "candidates", "symptom", "hypotheses", "recovery_plan", "precondition", "outcome",
                   "reconciliation", "verification", "recovery", "protected_consent", "review", "fixture"}
 EVIDENCE_KINDS |= {"adapter_payload", "recovery_manifest", "restore_verification", "retention", "recovery_archive"}
-# Storage adapters whose plans the storage service carries out today; the other storage ids hold.
-STORAGE_ADAPTERS = frozenset({pc_records.ADAPTER_STORAGE_BACKUP_CREATE, pc_records.ADAPTER_STORAGE_RESTORE, pc_records.ADAPTER_STORAGE_QUARANTINE,
-                              pc_records.ADAPTER_STORAGE_QUARANTINE_RESTORE, pc_records.ADAPTER_STORAGE_PURGE})
 MAX_FACT_ITEMS = pc_records.MAX_BACKUP_ENTRIES
 # Facts are copied into the journal state, so they stay small; large data belongs in the evidence content.
 FACTS_MAX_BYTES = 65_536
@@ -468,7 +467,8 @@ def action_binding(engine, state, action):
     elif action["adapter_id"] in pc_records.ADAPTERS and pc_records.ADAPTERS[action["adapter_id"]]["family"] in {"update", "repair"}:
         # The update and repair families bind in engine_updates, reached through the engine (no import of it here).
         engine.update_binding(state, action, payload, inventory)
-    elif action["adapter_id"] in STORAGE_ADAPTERS:
+    elif action["adapter_id"] in storage_contract.PLAN_KINDS:
+        # Every storage adapter binds here; the service holds an id whose family code is not written yet.
         checked(storage_contract.validate_payload, payload, adapter_id=action["adapter_id"], mode=state["mode"], plan_sha256=action["adapter_plan_sha256"])
         json_data(payload["storage_plan"])
         output_value = Path(bounded_text(payload["output_root"], "owned storage output root", 2000))

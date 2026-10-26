@@ -19,7 +19,7 @@ from unittest import mock
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).absolute().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
-from workflow_core import WorkflowEngine, WorkflowRefusal
+from workflow_core import WorkflowEngine, WorkflowRefusal, digest
 import pc_records
 from workflow_service import WorkflowService, ServiceRefusal, verify_storage_artifact
 from storage_ops import StorageRefusal
@@ -74,6 +74,94 @@ class PauseBeforeEffectTests(ServiceFixtures):
                                                                                diagnostic_fixture_result=None)
                     else:
                         service._storage_preconditions.assert_not_called()
+
+
+class BindingTests(ServiceFixtures):
+    """Fictional service objects only; no files, engine or adapter effect."""
+    HELD = ("service-refusal", "No fixed service adapter exists for this action")
+
+    def test_binding_reaches_every_dispatch_target(self):
+        # Every adapter id with an execute target passes the service's binding, and execute_action reaches the target with
+        # the bound payload and its own arguments unchanged; an id outside EXECUTE keeps the refusal. Nothing begins here.
+        service = object.__new__(WorkflowService)
+        service._lock = mock.Mock(side_effect=nullcontext)
+        state = {"status": "active", "stage": "apply"}
+        service._state = mock.Mock(return_value=state)
+        arguments = dict(action_id="dispatched", plan_sha256="a" * 64, precondition_evidence_ids=["proof"], owner_consent_evidence_id=None,
+                         diagnostic_fixture_runner=None, diagnostic_fixture_result=None)
+        for adapter_id in [*EXECUTE, "fixture.unlisted"]:
+            payload = {"fictional_payload": adapter_id}
+            action = {"action_id": "dispatched", "adapter_id": adapter_id, "adapter_payload_sha256": digest(payload)}
+            service.engine = types.SimpleNamespace(pending_items=mock.Mock(return_value=[]), begin_operation=mock.Mock(),
+                                                   current_plan=mock.Mock(return_value={"actions": [action]}),
+                                                   action_binding=mock.Mock(return_value=payload))
+            with self.subTest(adapter_id=adapter_id):
+                if adapter_id in EXECUTE:
+                    with mock.patch.object(service, EXECUTE[adapter_id], return_value="reached") as target:
+                        try:
+                            self.assertEqual(service.execute_action("session-fixture", **arguments), "reached")
+                        except ServiceRefusal as error:
+                            self.fail("the binding refused an id that has an execute target: " + str(error))
+                    target.assert_called_once_with("session-fixture", state, action, payload, **arguments)
+                else:
+                    with self.assertRaises(ServiceRefusal) as caught:
+                        service.execute_action("session-fixture", **arguments)
+                    self.assertEqual((caught.exception.code, str(caught.exception)), self.HELD)
+                service.engine.current_plan.assert_called_once_with(state, "a" * 64)
+                service.engine.action_binding.assert_called_once_with(state, action)
+                service.engine.begin_operation.assert_not_called()
+
+    def test_run_effect_order_and_unknown_mapping(self):
+        # _run_adapter: begin, intent, the session re-read, the effect boundary (entered.json), then the effect. A pause
+        # before the boundary finishes "failed" with no boundary and no effect; a listed failure after the boundary finishes
+        # "unknown" with a categorical receipt (no error text); any other error propagates and records nothing.
+        start = ["begin-operation", "engine-preflight", "intent", "status-1"]
+        cases = (("succeeds", None, start + ["entered.json", "effect"]),
+                 ("refusal", pc_records.Refusal("fictional-code", "Fictional private detail"), start + ["entered.json", "effect", "status-2", "finish"]),
+                 ("os-error", OSError(5, "Fictional private detail"), start + ["entered.json", "effect", "status-2", "finish"]),
+                 ("other-error", KeyError("Fictional private detail"), start + ["entered.json", "effect"]),
+                 ("paused", None, start + ["finish"]))
+        for label, error, expected in cases:
+            with self.subTest(case=label):
+                service, state, operation, events, written, arguments = self.prepared()
+                action, payload = service._binding.return_value
+                if label == "paused":
+                    def reread(*args):
+                        events.append("status-" + str(service.engine.read_session.call_count))
+                        state["status"] = "paused"
+                        return state
+                    service.engine.read_session.side_effect = reread
+
+                def effect(session_id, current, selected, bound_action, bound_payload, path, intent, **effect_arguments):
+                    events.append("effect")
+                    self.assertEqual((session_id, selected, bound_action, bound_payload, effect_arguments),
+                                     (state["session_id"], operation, action, payload, {"fictional_argument": True}))
+                    if error is not None:
+                        raise error
+                    return "effect-result"
+                run = lambda: service._run_adapter(state["session_id"], state, action, payload, effect, fictional_argument=True, **arguments)
+                if label == "other-error":
+                    with self.assertRaises(KeyError):
+                        run()
+                else:
+                    result = run()
+                self.assertEqual(events, expected)
+                if label == "paused":
+                    self.assertEqual(result["outcome"], "failed")
+                    self.assertNotIn("entered.json", written)
+                    continue
+                self.assertEqual(written["entered.json"]["kind"], "effect_boundary")
+                self.assertEqual((written["entered.json"]["operation_id"], written["entered.json"]["adapter_id"]),
+                                 (operation["operation_id"], action["adapter_id"]))
+                if label == "succeeds":
+                    self.assertEqual(result, "effect-result")
+                elif label in ("refusal", "os-error"):
+                    self.assertEqual(result["outcome"], "unknown")
+                    self.assertEqual(result["receipt"], {
+                        "adapter_invoked": True, "failure_class": type(error).__name__, "possible_partial_effects": True,
+                        "failure_code": "fictional-code" if label == "refusal" else None,
+                        "instruction": "Preserve exact intent, native attempt/mapping and outputs; inspect actual state before any new plan."})
+                    self.assertNotIn("private", str(result))
 
 
 class WorkflowServiceTests(SessionFixtures):
@@ -298,6 +386,46 @@ class DispatchTests(SessionFixtures):
                         call()
                     self.assertEqual(str(caught.exception), refusals[kind])
         service.engine.begin_operation.assert_not_called()
+
+    def held_execution(self, action, sha):
+        """Execute an approved action whose family is not written yet: the target's refusal, no begin, no file written."""
+        proof = self.precondition(action, sha)
+        # Paths and file sizes: a folder's own size moves when the service's lock folder comes and goes inside it.
+        def listing():
+            return sorted((path, path.stat().st_size if path.is_file() else None) for path in self.root.rglob("*"))
+        files, revision = listing(), self.state()["revision"]
+        with mock.patch.object(self.engine, "begin_operation") as begin, self.assertRaises(ServiceRefusal) as caught:
+            self.service.execute_action(self.sid, action_id=action["action_id"], plan_sha256=sha, precondition_evidence_ids=[proof])
+        self.assertEqual((caught.exception.code, str(caught.exception)), BindingTests.HELD)
+        begin.assert_not_called()
+        self.assertEqual(self.state()["revision"], revision)
+        self.assertEqual(listing(), files)
+
+    def test_unwritten_family_still_holds(self):
+        # A real fixture.assessment action binds in the engine and in the service, then holds in its own target.
+        inventory = {"fixture": True, "entries": [{"name": "fictional.data"}]}
+        fixture_plan = {"fictional_assessment": True}
+        payload = {"schema": "patchcairn.fixture.adapter", "schema_version": 1, "operation": pc_records.ADAPTER_FIXTURE_ASSESSMENT,
+                   "fixture_plan": fixture_plan, "fixture_plan_sha256": digest(fixture_plan), "inventory_sha256": digest(inventory)}
+        action = self.service._action(self.state(), action_id="fixture-assessment", adapter_id=payload["operation"], kind="assessment",
+                                      payload=payload, native_plan=fixture_plan, inventory=inventory, **PROSE)
+        self.held_execution(action, self.approve(action))
+
+    def test_every_storage_plan_kind_binds_generically(self):
+        # Every storage plan kind binds through the engine's one storage branch: a retention release plan registers and is
+        # approved, and executing it holds in the service until its family code is written.
+        records = {"fixture": True, "entries": [{"name": "fictional-kept-backup"}]}
+        plan = {"schema": "patchcairn.storage", "schema_version": 1, "kind": "retention_release", "records": records, "fixture": True}
+        payload = {"schema": "patchcairn.storage.adapter", "schema_version": 1, "operation": pc_records.ADAPTER_STORAGE_RETENTION_RELEASE,
+                   "storage_plan": plan, "storage_plan_sha256": digest(plan), "output_root": str(self.output), "mode": "fixture",
+                   "protected_roots": [str(self.output)]}
+        action = self.service._action(self.state(), action_id="release-kept", adapter_id=payload["operation"], kind="retention_release",
+                                      payload=payload, native_plan=plan, inventory=records, **PROSE)
+        try:
+            sha = self.approve(action, purge_choice=True)
+        except WorkflowRefusal as error:
+            self.fail("the retention release plan did not register: " + error.code)
+        self.held_execution(action, sha)
 
 
 class CompositionTests(unittest.TestCase):

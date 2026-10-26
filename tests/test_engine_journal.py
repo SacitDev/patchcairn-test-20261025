@@ -321,10 +321,10 @@ class WorkflowFixture(unittest.TestCase):
         self.engine.action_binding(self.state(), action)
         return plan
 
-    def evidence(self, kind, facts=None, observed_utc=None):
+    def evidence(self, kind, facts=None, observed_utc=None, content=None):
         self.sequence += 1
         evidence_id = "fictional-evidence-" + str(self.sequence)
-        return self.engine.register_evidence(self.sid, evidence_id=evidence_id, content=encoded({"fictional": True, "facts": facts or {}}), kind=kind, scope=self.scope, facts=facts, observed_utc=observed_utc)["data"]["evidence_id"]
+        return self.engine.register_evidence(self.sid, evidence_id=evidence_id, content=content or encoded({"fictional": True, "facts": facts or {}}), kind=kind, scope=self.scope, facts=facts, observed_utc=observed_utc)["data"]["evidence_id"]
 
     def raw_evidence(self, kind, value):
         self.sequence += 1
@@ -382,8 +382,9 @@ class WorkflowFixture(unittest.TestCase):
         plan = {"plan_id": "fictional-plan", "summary": "Fictional reviewed exact plan", "evidence_ids": [self.evidence("inventory", {"item_count": 1, "complete": True})], "actions": [action]}
         self.plan = copy.deepcopy(plan)
         self.plan_hash = self.engine.register_plan(self.sid, plan=plan)["data"]["plan_sha256"]
-        self.engine.record_review(self.sid, plan_sha256=self.plan_hash, reviewer_id="fictional-reviewer-a", role="compatibility_data", verdict="approved", evidence_ids=[self.evidence("review", {"reviewed": True})], notes="Fictional independent data-safety review")
-        self.engine.record_review(self.sid, plan_sha256=self.plan_hash, reviewer_id="fictional-reviewer-b", role="evidence_security", verdict="approved", evidence_ids=[self.evidence("review", {"reviewed": True})], notes="Fictional independent evidence review")
+        review = {"schema": "patchcairn.review", "schema_version": 1, "plan_sha256": self.plan_hash, "verdict": "approved", "attestation": "coordinator-attested"}
+        self.engine.record_review(self.sid, plan_sha256=self.plan_hash, reviewer_id="fictional-reviewer-a", role="compatibility_data", verdict="approved", evidence_ids=[self.evidence("review", {"reviewed": True}, content=encoded(dict(review, role="compatibility_data", reviewer_id="fictional-reviewer-a")))], notes="Fictional independent data-safety review")
+        self.engine.record_review(self.sid, plan_sha256=self.plan_hash, reviewer_id="fictional-reviewer-b", role="evidence_security", verdict="approved", evidence_ids=[self.evidence("review", {"reviewed": True}, content=encoded(dict(review, role="evidence_security", reviewer_id="fictional-reviewer-b")))], notes="Fictional independent evidence review")
 
     def apply_ready(self, **kwargs):
         self.plan_ready(**kwargs)

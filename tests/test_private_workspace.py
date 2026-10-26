@@ -19,6 +19,7 @@ from types import SimpleNamespace
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).absolute().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
+import pc_paths
 import private_workspace as private
 import win32_files
 
@@ -394,6 +395,51 @@ class WindowsPrivateWorkspaceTests(unittest.TestCase):
             self.assertTrue(checker.call_count == 1)
             self.assertFalse(write.called)
             self.assertTrue(close.call_count == 1)
+
+
+class PathRuleTests(unittest.TestCase):
+    """Path text only: nothing is created, opened or resolved."""
+
+    def test_relative_parts_of_the_root_a_child_an_outside_path_and_a_look_alike(self):
+        root = FIXTURES / "containment-root"
+        self.assertEqual(private.relative_parts(root, root), ())
+        self.assertEqual(private.relative_parts(root / "child" / "file.bin", root), ("child", "file.bin"))
+        for outside in (root.parent, root.parent / "containment-other", root.parent / "containment-root-sibling" / "child"):
+            with self.subTest(outside=outside.name):
+                self.assertIsNone(private.relative_parts(outside, root))
+        # Text comparison only, so a ".." part or a relative path is never taken to be inside.
+        for path, limit in ((root / ".." / "containment-other", root), (root / "child", root / ".." / "containment-root"),
+                            (Path("child"), Path("child")), (root / "child", Path("containment-root"))):
+            with self.subTest(refused=str(path)):
+                self.assertIsNone(private.relative_parts(path, limit))
+        # pathlib folds U+212A KELVIN SIGN to "k" on Windows; the file system keeps the two names apart.
+        anchor = Path("C:\\fictional") if os.name == "nt" else Path("/fictional")
+        self.assertIsNone(private.relative_parts(anchor / "wor\u212a" / "run", anchor / "work"))
+        if os.name == "nt":
+            self.assertEqual(private.relative_parts(Path("C:\\FICTIONAL\\WORK\\run"), anchor / "work"), ("run",))
+
+    @unittest.skipUnless(os.name == "nt", "only on windows: the Windows name rule applies to Windows paths only")
+    def test_private_paths_refuse_exactly_the_names_pc_paths_refuses(self):
+        # The path check runs before any file access, so these fictional paths are never opened.
+        refused = ("CON", "con.txt", "AUX .log", "NUL", "PRN", "CONIN$", "conout$.log", "COM1", "lpt9.dat", "COM\u00b9", "LPT\u00b2",
+                   "com\u00b3.txt", "name.", "name ", "a:b", "a*b", "a?b", 'a"b', "a<b", "a|b", "tab\tname", "del\x7fname",
+                   "\u00e9" * 128)
+        accepted = ("CONIN", "COM10", "LPT", "console", "com\u2074", "nul-file", "aux2", "conout", "fictional.txt")
+        base = "C:\\fictional\\"
+        for name in refused:
+            with self.subTest(refused=repr(name)):
+                self.assertFalse(pc_paths.portable(name))
+                with self.assertRaises(private.PrivateWorkspaceError) as caught:
+                    private._absolute(base + name)
+                self.assertTrue(caught.exception.code == "private-path-invalid")
+        for name in ("CON", "CONIN$", "CONOUT$", "COM\u00b9", "LPT\u00b3"):
+            with self.subTest(reserved=repr(name)), self.assertRaises(pc_paths.PathRefusal) as caught:
+                pc_paths.relative(name)
+            self.assertTrue(caught.exception.code == "reserved-path-component")
+        for name in accepted:
+            with self.subTest(accepted=name):
+                self.assertTrue(pc_paths.portable(name))
+                self.assertTrue(private._absolute(base + name) == Path(base + name))
 
 
 @unittest.skipUnless(os.name == "posix", "only on posix: private mode and owner fixtures")

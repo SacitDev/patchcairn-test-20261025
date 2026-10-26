@@ -55,11 +55,11 @@ SCHEMAS = frozenset({
     "patchcairn.quarantine.reservation", "patchcairn.recovery.binding", "patchcairn.recovery.retention",
     "patchcairn.restart.pending", "patchcairn.restart.verification", "patchcairn.service", "patchcairn.storage",
     "patchcairn.storage.adapter", "patchcairn.windows.boot.observation",
-    "patchcairn.package", "patchcairn.schedule", "patchcairn.report",
+    "patchcairn.package", "patchcairn.schedule", "patchcairn.report", "patchcairn.review",
 })
 # Names whose family is not written yet. They may not have a reader; each leaves this set when its
 # family's reader is registered, and the set is empty in a finished release.
-PLANNED_SCHEMAS = frozenset({"patchcairn.package", "patchcairn.schedule"})
+PLANNED_SCHEMAS = frozenset({"patchcairn.package", "patchcairn.schedule", "patchcairn.review"})
 CONTAINERS = frozenset({
     "engine_marker", "session_state", "session_creation", "response_envelope",
     "workflows_template", "tool_catalog", "toolkit_marker",

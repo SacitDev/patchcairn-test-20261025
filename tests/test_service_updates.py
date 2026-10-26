@@ -73,6 +73,16 @@ class ReviewedExternalHandoffOrderTests(ServiceFixtures):
 
 
 class WorkflowServiceTests(SessionFixtures):
+    def test_begin_step_writes_no_boundary(self):
+        # The reviewed handoff is the shared begin step alone: its handoff record is written, the operation stays open for
+        # the actual callback, and no effect boundary is ever written for it.
+        sid, action, plan = self.external()
+        handoff = self.execute(action, self.approve(action, sid=sid), sid=sid)
+        inspected = self.service.inspect_operation(sid, operation_id=handoff["operation_id"])
+        self.assertIs(inspected["effect_boundary_entered"], False)
+        self.assertEqual(inspected["handoff"]["kind"], "reviewed_external_handoff")
+        self.assertIsNone(inspected["operation"]["outcome"])
+
     def test_external_receipt_before_the_start_is_a_clock_step_or_stale(self):
         # D-056: ordering keeps no tolerance; a gap within pc_records' future-skew bound is reported as a clock step.
         sid, action, plan = self.external()
