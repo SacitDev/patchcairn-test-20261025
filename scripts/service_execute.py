@@ -27,7 +27,7 @@ from storage_policy import MAX_FILE_BYTES
 from scoped_fs import ScopedFSError
 from diagnostic_core import DiagnosticRefusal
 from private_workspace import ensure_private_directory, relative_parts
-from service_state import DEFAULT_ROOT, ServiceRefusal, apart, decoded, private_read, read_service, service_value, within, without_version
+from service_state import DEFAULT_ROOT, ServiceRefusal, apart, decoded, private_read, read_service, service_value, within
 from service_backup import verify_storage_artifact
 from service_diagnostics import DiagnosticStore
 
@@ -124,7 +124,8 @@ class ExecuteMixin:
                 raise ServiceRefusal("Missing service marker in nonempty storage; no recreation")
             self._immutable(marker, expected)
             self._immutable(self.work / "retention.json", service_value("retention_registry", entries=[]))
-        if without_version(older_folder(work_relative, lambda: read_service(decoded(private_read(marker))))) != without_version(expected):
+        # read_service refuses a schema_version that is not the integer 1 (True and 1.0 too), so == is exact here.
+        if older_folder(work_relative, lambda: read_service(decoded(private_read(marker)))) != expected:
             raise ServiceRefusal("Foreign service/engine binding")
         self.diagnostics = DiagnosticStore(self.root, work_relative=work_relative + "/diagnostics")
         self._retention()

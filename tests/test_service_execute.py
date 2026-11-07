@@ -597,6 +597,30 @@ class ServicePrivacyTests(ServiceFixtures):
         self.assertEqual((old.work / "service.json").read_bytes(), old_marker)
         self.assertNotEqual(current.work, old.work)
 
+    def test_a_marker_without_the_integer_schema_version_or_with_another_binding_is_refused(self):
+        root = self.fixture_root()
+        try:
+            marker = WorkflowService(self.fake_engine(root)).work / "service.json"
+        except PrivateWorkspaceError as exc:
+            if os.name == "posix" and exc.code in PRIVATE_CAPABILITY_HOLDS:
+                self.skipTest("only on posix: private namespace unavailable; native refusal covered separately")
+            raise
+        good = json.loads(marker.read_bytes())
+        WorkflowService(self.fake_engine(root))  # the marker as written is admitted again
+        # True == 1 and 1.0 == 1 in Python, so these must be refused by the schema check, not by the comparison.
+        cases = {"no schema_version": ({key: value for key, value in good.items() if key != "schema_version"}, "schema-version"),
+                 "true": ({**good, "schema_version": True}, "schema-version"), "1.0": ({**good, "schema_version": 1.0}, "schema-version"),
+                 "text": ({**good, "schema_version": "1"}, "schema-version"), "a later version": ({**good, "schema_version": 2}, "schema-version"),
+                 "another schema": ({**good, "schema": "patchcairn.storage"}, "schema-name"),
+                 "another kind": ({**good, "kind": "retention_registry"}, "service-refusal"),
+                 "another engine": ({**good, "engine_id": "fictional-other-engine"}, "service-refusal")}
+        for name, (value, code) in cases.items():
+            with self.subTest(name):
+                marker.write_bytes(json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+                with self.assertRaises(ServiceRefusal) as caught:
+                    WorkflowService(self.fake_engine(root))
+                self.assertEqual(caught.exception.code, code)
+
     def test_read_only_cli_defaults_and_explicit_paths_bind_selected_namespaces(self):
         import patchcairn_service as cli
         for options, session_work, service_work in (

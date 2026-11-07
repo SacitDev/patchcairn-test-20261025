@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
-import io
 import os
 import re
 import stat
@@ -28,10 +27,9 @@ import win32_files
 from storage_policy import (StorageRefusal, about_size, admitted_destination, archive_bound, attempt_record, bound_plan,
                             canonical, checked_absolute, content_permission, new_plan, selection, shown_path, storage_value,
                             synced_folder, within)
-from storage_verify import READ_BACK_NOTE, ManifestLines, plan_row, verify_archive
+from storage_verify import FOLDER, READ_BACK_NOTE, ManifestLines, plan_row, verify_archive
 
 LABEL = re.compile(r"[a-z0-9-]{1,32}\Z")
-FOLDER = re.compile(r"[0-9]{8}T[0-9]{6}Z-[a-z0-9-]{1,32}\Z")
 ARCHIVE, MANIFEST, README = "backup.zip", "manifest.json", "README.txt"
 # Plain reasons for entries an assessment lists as not included (scoped_base.EXCLUDED_REASONS).
 NOT_INCLUDED = {"link": "a link; not included", "special": "a special file; not included",
@@ -47,8 +45,6 @@ _FOLDER_NOT_BACKED_UP = "directory metadata and empty-directory preservation are
 _FIXED_REASONS = frozenset({*NOT_INCLUDED.values(), _NOT_SELECTED, _FOLDER_NOT_BACKED_UP})
 # A source that fails one of these while it is read changed during the backup: recorded as changed, never as backed up.
 CHANGED_CODES = frozenset({"stale-identity", "stale-content", "read-drift", "read-growth", "missing-entry", "expected-record"})
-# Fields a manifest entry adds to the plan's row.
-MANIFEST_FIELDS = frozenset({"crc32", "read_only", "dacl_protected", "changed", "archived", "archived_size", "archived_sha256"})
 _RECEIPT_BYTES_AT_MOST = 16_384
 # One record per temporary file of a backup, named by its key in the attempt record.
 _PARTIAL_KEYS = frozenset({"archive", "manifest", "readme"})

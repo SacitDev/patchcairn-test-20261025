@@ -7,7 +7,6 @@ import json
 import os
 from pathlib import Path
 import re
-import shutil
 import sys
 import unittest
 from unittest import mock
@@ -23,11 +22,7 @@ from workflow_service import DiagnosticStore
 import pc_records
 from clock_helpers import start_forward_only_clock, utc_now
 from private_workspace import PrivateWorkspaceError, ensure_private_directory, ensure_private_file, write_private_new
-
-PRIVATE_CAPABILITY_HOLDS = frozenset({
-    "private-owner-or-mode-refused", "private-darwin-acl-capability-unavailable", "private-platform-unavailable",
-    "private-linux-foreign-filesystem", "private-linux-abi-unavailable", "private-linux-libc-unavailable", "private-linux-descriptor-unavailable",
-})
+from work_fixtures import PRIVATE_CAPABILITY_HOLDS, private_hold, remove_tree
 
 
 def remove_link(path):
@@ -39,18 +34,7 @@ def remove_link(path):
 class DiagnosticCoreTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        # Capability probe only; a missing capability skips each test with a tagged reason.
-        cls.private_hold = None
-        if os.name == "posix":
-            probe = ROOT / "work" / ("dc-probe-" + uuid.uuid4().hex)
-            try:
-                ensure_private_directory(probe, create=True, parents=True)
-            except PrivateWorkspaceError as exc:
-                if exc.code not in PRIVATE_CAPABILITY_HOLDS:
-                    raise
-                cls.private_hold = exc.code
-            finally:
-                shutil.rmtree(probe, ignore_errors=True)
+        cls.private_hold = private_hold()  # a missing capability skips each test with a tagged reason
 
     def setUp(self):
         if self.private_hold:
@@ -58,7 +42,7 @@ class DiagnosticCoreTests(unittest.TestCase):
         start_forward_only_clock(self)
         self.root = ROOT / "work" / ("dc-" + uuid.uuid4().hex)
         self.root.mkdir(parents=True)
-        self.addCleanup(shutil.rmtree, self.root)
+        self.addCleanup(remove_tree, self.root)
         self.store = DiagnosticStore(self.root)
         self.receipt = self.store.create_request(platform="macos", recipe_id="macos.os_version",
                     symptom="Fictional application could not start.", scope=["os_metadata"])
@@ -300,7 +284,7 @@ class DiagnosticPrivacyTests(unittest.TestCase):
     def fixture_root(self):
         root = ROOT / "work" / ("dp-" + uuid.uuid4().hex[:16])
         root.mkdir(parents=True)
-        self.addCleanup(shutil.rmtree, root)
+        self.addCleanup(remove_tree, root)
         return root
 
     def test_namespace_refusal_precedes_private_record_writer(self):

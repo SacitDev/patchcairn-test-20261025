@@ -24,16 +24,10 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import pc_paths
 import private_workspace as private
 import win32_files
+from work_fixtures import remove_tree
 
 FIXTURES = ROOT / "work" / "test-fixtures"
 NAME_RULE_MESSAGE = '" is one PatchCairn does not accept (a reserved Windows name, too long, or an unsupported character)'
-
-
-def remove_fixture(path):
-    def writable_then_retry(function, name, _error):
-        os.chmod(name, stat.S_IWRITE)
-        function(name)
-    shutil.rmtree(path, onexc=writable_then_retry)
 
 
 @unittest.skipUnless(os.name == "nt", "only on windows: native owner and DACL fixtures")
@@ -41,7 +35,7 @@ class WindowsPrivateWorkspaceTests(unittest.TestCase):
     def setUp(self):
         self.base = FIXTURES / ("private-" + uuid.uuid4().hex)
         private.ensure_private_directory(self.base, create=True, parents=True)
-        self.addCleanup(remove_fixture, self.base)
+        self.addCleanup(remove_tree, self.base)
 
     def node_with_descriptor(self, name, descriptor_suffix, *, directory=True):
         """Creation-time ACL fixture only. Never change an existing object's ACL."""
@@ -507,7 +501,7 @@ class PublishTests(unittest.TestCase):
             if os.name == "posix":
                 self.skipTest("only on posix: actual workspace POSIX private-storage capability unavailable: " + error.code)
             raise
-        self.addCleanup(remove_fixture, self.folder)
+        self.addCleanup(remove_tree, self.folder)
         self.path = self.folder / "record.json"
 
     def temporary(self):

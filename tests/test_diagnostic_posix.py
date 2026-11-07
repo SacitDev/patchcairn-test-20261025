@@ -6,9 +6,7 @@ branches run on every OS. Fixture folders live under work/ and are removed.
 """
 from __future__ import annotations
 import json
-import os
 from pathlib import Path
-import shutil
 import sys
 from types import SimpleNamespace
 import unittest
@@ -20,16 +18,11 @@ ROOT = Path(__file__).absolute().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 from diagnostic_core import HELD, DiagnosticRefusal
 from workflow_service import DiagnosticStore
-from private_workspace import PrivateWorkspaceError, ensure_private_directory
 import diagnostic_posix as adapter
 from pc_records import Refusal
 import readonly_runner
 from test_readonly_runner import FakeProbe, regular
-
-PRIVATE_CAPABILITY_HOLDS = frozenset({
-    "private-owner-or-mode-refused", "private-darwin-acl-capability-unavailable", "private-platform-unavailable",
-    "private-linux-foreign-filesystem", "private-linux-abi-unavailable", "private-linux-libc-unavailable", "private-linux-descriptor-unavailable",
-})
+from work_fixtures import private_hold, remove_tree
 
 
 class FakeStart:
@@ -48,25 +41,14 @@ class FakeStart:
 class PosixDiagnosticTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        # Capability probe only; a missing capability skips each test with a tagged reason.
-        cls.private_hold = None
-        if os.name == "posix":
-            probe = ROOT / "work" / ("dx-probe-" + uuid.uuid4().hex)
-            try:
-                ensure_private_directory(probe, create=True, parents=True)
-            except PrivateWorkspaceError as exc:
-                if exc.code not in PRIVATE_CAPABILITY_HOLDS:
-                    raise
-                cls.private_hold = exc.code
-            finally:
-                shutil.rmtree(probe, ignore_errors=True)
+        cls.private_hold = private_hold()  # a missing capability skips each test with a tagged reason
 
     def setUp(self):
         if self.private_hold:
             self.skipTest("only on posix: the selected filesystem cannot enforce a new private diagnostic namespace: " + self.private_hold)
         self.root = ROOT / "work" / ("dx-" + uuid.uuid4().hex)
         self.root.mkdir(parents=True)
-        self.addCleanup(shutil.rmtree, self.root)
+        self.addCleanup(remove_tree, self.root)
         self.store = DiagnosticStore(self.root)
 
     def request(self, recipe="macos.os_version", scope=None):

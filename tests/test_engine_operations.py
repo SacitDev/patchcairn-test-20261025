@@ -29,6 +29,7 @@ from workflow_core import WorkflowEngine, WorkflowRefusal, digest, encoded
 from workflow_service import WorkflowService
 from test_engine_journal import WORK, WorkflowFixture
 from test_engine_plans import RuleHelpers, TypedReplyHelpers, typed_review
+from work_fixtures import remove_tree
 
 
 class AcknowledgmentTests(TypedReplyHelpers, WorkflowFixture):
@@ -711,6 +712,7 @@ class ServiceBoundaryTests(PackagePlanHelpers, WorkflowFixture):
         super().setUp()
         self.root = WORK / ("sb-" + uuid.uuid4().hex[:8])  # the service's records sit deep below it, within the path limit
         self.root.mkdir()
+        self.addCleanup(remove_tree, self.root)
         self.engine = WorkflowEngine(self.root, work_relative="work/boundary")
         self.service = WorkflowService(self.engine, elevation_probe=lambda: False)
         self.sid = self.engine.create_session(scope=self.scope, checkpoints=["before_action"])["session_id"]

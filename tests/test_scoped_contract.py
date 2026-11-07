@@ -33,6 +33,7 @@ import pc_paths  # noqa: E402
 import pc_records  # noqa: E402
 import scoped_base  # noqa: E402
 from scoped_base import CHUNK_BYTES, RECORD_KEYS, ScopedFSError  # noqa: E402
+from work_fixtures import remove_tree  # noqa: E402
 
 PATH_CODES = {"invalid-relative-path", "path-too-long", "invalid-path-component", "reserved-path-component"}
 
@@ -1273,14 +1274,6 @@ class SharedMethodTests(unittest.TestCase):
 FIXTURES = ROOT / "work" / "test-fixtures"
 
 
-def remove_fixture(path):
-    """Remove a fixture folder, including names only the extended path form reaches and read-only files."""
-    def writable_then_retry(function, name, _error):
-        os.chmod(name, stat.S_IWRITE)
-        function(name)
-    shutil.rmtree("\\\\?\\" + str(path), onexc=writable_then_retry)
-
-
 @unittest.skipUnless(os.name == "nt", "only on windows: WindowsRoot runs on Win32 file handles")
 class WindowsRootContractTests(RootContract, unittest.TestCase):
     """The contract against the Windows backend, on real NTFS folders under work/test-fixtures/.
@@ -1299,7 +1292,7 @@ class WindowsRootContractTests(RootContract, unittest.TestCase):
         self.case = FIXTURES / ("contract-" + uuid.uuid4().hex)
         (self.case / "root").mkdir(parents=True)
         (self.case / "outside").mkdir()
-        self.addCleanup(remove_fixture, self.case)
+        self.addCleanup(remove_tree, self.case)
         return windows_scoped.WindowsRoot(str(self.case / "root"))
 
     def path(self, relative):

@@ -18,6 +18,7 @@ ROOT = Path(__file__).absolute().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 from scoped_fs import ScopedFSError
 from private_workspace import PrivateWorkspaceError, ensure_private_directory, write_private_new
+from work_fixtures import remove_tree
 import storage_contract
 import storage_policy
 from storage_ops import StorageRefusal, StorageService, canonical, plan_sha256, storage_capabilities
@@ -32,15 +33,20 @@ import win32_files
 FIXTURES = ROOT / "work" / "test-fixtures" / "storage"
 
 
-def fixture_directory():
+def fixture_directory(test):
+    """A new private folder below work/test-fixtures/storage, removed when ``test`` ends."""
     FIXTURES.mkdir(parents=True, exist_ok=True)
     path = FIXTURES / ("private-" + uuid.uuid4().hex)
     try:
-        return ensure_private_directory(path, create=True, boundary=ROOT / "work")
+        directory = ensure_private_directory(path, create=True, boundary=ROOT / "work")
     except PrivateWorkspaceError as exc:
+        if os.path.lexists(path):
+            remove_tree(path)
         if os.name != "posix":
             raise
         raise unittest.SkipTest("only on posix: the actual filesystem cannot establish the required private namespace: " + exc.code) from exc
+    test.addCleanup(remove_tree, path)
+    return directory
 
 
 def make_directory_link(link, target):
@@ -104,7 +110,7 @@ class NativeStorageFixture:
     test_storage_* module defines NativeStorageTests(NativeStorageFixture, unittest.TestCase)."""
 
     def setUp(self):
-        self.base = fixture_directory()
+        self.base = fixture_directory(self)
         self.source = self.base / "source"
         self.output = self.base / "output"
         private_child(self.base, "source")
@@ -137,6 +143,7 @@ class StoragePrivacyAdmissionTests(unittest.TestCase):
         FIXTURES.mkdir(parents=True, exist_ok=True)
         base = FIXTURES / ("unsafe-admission-" + uuid.uuid4().hex)
         os.mkdir(base)
+        self.addCleanup(remove_tree, base)
         output = base / "output"
         os.mkdir(output)
         if os.name == "posix":
@@ -162,14 +169,16 @@ class StoragePrivacyAdmissionTests(unittest.TestCase):
             with self.assertRaisesRegex(StorageRefusal, "cannot use its work folder here"):
                 StorageService(output_root=output, quiet_workspace=True)
             if output.exists():
+                self.addCleanup(remove_tree, output)
                 self.assertEqual(list(output.iterdir()), [])
         else:
+            self.addCleanup(remove_tree, output)
             service = StorageService(output_root=output, quiet_workspace=True)
             self.assertEqual(service.output_root, output)
             ensure_private_directory(output)
 
     def test_output_privacy_is_rechecked_before_source_admission(self):
-        base = fixture_directory()
+        base = fixture_directory(self)
         output = private_child(base, "output")
         service = StorageService(output_root=output, quiet_workspace=True)
         with mock.patch("storage_policy.ensure_private_directory", side_effect=PrivateWorkspaceError("private-owner-or-mode-refused")):
@@ -222,7 +231,7 @@ class PureStorageTests(unittest.TestCase):
             StorageService(output_root=ROOT / "work", quiet_workspace=True)
 
     def test_read_permission_and_mutation_cli_are_not_inferred(self):
-        base = fixture_directory()
+        base = fixture_directory(self)
         output = base / "output"
         private_child(base, "output")
         service = StorageService(output_root=output, quiet_workspace=True)
@@ -232,7 +241,7 @@ class PureStorageTests(unittest.TestCase):
         self.assertTrue(storage_capabilities()["requires_workflow_engine_gate"])
 
     def test_plan_hash_does_not_authenticate_owner(self):
-        base = fixture_directory()
+        base = fixture_directory(self)
         output = base / "output"
         private_child(base, "output")
         service = StorageService(output_root=output, quiet_workspace=True)
@@ -549,7 +558,7 @@ class JunkRootPolicyTests(unittest.TestCase):
     plan; a selected root never gets it; every other protected rule stays."""
 
     def service(self):
-        base = fixture_directory()
+        base = fixture_directory(self)
         return StorageService(output_root=private_child(base, "output"), quiet_workspace=True)
 
     def test_file_under_user_temp_admitted(self):
@@ -675,7 +684,7 @@ class ContainmentTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "containment-undecidable")
 
     def test_equal_paths_overlap_and_protected_look_alike(self):
-        base = fixture_directory()
+        base = fixture_directory(self)
         source = private_child(base, "source")
         output = private_child(base, "output")
         with self.assertRaisesRegex(StorageRefusal, "Overlapping"):  # equal paths overlap
@@ -686,7 +695,7 @@ class ContainmentTests(unittest.TestCase):
         self.assertFalse(service._protected_entry(base, "sour\u212ae/x.txt"))  # a look-alike is another folder
 
     def test_protected_entry_rules_out_only_what_no_entry_can_reach(self):
-        base = fixture_directory()
+        base = fixture_directory(self)
         source, output, apart = private_child(base, "source"), private_child(base, "output"), private_child(base, "apart")
         kept = private_child(source, "kept")
         inner, elsewhere = private_child(kept, "inner"), private_child(base, "elsewhere")

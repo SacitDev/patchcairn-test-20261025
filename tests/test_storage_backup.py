@@ -590,6 +590,25 @@ class SettlementTests(BackupFixture, unittest.TestCase):
         self.assertEqual(caught.exception.code, "private-owner-or-mode-refused")
         self.assertTrue(partial.is_file())
 
+    def test_a_folder_name_not_from_backup_names_is_refused_before_anything_is_written(self):
+        plan = self.plan()
+        names, before = self.service.backup_names(plan=plan), sorted(os.listdir(self.output))
+        for folder in ("fictional-backup", "../" + names["folder"], names["folder"][:-len("backup")] + "Fictional-backup"):
+            with self.subTest(folder=folder), self.assertRaisesRegex(StorageRefusal, "backup_names"):
+                self.service.create_backup(plan=plan, expected_plan_sha256=plan_sha256(plan), names={**names, "folder": folder})
+        self.assertEqual(sorted(os.listdir(self.output)), before)
+
+    def test_an_attempt_record_naming_another_folder_is_refused_and_its_partial_stays(self):
+        plan, attempt, partial = self.interrupted()
+        record = self.output / f"attempt-backup-{plan_sha256(plan)}.json"
+        for folder in ("fictional-backup", "../" + attempt["folder"], attempt["folder"] + "/r001", 42):
+            with self.subTest(folder=folder):
+                record.unlink()
+                write_private_new(record, canonical({**attempt, "folder": folder}))
+                with self.assertRaisesRegex(StorageRefusal, "not this plan's"):
+                    self.settle(plan)
+        self.assertTrue(partial.is_file())
+
     def test_a_refused_receipt_is_not_read(self):
         plan = self.plan()
         receipt = self.create(plan)

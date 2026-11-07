@@ -563,8 +563,9 @@ def record_review(engine, session_id, *, plan_sha256, reviewer_id, role, verdict
         if reviewer_id == state["owner_id"] or any(row["reviewer_id"] == reviewer_id or row["role"] == role for row in state["reviews"]):
             raise WorkflowRefusal("The two assistant review passes need different reviewers and roles, separate from the owner")
         expected = {"plan_sha256": plan_sha256, "role": role, "verdict": verdict, "reviewer_id": reviewer_id}
+        reviews = (read_review(_evidence_value(engine, state, row)) for row in rows)  # each row read and checked once, after the reuse check below
         if (set(evidence_ids) & {evidence_id for row in state["reviews"] for evidence_id in row["evidence_ids"]}
-                or any({key: read_review(_evidence_value(engine, state, row))[key] for key in expected} != expected for row in rows)):
+                or any({key: review[key] for key in expected} != expected for review in reviews)):
             raise WorkflowRefusal("Each assistant review pass needs its own typed review evidence for this exact plan, role, verdict and reviewer",
                                   code="review-evidence")
         record = {"reviewer_id": reviewer_id, "role": role, "verdict": verdict, "evidence_ids": list(evidence_ids), "notes": notes, "plan_sha256": plan_sha256,

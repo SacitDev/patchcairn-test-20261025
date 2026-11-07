@@ -33,6 +33,7 @@ import engine_plans
 from workflow_core import JOBS, WorkflowEngine, WorkflowRefusal, PrivacyCapabilityHold, digest, encoded
 import pc_records
 from clock_helpers import start_forward_only_clock
+from work_fixtures import remove_tree
 
 WORK = ROOT / "work" / "wf"
 
@@ -61,6 +62,7 @@ class PosixPrivacyTests(unittest.TestCase):
         start_forward_only_clock(self)
         self.root = WORK / ("privacy-" + uuid.uuid4().hex)
         self.root.mkdir(parents=True)
+        self.addCleanup(remove_tree, self.root)
 
     def capable(self):
         supported, reason = posix_private_storage_capability(self.root)
@@ -245,6 +247,7 @@ class WorkflowFixture(unittest.TestCase):
         start_forward_only_clock(self)
         self.root = WORK / ("fictional-" + uuid.uuid4().hex)
         self.root.mkdir(parents=True)
+        self.addCleanup(remove_tree, self.root)
         self.verified, self.artifact_refusal = [], None
         try:
             self.engine = WorkflowEngine(self.root, verify_artifact=self.verify_artifact)

@@ -36,6 +36,7 @@ from test_engine_journal import WorkflowFixture
 from test_engine_updates import variants
 from test_packages import FakeLauncher, RunProbe, fake_route, registered
 from test_service_state import PROSE, SessionFixtures
+from work_fixtures import remove_tree
 
 
 def typed_review(test, reviewer_id, role, *, verdict="approved", plan_sha256=None, **changes):
@@ -168,6 +169,7 @@ class AssessmentAccessTests(unittest.TestCase):
             # No session folder exists, so the engine-wide message check reads an empty registry.
             work = ROOT / "work" / "test-fixtures" / ("fictional-" + uuid.uuid4().hex)
             work.mkdir(parents=True)
+            self.addCleanup(remove_tree, work)
             engine.journal = SimpleNamespace(registry_lock=contextlib.nullcontext, work=work)
             engine._change = lambda session, event, mutate, revision: mutate(state)
             engine.evidence_rows = lambda state, ids, **unused: [{"kind": "scope_confirmation", "facts": {"scope_confirmed": True}}]
@@ -1320,6 +1322,17 @@ class PlanRecordTests(RuleHelpers, WorkflowFixture):
         with self.assertRaises(WorkflowRefusal):
             self.approve_ids(["fictional-action"])
         self.assertIsNone(self.state()["approval"])
+
+    def test_each_review_evidence_row_is_read_and_checked_once(self):
+        self.plan_ready()
+        self.register(dict(self.plan, plan_id="fictional-read-once"), reviewed=False)
+        evidence_ids = [typed_review(self, "once-a", "compatibility_data") for _ in range(2)]
+        with mock.patch.object(engine_plans, "_evidence_value", wraps=engine_plans._evidence_value) as reads, \
+                mock.patch.object(engine_plans, "read_review", wraps=engine_plans.read_review) as checks:
+            self.engine.record_review(self.sid, plan_sha256=self.plan_hash, reviewer_id="once-a", role="compatibility_data", verdict="approved",
+                                      evidence_ids=evidence_ids, notes="Fictional review pass")
+        self.assertEqual((reads.call_count, checks.call_count), (2, 2))
+        self.assertEqual(self.state()["reviews"][0]["evidence_ids"], evidence_ids)
 
     def test_partial_or_same_disk_backup_never_called_safe(self):
         plan_sha256 = self.backed_up()

@@ -18,6 +18,7 @@ from private_workspace import PrivateWorkspaceError, ensure_private_directory, e
 from storage_ops import StorageRefusal, plan_sha256
 import storage_cleanup
 from storage_cleanup import release_set
+from work_fixtures import remove_tree
 
 
 class NativeStorageTests(NativeStorageFixture, unittest.TestCase):
@@ -25,6 +26,7 @@ class NativeStorageTests(NativeStorageFixture, unittest.TestCase):
     def test_windows_broad_quarantine_source_holds_without_acl_change(self):
         source = FIXTURES / ("ordinary-public-source-" + uuid.uuid4().hex)
         os.mkdir(source)  # Inherits the fixture folder's ordinary DACL; no ACL is changed.
+        self.addCleanup(remove_tree, source)
         target = source / "public-fixture.txt"
         create_file_everyone_may_read(target, b"fictional public source")
         with self.assertRaises(PrivateWorkspaceError) as caught:
@@ -138,7 +140,7 @@ class ReleaseSetTests(unittest.TestCase):
     """release_set, the one deletion path of kept backups and recovery files; fictional files below work/ only."""
 
     def setUp(self):
-        self.base = fixture_directory()
+        self.base = fixture_directory(self)
         self.kept, self.control = self.base / "kept", self.base / "control"
         private_child(self.base, "kept")
         private_child(self.base, "control")

@@ -83,12 +83,6 @@ def service_value(kind, **fields):
     return {"schema": SERVICE_RECORD, "schema_version": pc_records.SCHEMA_VERSION, "kind": kind, **fields}
 
 
-def without_version(record):
-    rest = dict(record)
-    rest.pop("schema_version", None)
-    return rest
-
-
 def native_platform():
     return "windows" if sys.platform == "win32" else "macos" if sys.platform == "darwin" else "linux" if sys.platform.startswith("linux") else "unknown"
 

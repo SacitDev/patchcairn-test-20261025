@@ -33,6 +33,7 @@ SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 import scoped_base  # noqa: E402
 from scoped_base import CHUNK_BYTES, CapabilityHold, ScopedFSError  # noqa: E402
+from work_fixtures import remove_tree  # noqa: E402
 
 if os.name == "nt":
     import msvcrt  # noqa: E402
@@ -52,14 +53,6 @@ def without_durable(record):
     return {key: value for key, value in record.items() if key != "durable"}
 
 
-def remove_fixture(path):
-    """Remove a fixture folder, including read-only files and names only the extended path form reaches."""
-    def writable_then_retry(function, name, _error):
-        os.chmod(name, stat.S_IWRITE)
-        function(name)
-    shutil.rmtree("\\\\?\\" + str(path), onexc=writable_then_retry)
-
-
 def volumes(filesystem, drive_type, removable="by drive type"):
     """A fake volume-information source: the real folder appears to be on another kind of drive (by default a fixed
     drive is proven built in and any other is removable; None is "Windows cannot tell")."""
@@ -72,7 +65,7 @@ class Fixture(unittest.TestCase):
         self.case = FIXTURES / ("io-" + uuid.uuid4().hex)
         (self.case / "root").mkdir(parents=True)
         (self.case / "outside").mkdir()
-        self.addCleanup(remove_fixture, self.case)
+        self.addCleanup(remove_tree, self.case)
 
     def path(self, relative=""):
         return self.case / "root" / relative if relative else self.case / "root"

@@ -671,7 +671,8 @@ class DestinationAdmissionTests(SessionFixtures):
         result = self.execute(action, self.approve(action))
         binding = {"kind": "backup_recovery", "output_root": str(self.output), "backup_receipt": result["receipt"]["native_receipt"],
                    "restore_receipt": result["receipt"]["restore_probe_receipt"], "purge_receipt": None}
-        root_class = type(scoped_fs.open_root(str(self.output)))
+        with scoped_fs.open_root(str(self.output)) as root:  # closed at once: an open root keeps its folder in use
+            root_class = type(root)
         real, modes = root_class.open_read, []
 
         def spy(root, relative, **options):

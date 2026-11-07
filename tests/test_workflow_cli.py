@@ -24,6 +24,7 @@ import patchcairn_service as service_cli
 from workflow_service import ServiceRefusal
 from test_packages import FakeChild, FakeTerminal, fake_route, remove_fixture_roots
 from test_service_updates import harness
+from work_fixtures import remove_tree
 
 
 def older_folder_message(folder):
@@ -119,6 +120,8 @@ class WorkflowCliTests(unittest.TestCase):
                 WorkflowEngine(probe)
             except PrivacyCapabilityHold as error:
                 cls.storage_available, cls.storage_reason = False, str(error)
+            finally:
+                remove_tree(probe)
 
     def requires_storage(self):
         if not self.storage_available:
@@ -127,6 +130,7 @@ class WorkflowCliTests(unittest.TestCase):
     def setUp(self):
         self.root = WORK / ("fictional-cli-" + uuid.uuid4().hex)
         (self.root / "scripts").mkdir(parents=True)
+        self.addCleanup(remove_tree, self.root)
         # The CLI and the engine's import closure: its L0 records and paths, the restart signals of the package routes, the
         # pure storage-payload and diagnostic validators, and the private-workspace admission with its native helpers.
         names = ["workflow_core.py", "engine_journal.py", "engine_text.py", "engine_plans.py", "engine_operations.py", "engine_restart.py",
@@ -235,6 +239,7 @@ class WorkflowCliTests(unittest.TestCase):
         self.requires_storage()
         work = "work/cli-older-" + uuid.uuid4().hex[:12]
         engine = WorkflowEngine(work_relative=work)
+        self.addCleanup(remove_tree, engine.work)
         sid = engine.create_session(checkpoints=[])["session_id"]
         older = make_marker_older(engine.work / "engine.json")
         with contextlib.redirect_stderr(io.StringIO()) as error, contextlib.redirect_stdout(io.StringIO()) as output:

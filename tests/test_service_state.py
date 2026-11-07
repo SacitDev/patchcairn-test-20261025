@@ -26,6 +26,7 @@ from workflow_service import WorkflowService, ServiceRefusal, native_platform, v
 from storage_ops import StorageService
 from scoped_fs import ScopedFSError, ScopedRoot
 from private_workspace import PrivateWorkspaceError, ensure_private_directory, ensure_private_file, write_private_new
+from work_fixtures import remove_tree
 
 PRIVATE_CAPABILITY_HOLDS = frozenset({
     "private-owner-or-mode-refused", "private-darwin-acl-capability-unavailable", "private-platform-unavailable",
@@ -64,11 +65,13 @@ def capability_probe():
         except PrivacyCapabilityHold as exc:
             private_hold = str(exc)
             return native_move_supported, private_hold
+        finally:
+            remove_tree(probe)
         base = ROOT / "work" / ("sv-move-" + uuid.uuid4().hex)
         source, output = base / "source", base / "output"
         source.mkdir(parents=True); output.mkdir()
-        (source / "fictional.txt").write_bytes(b"Fictional native capability probe only")
         try:
+            (source / "fictional.txt").write_bytes(b"Fictional native capability probe only")
             with ScopedRoot(source, quiet_workspace=True) as src, ScopedRoot(output, quiet_workspace=True) as dst:
                 expected = src.inspect("fictional.txt", hash_file=True, max_bytes=1024)
                 src.move_to("fictional.txt", destination=dst, destination_relative="fictional.txt", expected=expected)
@@ -76,6 +79,8 @@ def capability_probe():
             if exc.code != "no-replace-unavailable":
                 raise
             native_move_supported = False
+        finally:
+            remove_tree(base)
     return native_move_supported, private_hold
 
 
@@ -131,6 +136,7 @@ class ServiceFixtures(unittest.TestCase):
     def fixture_root(self):
         root = ROOT / "work" / ("sv-private-" + uuid.uuid4().hex[:16])
         root.mkdir(parents=True)
+        self.addCleanup(remove_tree, root)
         return root
 
     @staticmethod
@@ -151,6 +157,7 @@ class SessionFixtures(ServiceFixtures):
         self.source = self.root / "work" / "selected"
         self.output = self.root / "work" / "artifacts"
         ensure_private_directory(self.source, create=True, parents=True)
+        self.addCleanup(remove_tree, self.root)
         ensure_private_directory(self.output, create=True)
         write_private_new(self.source / "example.txt", b"Fictional selected file; no host content.\n")
         start_forward_only_clock(self)

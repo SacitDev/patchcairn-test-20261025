@@ -27,6 +27,7 @@ import storage_contract
 import storage_ops
 import workflow_core
 import workflow_service
+from work_fixtures import remove_tree
 
 # Short fixture names keep the deepest record path within the Windows private-path cap from a long checkout path.
 WORK = ROOT / "work" / "test-fixtures"
@@ -58,9 +59,11 @@ def readers():
     return sorted((name, reader) for name, reader in pc_records.READERS.items())
 
 
-def fixture_root():
+def fixture_root(test):
+    """A new fixture folder below work/test-fixtures, removed when ``test`` ends."""
     root = WORK / ("ss-" + uuid.uuid4().hex[:16])
     root.mkdir(parents=True)
+    test.addCleanup(remove_tree, root)
     return root
 
 
@@ -105,7 +108,7 @@ class StrictSchemaTests(unittest.TestCase):
             with self.subTest(file=relative):
                 record = pc_records.decode_strict((ROOT / relative).read_bytes())
                 self.assertIs(pc_records.require_container(record, kind), record)
-        root = fixture_root()
+        root = fixture_root(self)
         marker = workflow_core.WorkflowEngine(root).work / "engine.json"
         original = pc_records.decode_strict(marker.read_bytes())
         for version in BAD_VERSIONS:
@@ -119,7 +122,7 @@ class StrictSchemaTests(unittest.TestCase):
                 self.refused(lambda: workflow_core.WorkflowEngine(root), "schema-version")
 
     def test_stored_session_state_and_creation_need_integer_version(self):
-        engine = workflow_core.WorkflowEngine(fixture_root())
+        engine = workflow_core.WorkflowEngine(fixture_root(self))
         sid = engine.create_session(checkpoints=[])["session_id"]
         for name in ("session.json", "creation.json"):
             path = engine.work / sid / name
@@ -180,7 +183,7 @@ class StrictSchemaTests(unittest.TestCase):
             with self.subTest(container=kind):
                 error = self.refused(lambda: pc_records.require_container({"schema_version": "1.0"}, kind), "older-format")
                 self.assertEqual(str(error), pc_records.OLDER_FORMAT_MESSAGE)
-        root = fixture_root()
+        root = fixture_root(self)
         marker = workflow_core.WorkflowEngine(root).work / "engine.json"
         older = dict(pc_records.decode_strict(marker.read_bytes()), schema_version=3, backend=versioned("patchcairn.workflow.python", 3))
         marker.write_bytes(pc_records.encoded(older))
@@ -243,7 +246,7 @@ class RecordLayoutTests(unittest.TestCase):
     "schema_version" is the integer 1 (containers carry only the integer), encoded by pc_records.encoded."""
 
     def engine(self):
-        root, ids, real = fixture_root(), iter([uuid.UUID(int=0x1111), uuid.UUID(int=0x2222)]), uuid.uuid4
+        root, ids, real = fixture_root(self), iter([uuid.UUID(int=0x1111), uuid.UUID(int=0x2222)]), uuid.uuid4
         with mock.patch("pc_records.utc_now", return_value=CLOCK), mock.patch("uuid.uuid4", side_effect=lambda: next(ids, None) or real()):
             engine = workflow_core.WorkflowEngine(root)
             session_id = engine.create_session(scope={"roots": ["fictional-root"], "purpose": "Fictional golden layout"}, checkpoints=[])["session_id"]
@@ -291,7 +294,7 @@ class RecordLayoutTests(unittest.TestCase):
                          b'{"entries":[],"kind":"retention_registry","schema":"patchcairn.service","schema_version":1}')
 
     def test_diagnostic_request_layout_has_no_trailing_newline(self):
-        store = workflow_service.DiagnosticStore(fixture_root(), work_relative="work/d")
+        store = workflow_service.DiagnosticStore(fixture_root(self), work_relative="work/d")
         with mock.patch("pc_records.utc_now", return_value=CLOCK), mock.patch("uuid.uuid4", return_value=uuid.UUID(int=0x3333)):
             receipt = store.create_request(platform="macos", recipe_id="macos.os_version", symptom="Fictional error E42", scope=["os_metadata"])
         data = (store.root / receipt["evidence"]["path"]).read_bytes()
