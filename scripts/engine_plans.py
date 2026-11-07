@@ -1,52 +1,51 @@
 """A session's creation and settings, scope, evidence, plans, reviews, owner approvals, standing policies, stages and pending
 decisions.
-Functions that need the engine take it as ``engine`` (workflow_core.WorkflowEngine), the context described there.
+Functions that need the engine take it as ``engine`` (workflow_core.WorkflowEngine), the context described there. The pure
+rules they apply are in engine_decisions; every public name of this module keeps its definition here.
 """
 from __future__ import annotations
 
 import copy
-from datetime import timedelta
-import math
 from pathlib import Path
 import re
 import uuid
 
 import diagnostic_core
-from engine_journal import (ASSESSMENT_ACCESS, ASSESSMENT_SUMMARY, ASSESSMENT_VERIFICATION, BACKEND, CREATION_KEYS, DIAGNOSTIC_ADAPTER, EVIDENCE_MAX_BYTES,
-                            EVIDENCE_MAX_NODES, FIXTURE_ADAPTER, OUTCOMES, SHA, STATE_KEYS, WorkflowRefusal, bounded_text, checked, container,
-                            decode_record, exact_fields, fresh, ids, invalidate, no_links, private_directory, private_file, record_identifier, require_writable,
+import engine_decisions
+from engine_decisions import (ATTESTATION, CONDITIONAL_FIELDS, POLICY_KINDS, REPLY_FIELDS, REVIEW, ROLES, VERDICTS, WARNING_FIELDS, approved_ids,
+                              remaining_actions, reply_matches, typed)
+import engine_journal
+from engine_journal import (ASSESSMENT_ACCESS, ASSESSMENT_SUMMARY, ASSESSMENT_VERIFICATION, BACKEND, CREATION_KEYS, DIAGNOSTIC_ADAPTER, FIXTURE_ADAPTER,
+                            OUTCOMES, RECOVERY_BINDING, SHA, STATE_KEYS, WorkflowRefusal, bounded_text, checked, container, decode_record, exact_fields,
+                            fresh, ids, invalidate, no_links, private_directory, private_file, record_identifier, require_writable, restart_state,
                             typed_record, utc_time, write_private_new)
-from engine_decisions import reply_matches
-from engine_text import CHECKPOINTS, JOBS, STAGE_LABELS, initial_menu, irreversible_phrase, response
+import engine_text
+from engine_text import CHECKPOINTS, JOBS, STAGE_LABELS, irreversible_phrase, response
 import pc_paths
 import pc_records
 from pc_records import SCHEMA_VERSION, TYPED_ACKNOWLEDGMENTS, digest, encoded
+import private_workspace
 import storage_contract
 
 
-KINDS = {"update", "cleanup_quarantine", "backup_create", "backup_restore", "repair", "permanent_purge", "restart", "firmware", "os_transition",
-         "security_policy", "assessment"}
-# Every action kind a registered adapter may carry (pc_records.ADAPTERS) is a plan kind.
-KINDS |= {kind for facts in pc_records.ADAPTERS.values() for kind in facts["kinds"]}
-# Only the action kinds of adapters that pc_records lets a standing policy cover.
-POLICY_KINDS = frozenset(kind for facts in pc_records.ADAPTERS.values() if facts["policy_coverable"] for kind in facts["kinds"])
-ROLES = {"compatibility_data", "evidence_security"}
+# Every action kind a registered adapter may carry (pc_records.ADAPTERS) is a plan kind, and there is no other.
+KINDS = {kind for facts in pc_records.ADAPTERS.values() for kind in facts["kinds"]}
 EVIDENCE_KINDS = {"scope_confirmation", "inventory", "research", "candidates", "symptom", "hypotheses", "recovery_plan", "precondition", "outcome",
-                  "reconciliation", "verification", "recovery", "protected_consent", "review", "fixture"}
+                  "reconciliation", "verification", "recovery", "review", "fixture"}
 EVIDENCE_KINDS |= {"adapter_payload", "recovery_manifest", "restore_verification", "retention", "recovery_archive"}
-MAX_FACT_ITEMS = pc_records.MAX_BACKUP_ENTRIES
 # Facts are copied into the journal state, so they stay small; large data belongs in the evidence content.
 FACTS_MAX_BYTES = 65_536
-# A session keeps the message ids of its typed replies, at most this many.
+# A session keeps the message ids of its owner decisions, at most this many.
 MAX_USED_MESSAGE_IDS = 1000
-WARNING_FIELDS = frozenset({"plan_sha256", "kind", "action_ids", "number", "bytes", "revision", "recorded_utc"})
-REPLY_FIELDS = frozenset({"type", "action_ids", "number", "bytes", "warning_revision"})
-CONDITIONAL_FIELDS = frozenset({"action_id", "payload_sha256", "decision", "names", "message_id", "recorded_utc"})
-
-
-def _facts(action):
-    """The pc_records facts of an action's adapter; an action whose OS-consent flag contradicts them is refused."""
-    return checked(pc_records.adapter_facts, action["adapter_id"], requires_os_consent=action["requires_os_consent"])
+OWNER_SOURCES = ("current_owner_chat", "current_owner_terminal")
+# The evidence kind and facts each assessment stage needs (advance_stage and complete_assessment).
+STAGE_REQUIREMENTS = {"scope": ("scope_confirmation", {"scope_confirmed"}), "inventory": ("inventory", {"complete"}),
+                      "research": ("research", {"applicability_checked", "official_sources_checked"}),
+                      "candidates": ("candidates", {"candidates_reviewed", "excluded_private"}), "symptom": ("symptom", {"symptom_recorded", "relevant_scope"}),
+                      "hypotheses": ("hypotheses", {"alternatives_considered", "distinguishing_checks"}),
+                      "recovery_plan": ("recovery_plan", {"contents_reviewed", "restore_check_planned", "exclusions_explicit"})}
+# The one reader of assistant review records (pc_records.READERS).
+read_review = pc_records.register_reader(REVIEW, engine_decisions.read_review)
 
 
 def acknowledgments(action):
@@ -54,34 +53,10 @@ def acknowledgments(action):
     return pc_records.ADAPTERS[action["adapter_id"]]["acknowledgments"]
 
 
-def _json_shape(value, depth=0):
-    if depth > 12:
-        raise WorkflowRefusal("Record nesting exceeds the bounded schema")
-    if value is None or isinstance(value, (str, bool)):
-        if isinstance(value, str) and len(value) > 8000:
-            raise WorkflowRefusal("Evidence text is too long")
-        return
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        if not math.isfinite(value):
-            raise WorkflowRefusal("Nonfinite evidence value")
-        return
-    if isinstance(value, list) and len(value) <= MAX_FACT_ITEMS:
-        for item in value:
-            _json_shape(item, depth + 1)
-        return
-    if isinstance(value, dict) and len(value) <= 100:
-        for key, item in value.items():
-            if not isinstance(key, str) or key.lower() in {"command", "commands", "execute", "eval", "approved", "authorization"}:
-                raise WorkflowRefusal("Executable or self-authorizing evidence fields are not accepted")
-            _json_shape(item, depth + 1)
-        return
-    raise WorkflowRefusal("Evidence must be bounded JSON data")
-
-
 def json_data(value):
     """Bounded JSON evidence data that the one encoder also accepts (no lone surrogates, integers within 20
     digits), checked before anything is written."""
-    _json_shape(value)
+    engine_decisions.json_shape(value)
     checked(pc_records.encoded, value)
 
 
@@ -94,7 +69,7 @@ def _collector_result(content):
     if b'"platform"' not in content or b'"observations"' not in content:
         return None
     try:
-        value = decode_record(content, max_bytes=EVIDENCE_MAX_BYTES, max_nodes=EVIDENCE_MAX_NODES)
+        value = decode_record(content, max_bytes=engine_journal.EVIDENCE_MAX_BYTES, max_nodes=engine_journal.EVIDENCE_MAX_NODES)
     except WorkflowRefusal:
         return None
     return value if isinstance(value, dict) and "platform" in value and "observations" in value else None
@@ -174,39 +149,37 @@ def _scope_selected(scope):
 
 
 def owner_record(state, owner_quote, owner_message_id, owner_id=None, source="current_owner_chat"):
-    if source not in {"current_owner_chat", "current_owner_terminal"} or (owner_id or state["owner_id"]) != state["owner_id"]:
-        raise WorkflowRefusal("Only the actual current owner instruction can authorize this decision")
-    bounded_text(owner_quote, "actual owner quote")
+    """An owner decision as the coordinator writes it from the owner's message, labelled coordinator-attested: the record
+    names the message and where it was given, and does not show who wrote that message."""
+    if source not in OWNER_SOURCES or (owner_id or state["owner_id"]) != state["owner_id"]:
+        raise WorkflowRefusal("Only the session owner's own instruction, given in this conversation or terminal, can authorize this decision")
+    bounded_text(owner_quote, "owner quote")
     record_identifier(owner_message_id, "owner message identifier")
     return {"owner_id": state["owner_id"], "quote": owner_quote, "message_id": owner_message_id, "source": source, "recorded_utc": pc_records.utc_now(),
-            "settings_revision": state["settings_revision"]}
+            "settings_revision": state["settings_revision"], "attestation": ATTESTATION}
 
 
-def _typed_state(state):
-    """The typed-reply keys: used message ids, the warning (bound to the plan), the approval's reply, conditional decisions."""
-    used, warning, decisions = state["used_message_ids"], state["irreversible_warning"], state["conditional_decisions"]
-    reply = state["approval"].get("irreversible", 0) if state["approval"] else None
-    if (not isinstance(used, list) or len(used) > MAX_USED_MESSAGE_IDS or len(set(map(str, used))) != len(used) or reply == 0
-            or not isinstance(decisions, list) or len(decisions) > 100):
-        raise WorkflowRefusal("Invalid typed-reply state")
-    for message_id in used:
-        record_identifier(message_id, "used message identifier")
-    for record, fields, revision in ((warning, WARNING_FIELDS, "revision"), (reply, REPLY_FIELDS, "warning_revision")):
-        if record is not None:
-            exact_fields(record, fields, fields)
-            ids(record["action_ids"], "typed-reply actions", allow_empty=False)
-            if (type(record["number"]) is not int or record["number"] < 1 or type(record[revision]) is not int
-                    or record["bytes"] is not None and (type(record["bytes"]) is not int or record["bytes"] < 0)):
-                raise WorkflowRefusal("Invalid typed-reply record")
-    if warning is not None and (not state["plan"] or warning["plan_sha256"] != state["plan"]["sha256"] or str(warning["kind"]) not in KINDS
-                                or not 0 < warning["revision"] <= state["revision"] or not utc_time(warning["recorded_utc"])):
-        raise WorkflowRefusal("The irreversible-change warning is not bound to the current exact plan")
-    if reply is not None and str(reply["type"]) not in TYPED_ACKNOWLEDGMENTS:
-        raise WorkflowRefusal("Invalid typed reply")
-    for row in decisions:
-        exact_fields(row, CONDITIONAL_FIELDS, CONDITIONAL_FIELDS)
-        if str(row["decision"]) not in pc_records.CONDITIONAL_DECISIONS or not isinstance(row["names"], list):
-            raise WorkflowRefusal("Invalid conditional decision")
+def used_message_id(engine, message_id):
+    """True when a session in this engine's registry used ``message_id`` for a decision; the caller holds the registry lock.
+    It reads and checks every session's state, so one decision reads as many states as the registry holds sessions."""
+    return any(path.is_dir() and path.name.startswith("session-") and message_id in engine.read_session(path.name)["used_message_ids"]
+               for path in engine.work.iterdir())
+
+
+def claim_message(engine, state, owner_message_id):
+    """Record that ``owner_message_id`` backs one decision of this session: a message already used by a decision of any
+    session of this engine is refused. Called once per decision, under the registry lock (_decision)."""
+    if owner_message_id in state["used_message_ids"] or used_message_id(engine, owner_message_id):
+        raise WorkflowRefusal("This message was already used for a decision; ask the owner to reply again", code="message-id-used")
+    if len(state["used_message_ids"]) >= MAX_USED_MESSAGE_IDS:
+        raise WorkflowRefusal("This session has recorded all the decisions it can; start a new session", code="message-ids-full")
+    state["used_message_ids"].append(owner_message_id)
+
+
+def _decision(engine, session_id, event_type, mutate, expected_revision):
+    """Commit an owner decision under the registry lock, so its message id is checked against every session."""
+    with engine.journal.registry_lock():
+        return engine.change(session_id, event_type, mutate, expected_revision)
 
 
 def validate_state(engine, state):
@@ -251,8 +224,8 @@ def validate_state(engine, state):
         record_identifier(operation_id)
         fields = {"operation_id", "action_id", "plan_sha256", "settings_revision", "started_utc", "finished_utc", "outcome", "evidence_ids", "summary",
                   "authorization", "pause_requested", "resolution", "mutating", "adapter_id"}
-        exact_fields(op, fields | {"restart_pending", "restart_decision", "restart_verification"}, fields)
-        for name in ("restart_pending", "restart_decision", "restart_verification"):
+        exact_fields(op, fields | {"restart_pending", "restart_verification"}, fields)
+        for name in ("restart_pending", "restart_verification"):
             if name in op:
                 if not isinstance(op[name], dict):
                     raise WorkflowRefusal("Restart lifecycle metadata must be a typed record")
@@ -279,7 +252,7 @@ def validate_state(engine, state):
     if (state["approval"] and (not state["plan"] or state["approval"]["plan_sha256"] != state["plan"]["sha256"]
                                or state["approval"]["settings_revision"] != state["settings_revision"])):
         raise WorkflowRefusal("Approval is not bound to the current exact plan")
-    _typed_state(state)
+    engine_decisions.typed_state(state, MAX_USED_MESSAGE_IDS)
     return state
 
 
@@ -308,8 +281,8 @@ def create_session(engine, *, job="security_updates", control="guided", timing="
     marker = {"schema_version": SCHEMA_VERSION, **{key: state[key] for key in CREATION_KEYS}}
     write_private_new(directory / "creation.json", encoded(marker))
     engine.journal.commit(directory, state, [], "created", {"job": job})
-    return response(state, "created", initial_menu() + "\n\nYour " + JOBS[job]["label"].lower()
-                    + " session is ready. Confirm the exact scope before evidence collection.", {"state": state})
+    return response(state, "created", JOBS[job]["label"] + " is open. Nothing has been checked yet. What may I look at: the whole device, "
+                    "selected drives or folders, or one problem? Reply in your own words.", {"state": state})
 
 
 def setup(engine, session_id, *, scope=None, control=None, timing=None, checkpoints=None, expected_revision=None):
@@ -343,15 +316,16 @@ def authorize_scope(engine, session_id, *, owner_quote, owner_message_id, owner_
             raise WorkflowRefusal("Select the exact scope before authorizing collection")
         state["scope_authorization"] = owner_record(state, owner_quote, owner_message_id, owner_id, source)
         state["scope_authorization"]["scope_sha256"] = digest(state["settings"]["scope"])
+        claim_message(engine, state, owner_message_id)
         if state["status"] == "awaiting_user" and state["settings"]["timing"] == "now":
             state["status"] = "active"
         return {}, "Your exact scope decision is recorded. It permits only the agreed evidence collection; computer changes need a separate concrete plan."
-    return engine.change(session_id, "scope_authorized", mutate, expected_revision)
+    return _decision(engine, session_id, "scope_authorized", mutate, expected_revision)
 
 
 def register_evidence(engine, session_id, *, evidence_id, content, kind, scope, facts=None, observed_utc=None, expected_revision=None):
     record_identifier(evidence_id, "evidence identifier")
-    if not isinstance(content, bytes) or not 0 < len(content) <= EVIDENCE_MAX_BYTES or kind not in EVIDENCE_KINDS:
+    if not isinstance(content, bytes) or not 0 < len(content) <= engine_journal.EVIDENCE_MAX_BYTES or kind not in EVIDENCE_KINDS:
         raise WorkflowRefusal("Evidence must be bounded bytes with a supported kind")
     _scope(scope)
     facts = copy.deepcopy(facts or {})
@@ -411,6 +385,8 @@ def register_evidence(engine, session_id, *, evidence_id, content, kind, scope, 
 
 
 def evidence_rows(state, evidence_ids, *, kinds=None, after=None, seconds=86400, allow_empty=False):
+    """This session's evidence rows of the current scope and settings; ``seconds`` None sets no age limit (only a consumed
+    action's original evidence, action_binding)."""
     ids(evidence_ids, "evidence identifiers", allow_empty=allow_empty)
     rows = []
     for evidence_id in evidence_ids:
@@ -421,66 +397,38 @@ def evidence_rows(state, evidence_ids, *, kinds=None, after=None, seconds=86400,
             raise WorkflowRefusal("Evidence belongs to an earlier scope/settings revision")
         if kinds and row["kind"] not in kinds:
             raise WorkflowRefusal("Evidence kind does not support this transition")
-        fresh(row["observed_utc"], after=after, seconds=seconds)
+        if seconds is not None:
+            fresh(row["observed_utc"], after=after, seconds=seconds)
         rows.append(row)
     return rows
 
 
+def _evidence_value(engine, state, row):
+    """The decoded content of this session's evidence ``row``, within the evidence caps engine_journal sets when it is read."""
+    data = engine.journal.read_owned(engine.journal.directory(state["session_id"]) / row["path"], engine_journal.EVIDENCE_MAX_BYTES)
+    return decode_record(data, max_bytes=engine_journal.EVIDENCE_MAX_BYTES, max_nodes=engine_journal.EVIDENCE_MAX_NODES)
+
+
 def validate_plan_document(state, plan):
-    exact_fields(plan, {"plan_id", "summary", "evidence_ids", "actions"}, {"plan_id", "summary", "evidence_ids", "actions"})
-    record_identifier(plan["plan_id"])
-    bounded_text(plan["summary"], "plan explanation")
-    ids(plan["evidence_ids"], allow_empty=False)
-    if not isinstance(plan["actions"], list) or not 0 < len(plan["actions"]) <= 100:
-        raise WorkflowRefusal("A plan needs a bounded concrete action list")
-    seen = set()
-    for action in plan["actions"]:
-        fields = {"action_id", "kind", "target", "benefit", "risk", "reversibility", "verification", "mutating", "requires_os_consent", "requires_recovery",
-                  "recovery_evidence_ids", "estimate_evidence_id", "adapter_id", "adapter_payload_evidence_id", "adapter_payload_sha256", "adapter_plan_sha256",
-                  "target_inventory_evidence_id", "target_inventory_sha256"}
-        required = fields - {"estimate_evidence_id"}
-        exact_fields(action, fields, required)
-        record_identifier(action["action_id"])
-        if action["action_id"] in seen or action["kind"] not in KINDS:
-            raise WorkflowRefusal("Action identifiers must be unique and kinds supported")
-        seen.add(action["action_id"])
-        for field in ("target", "benefit", "risk", "reversibility", "verification"):
-            bounded_text(action[field], "action " + field, 2000)
-        if any(type(action[key]) is not bool for key in ("mutating", "requires_os_consent", "requires_recovery")):
-            raise WorkflowRefusal("Action safety flags must be explicit booleans")
-        if action["adapter_id"] == pc_records.ADAPTER_SYSTEM_REVIEWED_EXTERNAL and action["requires_os_consent"] is not True:
-            raise WorkflowRefusal("Every fixed local external installer requires actual owner-handled protected-system consent")
-        if action["kind"] != "assessment" and not action["mutating"]:
-            raise WorkflowRefusal("Change kinds cannot be disguised as read-only actions")
-        if not isinstance(action["adapter_id"], str):
-            raise WorkflowRefusal("Adapter identifier must name a fixed supported recipe")
-        facts = _facts(action)
-        if action["kind"] not in facts["kinds"] or action["adapter_id"] == pc_records.ADAPTER_FIXTURE_ASSESSMENT and state["mode"] != "fixture":
-            raise WorkflowRefusal("This action has no fixed supported adapter for this kind and mode")
-        if facts["backup_receipt"] == "required" and not action["requires_recovery"]:
-            raise WorkflowRefusal("This adapter consumes a verified backup receipt; bind its recovery evidence")
-        for field in ("adapter_payload_evidence_id", "target_inventory_evidence_id"):
-            record_identifier(action[field])
-        for field in ("adapter_payload_sha256", "adapter_plan_sha256", "target_inventory_sha256"):
-            if not isinstance(action[field], str) or not SHA.fullmatch(action[field]):
-                raise WorkflowRefusal("Exact adapter payload, lower-level plan and target inventory hashes are required")
-        if action["kind"] in {"backup_restore", "permanent_purge", "repair", "firmware", "os_transition"} and not action["requires_recovery"]:
-            raise WorkflowRefusal("This action needs verified recovery evidence or an explicit supported recovery design")
-        ids(action["recovery_evidence_ids"])
-        if action["requires_recovery"] and not action["recovery_evidence_ids"]:
-            raise WorkflowRefusal("Required recovery has not been provided")
-        if "estimate_evidence_id" in action:
-            record_identifier(action["estimate_evidence_id"])
+    """The plan document's fixed shape and per-action rules, and the composition rule (engine_decisions)."""
+    engine_decisions.validate_plan_document(state, plan)
 
 
-def action_binding(engine, state, action):
-    payload_row = engine.evidence_rows(state, [action["adapter_payload_evidence_id"]], kinds={"adapter_payload"})[0]
-    inventory_row = engine.evidence_rows(state, [action["target_inventory_evidence_id"]], kinds={"inventory"})[0]
+def action_binding(engine, state, action, *, operation_id=None):
+    """The reviewed payload of ``action``, after its hashes, scope, settings and adapter rules are checked. A new launch gives no
+    ``operation_id``: its payload and inventory must be fresh, and a restore probe must still be absent. ``operation_id`` names
+    the action's own consumed operation (engine_decisions.require_consumed): the same original binding is checked with no age
+    limit, because such a step may finish long after its plan, after a restart for example. What that step finds now needs
+    fresh observations of its own."""
+    limit = {}
+    if operation_id is not None:
+        engine_decisions.require_consumed(state, action, operation_id)
+        limit["seconds"] = None
+    payload_row = engine.evidence_rows(state, [action["adapter_payload_evidence_id"]], kinds={"adapter_payload"}, **limit)[0]
+    inventory_row = engine.evidence_rows(state, [action["target_inventory_evidence_id"]], kinds={"inventory"}, **limit)[0]
     if payload_row["sha256"] != action["adapter_payload_sha256"] or inventory_row["sha256"] != action["target_inventory_sha256"]:
         raise WorkflowRefusal("Exact reviewed adapter payload or target inventory has changed")
-    directory = engine.journal.directory(state["session_id"])
-    payload, inventory = (decode_record(engine.journal.read_owned(directory / row["path"], EVIDENCE_MAX_BYTES), max_bytes=EVIDENCE_MAX_BYTES,
-                                        max_nodes=EVIDENCE_MAX_NODES) for row in (payload_row, inventory_row))
+    payload, inventory = (_evidence_value(engine, state, row) for row in (payload_row, inventory_row))
     if action["adapter_id"] == pc_records.ADAPTER_FIXTURE_ASSESSMENT:
         typed_record(payload, FIXTURE_ADAPTER)
         if (payload["operation"] != action["adapter_id"] or digest(payload["fixture_plan"]) != action["adapter_plan_sha256"]
@@ -499,7 +447,7 @@ def action_binding(engine, state, action):
             raise WorkflowRefusal("Diagnostic request is not a supported bounded recipe") from error
         if request["mode"] != state["mode"] or request["platform"] != state["platform"]:
             raise WorkflowRefusal("Diagnostic request belongs to a different creation mode/platform")
-    elif action["adapter_id"] in pc_records.ADAPTERS and pc_records.ADAPTERS[action["adapter_id"]]["family"] in {"update", "repair"}:
+    elif action["adapter_id"] in pc_records.ADAPTERS and pc_records.ADAPTERS[action["adapter_id"]]["family"] in engine_decisions.UPDATE_FAMILIES:
         # The update and repair families bind in engine_updates, reached through the engine (no import of it here).
         engine.update_binding(state, action, payload, inventory)
     elif action["adapter_id"] in storage_contract.PLAN_KINDS:
@@ -510,20 +458,21 @@ def action_binding(engine, state, action):
         if not output_value.is_absolute():
             raise WorkflowRefusal("Storage output root must be an exact absolute owned work path")
         output = no_links(output_value)
-        try:
-            output.relative_to(engine.root / "work")
-        except ValueError as error:
-            raise WorkflowRefusal("Adapter outputs must stay inside this repository's owned work tree") from error
+        # Parts are compared by the file system's own rule; a path equal to the work tree passes, as before.
+        if private_workspace.relative_parts(output, engine.root / "work") is None:
+            raise WorkflowRefusal("Adapter outputs must stay inside this repository's owned work tree")
+        if "backup_destination" in payload and (action["adapter_id"] != pc_records.ADAPTER_STORAGE_BACKUP_CREATE
+                                                or payload["backup_destination"] not in payload["protected_roots"]):
+            raise WorkflowRefusal("Only a reviewed backup names an outside destination, and that destination must be one of its protected roots",
+                                  code="backup-destination")
         probe_value = payload.get("restore_probe_destination")
         if probe_value is not None:
             if action["adapter_id"] != pc_records.ADAPTER_STORAGE_BACKUP_CREATE or not isinstance(probe_value, str) or not Path(probe_value).is_absolute():
                 raise WorkflowRefusal("Only an explicitly reviewed backup action can include an exact owned restore-probe destination")
             probe = no_links(Path(probe_value))
-            try:
-                probe.relative_to(output)
-            except ValueError as error:
-                raise WorkflowRefusal("Restore probe must stay under the exact owned backup output root") from error
-            if probe.exists():
+            if private_workspace.relative_parts(probe, output) is None:
+                raise WorkflowRefusal("Restore probe must stay under the exact owned backup output root")
+            if operation_id is None and probe.exists():
                 raise WorkflowRefusal("The reviewed restore-probe destination is no longer absent")
         source_inventory = payload["storage_plan"].get("inventory", payload["storage_plan"].get("records", payload["storage_plan"].get("receipt")))
         if source_inventory is None or digest(source_inventory) != digest(inventory):
@@ -534,23 +483,40 @@ def action_binding(engine, state, action):
     return payload
 
 
+def _depends(payload):
+    """The depends_on list a bound payload gives (only update and repair payloads carry one), or None."""
+    return payload.get("depends_on") if isinstance(payload, dict) else None
+
+
+def _backup_receipts(engine, state, actions):
+    """The backup receipt each recovery binding of ``actions`` names (None for a binding that names none)."""
+    values = [_evidence_value(engine, state, row) for action in actions
+              for row in engine.evidence_rows(state, action["recovery_evidence_ids"], kinds={"recovery"})]
+    return [value.get("backup_receipt") if isinstance(value, dict) and value.get("schema") == RECOVERY_BINDING else None for value in values]
+
+
 def register_plan(engine, session_id, *, plan, expected_revision=None):
+    """Register an exact plan before the apply stage, or the one follow-up removal plan at the verify stage."""
     document = copy.deepcopy(plan)
     def mutate(state):
         require_writable(state)
+        validate_plan_document(state, document)
         stages = JOBS[state["job"]]["stages"]
-        if state["stage"] not in stages[:stages.index("apply")]:
+        removal = any(action["adapter_id"] == pc_records.ADAPTER_STORAGE_REMOVE_ORIGINALS for action in document["actions"])
+        if state["plan"] and any(action["adapter_id"] == pc_records.ADAPTER_STORAGE_REMOVE_ORIGINALS for action in state["plan"]["document"]["actions"]):
+            raise WorkflowRefusal("The follow-up removal plan is this session's last plan; start a new session for other changes", code="followup-plan")
+        if not removal and state["stage"] not in stages[:stages.index("apply")]:
             raise WorkflowRefusal("A new or replacement plan must be reviewed before the apply stage; existing action, verification and finish checkpoints "
                                   "cannot authorize another plan")
         if any(op["outcome"] is None for op in state["operations"].values()):
             raise WorkflowRefusal("Reconcile the active operation before replacing its plan")
-        validate_plan_document(state, document)
         engine.evidence_rows(state, document["evidence_ids"])
         if not state["scope_authorization"]:
             raise WorkflowRefusal("The current owner has not authorized this scope")
         consumed = {op["action_id"] for op in state["operations"].values()}
+        payloads = []
         for action in document["actions"]:
-            action_binding(engine, state, action)
+            payloads.append(action_binding(engine, state, action))
             if action["action_id"] in consumed:
                 raise WorkflowRefusal("A consumed action identifier cannot be reused or retried")
             if action["requires_recovery"] or action["recovery_evidence_ids"]:
@@ -559,14 +525,21 @@ def register_plan(engine, session_id, *, plan, expected_revision=None):
                 estimate = engine.evidence_rows(state, [action["estimate_evidence_id"]], kinds={"inventory"})[0]
                 if estimate["facts"].get("action_id") != action["action_id"]:
                     raise WorkflowRefusal("A cost fact must identify this exact action to prevent unrelated or duplicate workload estimates")
+        action_ids = [action["action_id"] for action in document["actions"]]
+        engine_decisions.check_depends_on(action_ids, {action_id: _depends(payload) for action_id, payload in zip(action_ids, payloads)})
+        data, notes = {}, []
+        if removal:
+            receipts = _backup_receipts(engine, state, document["actions"])
+            engine_decisions.check_followup(state, document, receipts)
+            notes, read_only = engine_decisions.followup_notes(receipts, [row for payload in payloads for row in payload["storage_plan"]["files"]])
+            data["followup"] = {"notes": notes, "read_only_files": read_only}
+            state["stage"] = "plan"
         state["plan"] = {"document": document, "sha256": digest(document), "settings_revision": state["settings_revision"],
                          "registered_utc": pc_records.utc_now()}
-        state["reviews"] = []
-        state["approval"] = None
-        state["irreversible_ack"] = None
-        state["irreversible_warning"], state["conditional_decisions"] = None, []
-        return ({"plan_sha256": state["plan"]["sha256"], "action_ids": [a["action_id"] for a in document["actions"]]},
-                "The exact plan is saved. It still needs two independent reviews and your concrete action decision before any change.")
+        engine_decisions.clear_plan_decisions(state)
+        return ({"plan_sha256": state["plan"]["sha256"], "action_ids": action_ids, **data},
+                " ".join(["The exact plan is saved. It still needs two assistant review passes and your decision on its exact actions before any change."]
+                         + notes))
     return engine.change(session_id, "plan_registered", mutate, expected_revision)
 
 
@@ -577,80 +550,80 @@ def current_plan(state, plan_sha256):
 
 
 def record_review(engine, session_id, *, plan_sha256, reviewer_id, role, verdict, evidence_ids, notes, expected_revision=None):
+    """Record one assistant review pass of the exact current plan; its evidence is a typed review of this plan, role, verdict
+    and reviewer, used by no other review."""
     record_identifier(reviewer_id, "reviewer identifier")
     bounded_text(notes, "review notes")
-    if role not in ROLES or verdict not in {"approved", "hold"}:
+    if not isinstance(role, str) or role not in ROLES or not isinstance(verdict, str) or verdict not in VERDICTS:
         raise WorkflowRefusal("A supported review role and approved/hold verdict are required")
     def mutate(state):
         require_writable(state)
         current_plan(state, plan_sha256)
-        engine.evidence_rows(state, evidence_ids, kinds={"review"}, after=state["plan"]["registered_utc"])
+        rows = engine.evidence_rows(state, evidence_ids, kinds={"review"}, after=state["plan"]["registered_utc"])
         if reviewer_id == state["owner_id"] or any(row["reviewer_id"] == reviewer_id or row["role"] == role for row in state["reviews"]):
-            raise WorkflowRefusal("Reviews need two distinct independent reviewers, separate from the owner")
+            raise WorkflowRefusal("The two assistant review passes need different reviewers and roles, separate from the owner")
+        expected = {"plan_sha256": plan_sha256, "role": role, "verdict": verdict, "reviewer_id": reviewer_id}
+        if (set(evidence_ids) & {evidence_id for row in state["reviews"] for evidence_id in row["evidence_ids"]}
+                or any({key: read_review(_evidence_value(engine, state, row))[key] for key in expected} != expected for row in rows)):
+            raise WorkflowRefusal("Each assistant review pass needs its own typed review evidence for this exact plan, role, verdict and reviewer",
+                                  code="review-evidence")
         record = {"reviewer_id": reviewer_id, "role": role, "verdict": verdict, "evidence_ids": list(evidence_ids), "notes": notes, "plan_sha256": plan_sha256,
-                  "settings_revision": state["settings_revision"], "recorded_utc": pc_records.utc_now()}
+                  "settings_revision": state["settings_revision"], "recorded_utc": pc_records.utc_now(), "attestation": ATTESTATION}
         state["reviews"].append(record)
         state["approval"] = None
-        return record, "The independent review is recorded against the exact current plan. A held review prevents changes."
+        return record, "The assistant review pass is recorded against the exact current plan. A held review prevents changes."
     return engine.change(session_id, "review_recorded", mutate, expected_revision)
 
 
 def require_reviews(engine, state):
-    if (not state["plan"] or len(state["reviews"]) != 2 or {row["role"] for row in state["reviews"]} != ROLES
-            or len({row["reviewer_id"] for row in state["reviews"]}) != 2):
-        raise WorkflowRefusal("Two independent compatibility/data and evidence/security reviews are required")
-    for row in state["reviews"]:
+    reviews = state["reviews"]
+    if (not state["plan"] or len(reviews) != 2 or {row["role"] for row in reviews} != ROLES or len({row["reviewer_id"] for row in reviews}) != 2
+            or len({evidence_id for row in reviews for evidence_id in row["evidence_ids"]}) != sum(len(row["evidence_ids"]) for row in reviews)):
+        raise WorkflowRefusal("Two assistant review passes are required: compatibility and data safety, and evidence and security")
+    for row in reviews:
         if row["verdict"] != "approved" or row["plan_sha256"] != state["plan"]["sha256"] or row["settings_revision"] != state["settings_revision"]:
             raise WorkflowRefusal("A review holds this plan or belongs to an earlier plan")
         engine.evidence_rows(state, row["evidence_ids"], kinds={"review"}, after=state["plan"]["registered_utc"])
 
 
-def used_message_id(engine, message_id):
-    """True when a session in this engine's registry used ``message_id`` for a typed reply; the caller holds the registry lock."""
-    return any(path.is_dir() and path.name.startswith("session-") and message_id in engine.read_session(path.name)["used_message_ids"]
-               for path in engine.work.iterdir())
-
-
-def _typed_reply(engine, state, action_ids, owner_quote, owner_message_id):
-    """The approval's typed reply (all warned actions, the current warning's whole phrase, an unused message id), or None."""
-    typed = [a for a in state["plan"]["document"]["actions"] if a["action_id"] in action_ids and TYPED_ACKNOWLEDGMENTS & set(acknowledgments(a))]
-    if not typed:
+def _typed_reply(state, action_ids, owner_quote):
+    """The approval's typed reply (all warned actions, the current warning's whole phrase), or None."""
+    warned = [a for a in state["plan"]["document"]["actions"] if a["action_id"] in action_ids and typed(a)]
+    if not warned:
         return None
     warning = state["irreversible_warning"] or {}
-    if warning.get("plan_sha256") != state["plan"]["sha256"] or set(warning.get("action_ids", ())) != {a["action_id"] for a in typed}:
+    if warning.get("plan_sha256") != state["plan"]["sha256"] or set(warning.get("action_ids", ())) != {a["action_id"] for a in warned}:
         raise WorkflowRefusal("Show this plan's warning first; the typed reply approves all warned actions together", code="typed-reply-warning")
     phrase = irreversible_phrase(warning.get("kind"), warning.get("number"))
     if not reply_matches(owner_quote, phrase):
-        raise WorkflowRefusal("This step needs the owner's exact typed reply: " + phrase, code="typed-reply-mismatch")
-    if owner_message_id in state["used_message_ids"] or used_message_id(engine, owner_message_id):
-        raise WorkflowRefusal("This message was already used for a typed reply; ask the owner to reply again", code="message-id-used")
-    if len(state["used_message_ids"]) >= MAX_USED_MESSAGE_IDS:
-        raise WorkflowRefusal("This session has used all its typed replies; start a new session", code="message-ids-full")
-    state["used_message_ids"].append(owner_message_id)
-    return {"type": min(TYPED_ACKNOWLEDGMENTS & set(acknowledgments(typed[0]))), "action_ids": list(warning["action_ids"]),
+        raise WorkflowRefusal(engine_text.WRONG_REPLY + phrase, code="typed-reply-mismatch")
+    return {"type": min(TYPED_ACKNOWLEDGMENTS & set(acknowledgments(warned[0]))), "action_ids": list(warning["action_ids"]),
             "number": warning["number"], "bytes": warning["bytes"], "warning_revision": warning["revision"]}
 
 
-def approve_plan(engine, session_id, *, plan_sha256, action_ids, owner_quote, owner_message_id, owner_id="owner", source="current_owner_chat",
+def approve_plan(engine, session_id, *, plan_sha256, action_ids, owner_quote, owner_message_id, owner_id=None, source="current_owner_chat",
                  expected_revision=None):
-    """The owner's approval of exact reviewed actions; a permanent deletion or a firmware update needs the typed reply."""
+    """The owner's approval of exact reviewed actions, with every action each one depends on; a plan with a permanent deletion
+    or a firmware update is approved whole, by the typed reply. One message is the approval and its typed reply."""
     ids(action_ids, "approved action identifiers", allow_empty=False)
     def mutate(state):
         require_writable(state)
         document = current_plan(state, plan_sha256)
         require_reviews(engine, state)
         engine.evidence_rows(state, document["evidence_ids"])
-        if set(action_ids) - {a["action_id"] for a in document["actions"]}:
+        plan_ids = [a["action_id"] for a in document["actions"]]
+        if set(action_ids) - set(plan_ids):
             raise WorkflowRefusal("Approval cannot include actions outside the concrete plan")
+        engine_decisions.check_approval(plan_ids, plan_depends_on(engine, state), action_ids, any(map(typed, document["actions"])), state["operations"])
         purge_ids = [a["action_id"] for a in document["actions"] if "permanent_data_loss" in acknowledgments(a) and a["action_id"] in action_ids]
         record = owner_record(state, owner_quote, owner_message_id, owner_id, source)
         record.update(plan_sha256=plan_sha256, action_ids=list(action_ids), permanent_loss_action_ids=purge_ids,
-                      irreversible=_typed_reply(engine, state, action_ids, owner_quote, owner_message_id))
+                      irreversible=_typed_reply(state, action_ids, owner_quote))
+        claim_message(engine, state, owner_message_id)
         state["approval"] = record
         return ({"action_ids": list(action_ids)},
-                "Your actual instruction is recorded for those exact reviewed actions. Fresh checks and protected system consent still apply.")
-    with engine.journal.registry_lock():  # a typed reply's message id is checked against every session
-        return engine.change(session_id, "plan_approved", mutate, expected_revision)
+                "Your approval is recorded for exactly these changes. I check again just before each one, and your computer may still ask you to confirm.")
+    return _decision(engine, session_id, "plan_approved", mutate, expected_revision)
 
 
 def record_irreversible_ack(engine, session_id, *, plan_sha256, action_ids, acknowledge_irreversible_loss, owner_quote, owner_message_id, owner_id=None,
@@ -671,10 +644,11 @@ def record_irreversible_ack(engine, session_id, *, plan_sha256, action_ids, ackn
         record = owner_record(state, owner_quote, owner_message_id, owner_id, source)
         record.update(type=needed.pop(), plan_sha256=plan_sha256, action_ids=list(action_ids), scope_sha256=digest(state["settings"]["scope"]),
                       acknowledge_irreversible_loss=True)
+        claim_message(engine, state, owner_message_id)
         state["irreversible_ack"] = record
         return ({"action_ids": action_ids},
                 "Your separate acknowledgement is bound to these exact actions, the current scope and plan. It cannot authorize another change.")
-    return engine.change(session_id, "irreversible_loss_acknowledged", mutate, expected_revision)
+    return _decision(engine, session_id, "irreversible_loss_acknowledged", mutate, expected_revision)
 
 
 def issue_irreversible_warning(engine, session_id, *, plan_sha256, expected_revision=None):
@@ -683,45 +657,32 @@ def issue_irreversible_warning(engine, session_id, *, plan_sha256, expected_revi
         require_writable(state)
         document = current_plan(state, plan_sha256)
         require_reviews(engine, state)
-        typed = [a for a in document["actions"] if TYPED_ACKNOWLEDGMENTS & set(acknowledgments(a))]
-        firmware = bool(typed) and "firmware_risk" in acknowledgments(typed[0])
-        if not typed or len({a["adapter_id"] for a in typed}) != 1 or firmware and len(typed) != 1:
+        warned = [a for a in document["actions"] if typed(a)]
+        firmware = bool(warned) and "firmware_risk" in acknowledgments(warned[0])
+        if not warned or len({a["adapter_id"] for a in warned}) != 1 or firmware and len(warned) != 1:
             raise WorkflowRefusal("A typed reply covers one kind of permanent deletion, or one firmware update, per plan", code="typed-reply-plan")
-        payloads = [action_binding(engine, state, action) for action in typed]
+        payloads = [action_binding(engine, state, action) for action in warned]
         if firmware:
             device = payloads[0].get("device") if isinstance(payloads[0], dict) else None
             number, size = (device.get("number") if isinstance(device, dict) else None), None
         else:
             number, size = sum(payload["delete_count"] for payload in payloads), sum(payload["delete_bytes"] for payload in payloads)
-        phrase = irreversible_phrase(typed[0]["kind"], number)
-        state["irreversible_warning"] = warning = {"plan_sha256": plan_sha256, "kind": typed[0]["kind"], "action_ids": [a["action_id"] for a in typed],
+        phrase = irreversible_phrase(warned[0]["kind"], number)
+        state["irreversible_warning"] = warning = {"plan_sha256": plan_sha256, "kind": warned[0]["kind"], "action_ids": [a["action_id"] for a in warned],
                                                    "number": number, "bytes": size, "revision": state["revision"] + 1, "recorded_utc": pc_records.utc_now()}
+        details = engine_text.release_details(warning, payloads)
+        if warned[0]["adapter_id"] == pc_records.ADAPTER_STORAGE_REMOVE_ORIGINALS:
+            files = [row for payload in payloads for row in payload["storage_plan"]["files"]]
+            details["notes"] = engine_decisions.followup_notes(_backup_receipts(engine, state, warned), files)[0]
         return ({"phrase": phrase, "action_ids": warning["action_ids"], "number": number, "bytes": size},
-                "This cannot be undone. To go ahead, the owner replies with exactly: " + phrase)
+                engine_text.firmware_warning(warning, platform=state["platform"], device=device.get("name"), version=device.get("target_version"),
+                                             flags=payloads[0].get("flags")) if firmware else engine_text.deletion_warning(warning, **details))
     return engine.change(session_id, "irreversible_warning_recorded", mutate, expected_revision)
 
 
 def set_standing_policy(engine, session_id, *, action_kinds, max_actions, expires_utc, owner_quote, owner_message_id, targets=None, action_bindings=None,
-                        owner_id="owner", source="current_owner_chat", expected_revision=None):
-    if (not isinstance(action_kinds, list) or not action_kinds or set(action_kinds) - POLICY_KINDS or len(set(action_kinds)) != len(action_kinds)
-            or type(max_actions) is not int or not 1 <= max_actions <= 20):
-        raise WorkflowRefusal("Standing policy needs bounded supported ordinary action kinds and 1–20 actions")
-    if not isinstance(targets, list) or not targets or len(targets) > 20:
-        raise WorkflowRefusal("Standing policy needs exact explicitly selected targets")
-    for target in targets:
-        bounded_text(target, "policy target", 2000)
-    if not isinstance(action_bindings, list) or not action_bindings or len(action_bindings) > 20:
-        raise WorkflowRefusal("Standing policy needs exact adapter payload/plan/inventory hash bindings")
-    for binding in action_bindings:
-        exact_fields(binding, {"adapter_id", "adapter_payload_sha256", "adapter_plan_sha256", "target_inventory_sha256"},
-                     {"adapter_id", "adapter_payload_sha256", "adapter_plan_sha256", "target_inventory_sha256"})
-        facts = pc_records.ADAPTERS.get(binding["adapter_id"]) if isinstance(binding["adapter_id"], str) else None
-        if (not facts or not facts["policy_coverable"] or not set(facts["kinds"]) & set(action_kinds)
-                or any(not isinstance(binding[key], str) or not SHA.fullmatch(binding[key]) for key in binding if key != "adapter_id")):
-            raise WorkflowRefusal("Standing policy binding has unsupported adapter or missing exact hashes")
-    expiry = utc_time(expires_utc)
-    if not utc_time(pc_records.utc_now()) < expiry <= utc_time(pc_records.utc_now()) + timedelta(days=7):
-        raise WorkflowRefusal("Policy expiry must be in the next seven days")
+                        owner_id=None, source="current_owner_chat", expected_revision=None):
+    engine_decisions.check_policy_request(action_kinds, max_actions, expires_utc, targets, action_bindings)
     def mutate(state):
         require_writable(state)
         if state["settings"]["control"] != "automatic" or not state["scope_authorization"]:
@@ -729,25 +690,60 @@ def set_standing_policy(engine, session_id, *, action_kinds, max_actions, expire
         record = owner_record(state, owner_quote, owner_message_id, owner_id, source)
         record.update(action_kinds=list(action_kinds), targets=list(targets), action_bindings=copy.deepcopy(action_bindings), max_actions=max_actions,
                       used_actions=0, expires_utc=expires_utc, scope_sha256=digest(state["settings"]["scope"]))
+        claim_message(engine, state, owner_message_id)
         state["standing_policy"] = record
-        return ({}, "Your bounded standing policy is recorded. Each exact plan still needs two independent reviews, fresh checks and all selected checkpoints; "
-                    "protected consent cannot be automated.")
-    return engine.change(session_id, "policy_recorded", mutate, expected_revision)
+        return ({}, "Your limited standing policy is recorded. Each exact plan still needs two assistant review passes, fresh checks and all selected "
+                    "checkpoints. It never covers a step that needs your own reply or your own action.")
+    return _decision(engine, session_id, "policy_recorded", mutate, expected_revision)
 
 
-def action_authorization(state, action):
+def policy_covers(state, action, payload):
+    """True when the session's standing policy covers ``action`` with its bound ``payload`` (engine_decisions.policy_covers:
+    pure; a None payload is never covered). In-session authorization uses it, and a scheduled run too."""
+    return engine_decisions.policy_covers(state, action, payload)
+
+
+def action_authorization(state, action, payload=None):
+    """The owner authority for ``action``, after the conditional-decision check on the bound ``payload`` (a None payload fails
+    it where it applies): the approval of the exact plan, which also ends at the actions it leaves out, or with no approval the
+    standing policy when policy_covers holds."""
+    engine_decisions.require_conditional(state, action, payload)
     approval = state["approval"]
-    if approval and action["action_id"] in approval["action_ids"] and approval["plan_sha256"] == state["plan"]["sha256"]:
+    if approval:
+        if action["action_id"] not in approval["action_ids"] or approval["plan_sha256"] != state["plan"]["sha256"]:
+            raise WorkflowRefusal("Your approval leaves this action out, so it does not run", code="approval-left-out")
         return {"kind": "exact_plan", "message_id": approval["message_id"], "plan_sha256": state["plan"]["sha256"], "action_id": action["action_id"]}
     policy = state["standing_policy"]
-    if (policy and state["settings"]["control"] == "automatic" and policy["settings_revision"] == state["settings_revision"]
-            and policy["scope_sha256"] == digest(state["settings"]["scope"]) and utc_time(policy["expires_utc"]) > utc_time(pc_records.utc_now())
-            and policy["used_actions"] < policy["max_actions"] and action["kind"] in policy["action_kinds"] and action["target"] in policy["targets"]
-            and {key: action[key] for key in ("adapter_id", "adapter_payload_sha256", "adapter_plan_sha256",
-                                              "target_inventory_sha256")} in policy["action_bindings"] and not action["requires_os_consent"]
-            and pc_records.ADAPTERS[action["adapter_id"]]["policy_coverable"] and not pc_records.ADAPTERS[action["adapter_id"]]["irreversible"]):
+    if policy_covers(state, action, payload):
         return {"kind": "standing_policy", "message_id": policy["message_id"], "plan_sha256": state["plan"]["sha256"], "action_id": action["action_id"]}
     raise WorkflowRefusal("This exact action lacks current owner authority; control style alone never authorizes a change")
+
+
+def record_conditional_decision(engine, session_id, *, action_id, decision, names, owner_quote, owner_message_id, owner_id=None,
+                                source="current_owner_chat", expected_revision=None):
+    """The owner's own decision for one flagged action (run its install scripts, or change its runtime line), bound to the
+    action id, its payload hash and the exact sorted name@version list the payload names ([] for a runtime line change)."""
+    record_identifier(action_id)
+    if not isinstance(decision, str) or decision not in pc_records.CONDITIONAL_DECISIONS or not engine_decisions.valid_names(decision, names):
+        raise WorkflowRefusal("Choose one conditional decision with its exact name@version list (none for a runtime line change)",
+                              code="conditional-decision")
+    def mutate(state):
+        require_writable(state)
+        action = next((a for a in state["plan"]["document"]["actions"] if a["action_id"] == action_id), None) if state["plan"] else None
+        if action is None or decision not in pc_records.ADAPTERS[action["adapter_id"]]["conditional_decisions"]:
+            raise WorkflowRefusal("This decision applies only to an action of the current plan that can need it", code="conditional-decision")
+        if (engine_decisions.needed_decisions(action_binding(engine, state, action)) or {}).get(decision) != names:
+            raise WorkflowRefusal("This decision must name exactly what this action's reviewed payload asks for", code="conditional-decision")
+        if (any(row["action_id"] == action_id and row["decision"] == decision for row in state["conditional_decisions"])
+                or len(state["conditional_decisions"]) >= engine_decisions.MAX_CONDITIONAL_DECISIONS):
+            raise WorkflowRefusal("This decision is already recorded, or the session holds all the decisions it can", code="conditional-decision")
+        record = owner_record(state, owner_quote, owner_message_id, owner_id, source)
+        claim_message(engine, state, owner_message_id)
+        row = {"action_id": action_id, "payload_sha256": action["adapter_payload_sha256"], "decision": decision, "names": list(names),
+               "message_id": owner_message_id, "recorded_utc": record["recorded_utc"]}
+        state["conditional_decisions"].append(row)
+        return row, "Your decision is recorded for this one action and its exact reviewed payload. A standing policy or a schedule never uses it."
+    return _decision(engine, session_id, "conditional_decision_recorded", mutate, expected_revision)
 
 
 def pending_items(state):
@@ -766,25 +762,38 @@ def add_checkpoint(state, name, action_id=None):
             state["status"] = "awaiting_user"
 
 
-def next_action_checkpoint(state):
+def plan_depends_on(engine, state):
+    """depends_on of each plan action that has not run, read from its hash-bound payload: only update and repair payloads carry
+    one, and a missing entry means every earlier action (remaining_actions)."""
+    consumed = {op["action_id"] for op in state["operations"].values()}
+    return {action["action_id"]: _depends(_evidence_value(engine, state, state["evidence"][action["adapter_payload_evidence_id"]]))
+            for action in state["plan"]["document"]["actions"]
+            if action["action_id"] not in consumed and pc_records.ADAPTERS[action["adapter_id"]]["family"] in engine_decisions.UPDATE_FAMILIES}
+
+
+def _can_start(engine, state, action):
+    """False for an action whose reviewed payload or inventory is past the evidence limit: it never starts and ends as not run,
+    because a restart wait has no limit and a batch can outlast its evidence."""
+    try:
+        return bool(engine.evidence_rows(state, [action["adapter_payload_evidence_id"], action["target_inventory_evidence_id"]]))
+    except WorkflowRefusal as error:
+        if error.code == "stale-evidence":
+            return False
+        raise
+
+
+def next_action_checkpoint(state, depends_on=None):
+    """The before_action checkpoint of the first remaining action (remaining_actions); ``depends_on`` is the map
+    plan_depends_on returns, and None keeps strict plan order."""
     if not state["plan"] or state["stage"] != "apply":
         return
-    consumed = {op["action_id"] for op in state["operations"].values()}
-    for action in state["plan"]["document"]["actions"]:
-        if action["action_id"] not in consumed:
-            add_checkpoint(state, "before_action", action["action_id"])
-            return
+    remaining = remaining_actions([a["action_id"] for a in state["plan"]["document"]["actions"]], depends_on or {}, approved_ids(state), state["operations"])
+    if remaining:
+        add_checkpoint(state, "before_action", remaining[0])
 
 
-def resolve(engine, session_id, *, pending_id=None, evidence_ids=None, choice=None, owner_quote=None, owner_message_id=None, expected_revision=None):
-    if pending_id and choice is not None:
-        current = engine.read_session(session_id)
-        item = current["pending"].get(pending_id)
-        if item and item["kind"] == "restart" and not item["resolved"]:
-            if evidence_ids:
-                raise WorkflowRefusal("A restart choice uses the actual owner instruction, not imported approval evidence")
-            return engine.decide_restart(session_id, operation_id=item["operation_id"], choice=choice, owner_quote=owner_quote,
-                                         owner_message_id=owner_message_id, expected_revision=expected_revision)
+def resolve(engine, session_id, *, pending_id=None, evidence_ids=None, choice=None, owner_quote=None, owner_message_id=None, owner_id=None,
+            source="current_owner_chat", expected_revision=None):
     if choice is None and not evidence_ids:
         state = engine.read_session(session_id)
         items = pending_items(state)
@@ -793,16 +802,7 @@ def resolve(engine, session_id, *, pending_id=None, evidence_ids=None, choice=No
             if not items:
                 raise WorkflowRefusal("No unresolved item has that identifier")
         choices = ["keep_stopped"] if state["status"] == "stopped" else ["continue", "revise_plan", "keep_held"]
-        if len(items) == 1 and items[0]["kind"] == "restart":
-            choices = ["defer", "authorize"]
-        elif any(item["kind"] == "restart" for item in items):
-            choices += ["defer", "authorize"]
-        message = ("Review the specific pending decision or collect its bounded reconciliation evidence. Resolve cannot declare success or retry an action. A "
-                   "stopped session remains stopped while actual results are recorded.")
-        if state["status"] == "stopped" and any(item["kind"] == "restart" for item in items):
-            message += (" For the retained original 3010 operation only, select its restart item to defer or authorize owner-handled restart accounting; this "
-                        "cannot reopen work or create another installer attempt.")
-        return response(state, "resolution_needed", message, {"pending": items, "choices": choices})
+        return response(state, "resolution_needed", engine_text.resolve_text(state, items), {"pending": items, "choices": choices})
     def mutate(state):
         if not pending_id or pending_id not in state["pending"] or state["pending"][pending_id]["resolved"]:
             raise WorkflowRefusal("Choose one existing unresolved item")
@@ -815,7 +815,8 @@ def resolve(engine, session_id, *, pending_id=None, evidence_ids=None, choice=No
         if item["kind"] == "checkpoint":
             if choice != "continue" or not owner_quote or not owner_message_id:
                 raise WorkflowRefusal("A checkpoint needs the owner's actual continue decision")
-            item["owner_instruction"] = owner_record(state, owner_quote, owner_message_id)
+            item["owner_instruction"] = owner_record(state, owner_quote, owner_message_id, owner_id, source)
+            claim_message(engine, state, owner_message_id)
             item["resolved"] = True
             if state["status"] == "awaiting_user" and not pending_items(state):
                 state["status"] = "completed" if state["stage"] == "complete" else "active"
@@ -836,9 +837,9 @@ def resolve(engine, session_id, *, pending_id=None, evidence_ids=None, choice=No
                 state["status"] = "stopped" if was_stopped else "paused"
                 if not was_stopped:
                     add_checkpoint(state, "after_action", operation["action_id"])
-                    next_action_checkpoint(state)
+                    next_action_checkpoint(state, plan_depends_on(engine, state) if state["plan"] else None)
             elif choice in {"revise_plan", "keep_stopped"} and owner_quote and owner_message_id:
-                if operation.get("restart_pending") and operation.get("restart_verification", {}).get("boot_observed") is not True:
+                if restart_state(operation) == "waiting":
                     raise WorkflowRefusal("The original restart requirement still needs actual boot accounting; generic effects flags cannot clear it")
                 if was_stopped != (choice == "keep_stopped"):
                     raise WorkflowRefusal("A stopped session may account for actual effects while staying stopped; it cannot request or resume a replacement "
@@ -849,15 +850,14 @@ def resolve(engine, session_id, *, pending_id=None, evidence_ids=None, choice=No
                        for row in rows):
                     raise WorkflowRefusal("Replanning needs fresh actual-effects reconciliation, no ongoing operation and retained recovery; the historical "
                                           "failure remains unchanged")
-                item["owner_instruction"] = owner_record(state, owner_quote, owner_message_id)
+                item["owner_instruction"] = owner_record(state, owner_quote, owner_message_id, owner_id, source)
+                claim_message(engine, state, owner_message_id)
                 item["resolved"] = True
                 operation["resolution"] = {"kind": "effects_accounted" if was_stopped else "replan_required", "evidence_ids": list(evidence_ids),
                                            "recorded_utc": pc_records.utc_now(), "owner_message_id": owner_message_id}
                 if not was_stopped:
                     state["plan"] = None
-                    state["approval"] = None
-                    state["reviews"] = []
-                    state["irreversible_warning"], state["conditional_decisions"] = None, []
+                    engine_decisions.clear_plan_decisions(state)
                     state["stage"] = "plan"
                 state["status"] = "stopped" if was_stopped else "held"
             elif choice in {"keep_held", None}:
@@ -866,9 +866,10 @@ def resolve(engine, session_id, *, pending_id=None, evidence_ids=None, choice=No
                 raise WorkflowRefusal("An unsuccessful action stays held; the owner may request a separately reviewed replacement plan")
         else:
             raise WorkflowRefusal("This pending item has no general-purpose resolution")
-        return ({"pending": item},
-                "The identified item is reconciled only to the extent supported by actual evidence and your bounded decision. No action was retried.")
-    return engine.change(session_id, "resolved", mutate, expected_revision)
+        return {"pending": item}, "Recorded. No step was repeated."
+    if owner_message_id is None:
+        return engine.change(session_id, "resolved", mutate, expected_revision)
+    return _decision(engine, session_id, "resolved", mutate, expected_revision)
 
 
 def advance_stage(engine, session_id, *, evidence_ids, expected_revision=None):
@@ -878,13 +879,9 @@ def advance_stage(engine, session_id, *, evidence_ids, expected_revision=None):
         engine.require_schedule_activation(state)
         stage = state["stage"]
         rows = engine.evidence_rows(state, evidence_ids, allow_empty=stage in {"plan", "apply"})
-        required = {"scope": ("scope_confirmation", {"scope_confirmed"}), "inventory": ("inventory", {"complete"}),
-                    "research": ("research", {"applicability_checked", "official_sources_checked"}),
-                    "candidates": ("candidates", {"candidates_reviewed", "excluded_private"}), "symptom": ("symptom", {"symptom_recorded", "relevant_scope"}),
-                    "hypotheses": ("hypotheses", {"alternatives_considered", "distinguishing_checks"}),
-                    "recovery_plan": ("recovery_plan", {"contents_reviewed", "restore_check_planned", "exclusions_explicit"})}
-        if stage in required:
-            kind, flags = required[stage]
+        finished = {}
+        if stage in STAGE_REQUIREMENTS:
+            kind, flags = STAGE_REQUIREMENTS[stage]
             matching = [row for row in rows if row["kind"] == kind and all(row["facts"].get(flag) is True for flag in flags)]
             if not matching:
                 raise WorkflowRefusal("This stage needs owned evidence establishing its actual required checks")
@@ -894,26 +891,34 @@ def advance_stage(engine, session_id, *, evidence_ids, expected_revision=None):
                 raise WorkflowRefusal("Inventory must record an explicit assessed item count")
         elif stage == "plan":
             require_reviews(engine, state)
+            approved = set(approved_ids(state))
             for action in state["plan"]["document"]["actions"]:
-                action_authorization(state, action)
-        elif stage == "apply":
+                if action["action_id"] in approved:
+                    action_authorization(state, action, action_binding(engine, state, action))
+        elif stage in {"apply", "verify"}:
             if not state["plan"]:
                 raise WorkflowRefusal("No current plan can be verified")
-            planned = {a["action_id"] for a in state["plan"]["document"]["actions"]}
-            succeeded = {op["action_id"] for op in state["operations"].values() if op["plan_sha256"] == state["plan"]["sha256"]
-                         and op["outcome"] == "succeeded"}
-            if planned != succeeded:
-                raise WorkflowRefusal("Every current planned action needs its own actual successful receipt before verification")
-        elif stage == "verify":
-            if not state["plan"]:
-                raise WorkflowRefusal("Verification needs the exact current plan")
-            planned = {a["action_id"] for a in state["plan"]["document"]["actions"]}
-            latest = max(op["finished_utc"] for op in state["operations"].values() if op["plan_sha256"] == state["plan"]["sha256"])
-            verified = [row for row in rows if row["kind"] == "verification" and row["facts"].get("verification_passed") is True
-                        and row["facts"].get("plan_sha256") == state["plan"]["sha256"] and set(row["facts"].get("checked_action_ids", [])) == planned
-                        and utc_time(row["observed_utc"]) >= utc_time(latest)]
-            if not verified:
-                raise WorkflowRefusal("Actual behavior verification for every exact planned action is required after its outcome")
+            ran = {op["action_id"]: op for op in state["operations"].values() if op["plan_sha256"] == state["plan"]["sha256"]}
+            succeeded = {action_id for action_id, op in ran.items() if op["outcome"] == "succeeded"}
+            if stage == "apply" and (not ran or any(op["outcome"] != "succeeded" and (op["resolution"] or {}).get("kind") != "verified_failure"
+                                                    for op in ran.values())
+                                     or remaining_actions([a["action_id"] for a in state["plan"]["document"]["actions"]], plan_depends_on(engine, state),
+                                                          [a["action_id"] for a in state["plan"]["document"]["actions"] if a["action_id"] in approved_ids(state)
+                                                           and _can_start(engine, state, a)], state["operations"])):
+                raise WorkflowRefusal("Every approved action that can still run needs its own actual receipt, and every action run must have succeeded or "
+                                      "have a checked failure, before verification")
+            if stage == "verify":
+                latest = max(op["finished_utc"] for op in ran.values())
+                verified = [row for row in rows if row["kind"] == "verification" and row["facts"].get("verification_passed") is True
+                            and row["facts"].get("plan_sha256") == state["plan"]["sha256"] and set(row["facts"].get("checked_action_ids", [])) == succeeded
+                            and utc_time(row["observed_utc"]) >= utc_time(latest)]
+                if not verified:
+                    raise WorkflowRefusal("Actual behavior verification of every action that succeeded is required after its outcome")
+                # The finish record lists failed, not-run and left-out actions apart from the ones that succeeded.
+                approved = approved_ids(state)
+                finished = {"succeeded": sorted(succeeded), "failed": sorted(set(ran) - succeeded),
+                            "not_run": [action_id for action_id in approved if action_id not in ran],
+                            "excluded": [a["action_id"] for a in state["plan"]["document"]["actions"] if a["action_id"] not in approved]}
         else:
             raise WorkflowRefusal("This job is already at its final stage")
         stages = JOBS[state["job"]]["stages"]
@@ -924,8 +929,8 @@ def advance_stage(engine, session_id, *, evidence_ids, expected_revision=None):
         if state["stage"] == "complete" and not pending_items(state):
             state["status"] = "completed"
         if state["stage"] == "apply":
-            next_action_checkpoint(state)
-        return ({"stage": state["stage"]}, "The evidence supports the next step: " + STAGE_LABELS[state["stage"]].lower() + ". "
+            next_action_checkpoint(state, plan_depends_on(engine, state))
+        return ({"stage": state["stage"], **finished}, "The evidence supports the next step: " + STAGE_LABELS[state["stage"]].lower() + ". "
                 + ("The actual checked result is complete; retained evidence and recovery files still need a separate cleanup decision."
                    if state["status"] == "completed" else "Use PatchCairn: options for the next decision and any selected checkpoint."))
     return engine.change(session_id, "stage_advanced", mutate, expected_revision)
@@ -948,7 +953,7 @@ def complete_assessment(engine, session_id, *, summary_evidence_id, verification
             raise WorkflowRefusal("Assessment completion requires the actual current owner's exact authorized scope")
         after = max((authorization["recorded_utc"], activation["activated_utc"]), key=utc_time) if activation else authorization["recorded_utc"]
         summary_row = engine.evidence_rows(state, [summary_evidence_id], kinds={"research"}, after=after, seconds=900)[0]
-        summary = typed_record(decode_record(engine.journal.read_owned(engine.journal.directory(session_id) / summary_row["path"])), ASSESSMENT_SUMMARY)
+        summary = typed_record(_evidence_value(engine, state, summary_row), ASSESSMENT_SUMMARY)
         if (summary["job"] != state["job"] or summary["mode"] != state["mode"] or summary["scope_sha256"] != scope_sha
                 or summary["settings_revision"] != state["settings_revision"]):
             raise WorkflowRefusal("The assessment summary must bind this exact current job, mode and scope")
@@ -961,21 +966,15 @@ def complete_assessment(engine, session_id, *, summary_evidence_id, verification
         ids(summary["assessed_evidence_ids"], "assessed evidence identifiers", allow_empty=False)
         if summary_evidence_id in summary["assessed_evidence_ids"]:
             raise WorkflowRefusal("An assessment summary cannot stand in for its underlying assessment evidence")
-        assessed = engine.evidence_rows(state, summary["assessed_evidence_ids"], kinds={"scope_confirmation", "inventory", "research", "candidates", "symptom",
-                                                                                        "hypotheses", "recovery_plan"}, after=authorization["recorded_utc"])
-        requirements = {"scope": ("scope_confirmation", {"scope_confirmed"}), "inventory": ("inventory", {"complete"}),
-                        "research": ("research", {"applicability_checked", "official_sources_checked"}),
-                        "candidates": ("candidates", {"candidates_reviewed", "excluded_private"}),
-                        "symptom": ("symptom", {"symptom_recorded", "relevant_scope"}),
-                        "hypotheses": ("hypotheses", {"alternatives_considered", "distinguishing_checks"}),
-                        "recovery_plan": ("recovery_plan", {"contents_reviewed", "restore_check_planned", "exclusions_explicit"})}
+        assessed = engine.evidence_rows(state, summary["assessed_evidence_ids"], kinds={kind for kind, _ in STAGE_REQUIREMENTS.values()},
+                                        after=authorization["recorded_utc"])
         for stage in JOBS[state["job"]]["stages"][:JOBS[state["job"]]["stages"].index("plan")]:
-            kind, flags = requirements[stage]
+            kind, flags = STAGE_REQUIREMENTS[stage]
             if not any(row["kind"] == kind and all(row["facts"].get(flag) is True for flag in flags) for row in assessed):
                 raise WorkflowRefusal("The summary must cover the actual current evidence for every agreed assessment step")
         rows = engine.evidence_rows(state, verification_evidence_ids, kinds={"verification"}, after=summary_row["registered_utc"], seconds=900)
         for row in rows:
-            verification = typed_record(decode_record(engine.journal.read_owned(engine.journal.directory(session_id) / row["path"])), ASSESSMENT_VERIFICATION)
+            verification = typed_record(_evidence_value(engine, state, row), ASSESSMENT_VERIFICATION)
             if (any(verification[key] != summary[key] for key in ("job", "mode", "scope_sha256", "settings_revision", "assessed_evidence_ids"))
                     or verification["summary_evidence_id"] != summary_evidence_id or verification["summary_sha256"] != summary_row["sha256"]
                     or verification["coverage_checked"] is not True or verification["limitations_checked"] is not True
@@ -985,6 +984,7 @@ def complete_assessment(engine, session_id, *, summary_evidence_id, verification
         record = {"summary_evidence_id": summary_evidence_id, "summary_sha256": summary_row["sha256"],
                   "verification_evidence_ids": list(verification_evidence_ids),
                   "owner_instruction": owner_record(state, owner_quote, owner_message_id, owner_id, source)}
+        claim_message(engine, state, owner_message_id)
         key = "assessment-finish-" + digest({"summary": summary_row["sha256"], "settings": state["settings_revision"], "message": owner_message_id})[:24]
         state["pending"][key] = {"pending_id": key, "kind": "assessment_finish", "resolved": True, "record": record}
         state["stage"] = "complete"
@@ -994,4 +994,4 @@ def complete_assessment(engine, session_id, *, summary_evidence_id, verification
         return (record, "The assessment and its findings are recorded, including what remains uncertain. This session recorded no maintenance action. "
                 + ("Review the selected finish checkpoint before closing." if state["status"] != "completed"
                    else "The assessment session is complete; any computer change needs a separate reviewed plan."))
-    return engine.change(session_id, "assessment_completed", mutate, expected_revision)
+    return _decision(engine, session_id, "assessment_completed", mutate, expected_revision)

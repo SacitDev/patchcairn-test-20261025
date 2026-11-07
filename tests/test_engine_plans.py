@@ -7,25 +7,42 @@ No test collects host inventory, creates a schedule, executes a plan or cleans a
 from __future__ import annotations
 
 import ast
+import contextlib
 import copy
 from datetime import datetime, timedelta, timezone
+import inspect
 import json
 from pathlib import Path
 import sys
+from types import MappingProxyType, SimpleNamespace
 import unittest
 from unittest import mock
+import uuid
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).absolute().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 import diagnostic_core
+import engine_decisions
+import engine_journal
 import engine_plans
 import engine_text
 import engine_updates
 import pc_records
+import storage_contract
 import workflow_core
 from workflow_core import JOBS, WorkflowEngine, WorkflowRefusal, digest, encoded
 from test_engine_journal import WorkflowFixture
+from test_engine_updates import variants
+from test_packages import FakeLauncher, RunProbe, fake_route, registered
+from test_service_state import PROSE, SessionFixtures
+
+
+def typed_review(test, reviewer_id, role, *, verdict="approved", plan_sha256=None, **changes):
+    """Register the typed evidence of one assistant review pass (patchcairn.review) for ``test``'s current plan; returns its id."""
+    record = {"schema": "patchcairn.review", "schema_version": 1, "plan_sha256": plan_sha256 or test.plan_hash, "role": role, "verdict": verdict,
+              "reviewer_id": reviewer_id, "attestation": "coordinator-attested", **changes}
+    return test.evidence("review", {"reviewed": True}, content=encoded({key: value for key, value in record.items() if value is not None}))
 
 
 class KindAndLabelTests(unittest.TestCase):
@@ -42,7 +59,7 @@ class KindAndLabelTests(unittest.TestCase):
 
     def test_report_labels_cover_every_job_stage_and_action_kind(self):
         labels = workflow_core.report_labels()
-        self.assertEqual(set(labels), {"jobs", "stages", "actions"})
+        self.assertLessEqual({"jobs", "stages", "actions"}, set(labels))
         self.assertEqual(labels["jobs"], {job: row["label"] for job, row in JOBS.items()})
         self.assertEqual(set(labels["stages"]), {stage for row in JOBS.values() for stage in row["stages"]})
         self.assertEqual(set(labels["actions"]), engine_plans.KINDS)
@@ -68,6 +85,11 @@ class KindAndLabelTests(unittest.TestCase):
                      and getattr(node.func, "attr", getattr(node.func, "id", None)) in ("import_module", "__import__")}
         self.assertIn("engine_journal", imported)
         self.assertNotIn("engine_updates", imported)
+
+    def test_engine_kinds_are_exactly_the_adapter_kinds(self):
+        # A kind with no adapter (restart, firmware, os_transition, security_policy) can never be planned.
+        self.assertEqual(engine_plans.KINDS, {kind for facts in pc_records.ADAPTERS.values() for kind in facts["kinds"]})
+        self.assertFalse({"restart", "firmware", "os_transition", "security_policy"} & engine_plans.KINDS)
 
 
 class AssessmentAccessTests(unittest.TestCase):
@@ -141,8 +163,12 @@ class AssessmentAccessTests(unittest.TestCase):
                 scope["assessment"] = self.descriptor(target)
             state = {"owner_id": "owner", "status": "active", "settings_revision": 0,
                      "job": "diagnosis_repair", "stage": "scope", "pending": {},
-                     "settings": {"scope": engine_plans._scope(scope), "timing": "now"}, "scope_authorization": None}
+                     "settings": {"scope": engine_plans._scope(scope), "timing": "now"}, "scope_authorization": None, "used_message_ids": []}
             engine = object.__new__(WorkflowEngine)
+            # No session folder exists, so the engine-wide message check reads an empty registry.
+            work = ROOT / "work" / "test-fixtures" / ("fictional-" + uuid.uuid4().hex)
+            work.mkdir(parents=True)
+            engine.journal = SimpleNamespace(registry_lock=contextlib.nullcontext, work=work)
             engine._change = lambda session, event, mutate, revision: mutate(state)
             engine.evidence_rows = lambda state, ids, **unused: [{"kind": "scope_confirmation", "facts": {"scope_confirmed": True}}]
             self.assertEqual(engine_plans._scope_selected(state["settings"]["scope"]), target in ("whole_device", "specific_problem"))
@@ -209,11 +235,11 @@ class WorkflowTests(WorkflowFixture):
         self.engine.register_plan(self.sid, plan=self.plan)
         with self.assertRaises(WorkflowRefusal):
             self.engine.approve_plan(self.sid, plan_sha256=self.plan_hash, action_ids=["fictional-action"], owner_quote="Apply the fictional plan.", owner_message_id="owner-plan")
-        eid = self.evidence("review", {"checked": True})
+        eid = typed_review(self, "reviewer-a", "compatibility_data")
         self.engine.record_review(self.sid, plan_sha256=self.plan_hash, reviewer_id="reviewer-a", role="compatibility_data", verdict="approved", evidence_ids=[eid], notes="Fictional review")
         for reviewer, role in (("reviewer-a", "evidence_security"), ("reviewer-b", "compatibility_data"), ("owner", "evidence_security")):
             with self.assertRaises(WorkflowRefusal):
-                self.engine.record_review(self.sid, plan_sha256=self.plan_hash, reviewer_id=reviewer, role=role, verdict="approved", evidence_ids=[eid], notes="Fictional review")
+                self.engine.record_review(self.sid, plan_sha256=self.plan_hash, reviewer_id=reviewer, role=role, verdict="approved", evidence_ids=[typed_review(self, reviewer, role)], notes="Fictional review")
 
     def test_imported_approval_source_and_wrong_owner_cannot_authorize(self):
         self.plan_ready()
@@ -324,8 +350,7 @@ class WorkflowTests(WorkflowFixture):
         cases = (({"requires_os_consent": True}, "os-consent"),  # a storage adapter never involves an OS prompt
                  ({"adapter_id": "system.repair", "kind": "repair", "requires_os_consent": False}, "os-consent"),  # always prompts
                  ({"adapter_id": "fictional.unregistered"}, "unknown-adapter"),
-                 ({"kind": "update"}, None),  # a kind its adapter does not carry
-                 ({"adapter_id": "package.upgrade", "kind": "update"}, "adapter-held"))  # registered, no executor here yet
+                 ({"kind": "update"}, None))  # a kind its adapter does not carry
         for change, code in cases:
             plan = copy.deepcopy(self.plan)
             plan["actions"][0].update(change)
@@ -333,6 +358,11 @@ class WorkflowTests(WorkflowFixture):
                 self.engine.register_plan(self.sid, plan=plan)
             if code:
                 self.assertEqual(caught.exception.code, code)
+        # A registered adapter that no binding branch serves is held: here the storage branch no longer lists the backup.
+        unbound = MappingProxyType({key: value for key, value in storage_contract.PLAN_KINDS.items() if key != pc_records.ADAPTER_STORAGE_BACKUP_CREATE})
+        with mock.patch.object(storage_contract, "PLAN_KINDS", unbound), self.assertRaises(WorkflowRefusal) as caught:
+            self.engine.register_plan(self.sid, plan=dict(self.plan, plan_id="fictional-unbound"))
+        self.assertEqual(caught.exception.code, "adapter-held")
         self.assertEqual(self.state()["revision"], before)
 
     def test_update_and_repair_families_route_to_update_binding(self):
@@ -367,7 +397,7 @@ class WorkflowTests(WorkflowFixture):
         self.plan_ready(automatic=True)
         expiry = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat().replace("+00:00", "Z")
         hashes = {key: digest({"fictional": key}) for key in ("adapter_payload_sha256", "adapter_plan_sha256", "target_inventory_sha256")}
-        for adapter_id, kinds in (("system.reviewed_external", ["update"]), ("storage.purge", ["cleanup_quarantine"]), ("storage.backup_create", ["update"])):
+        for adapter_id, kinds in (("storage.purge", ["cleanup_quarantine"]), ("storage.backup_create", ["update"])):
             with self.subTest(adapter_id=adapter_id), self.assertRaisesRegex(WorkflowRefusal, "unsupported adapter"):
                 self.engine.set_standing_policy(self.sid, action_kinds=kinds, targets=["Fictional component"], action_bindings=[{"adapter_id": adapter_id, **hashes}], max_actions=1, expires_utc=expiry, owner_quote="Policy", owner_message_id="fictional-policy-" + adapter_id)
         self.assertIsNone(self.state()["standing_policy"])
@@ -401,7 +431,7 @@ class WorkflowTests(WorkflowFixture):
         self.assertEqual(state["status"], "stopped")
         self.assertEqual(state["operations"][operation_id]["outcome"], "partial")
         self.assertEqual(state["operations"][operation_id]["resolution"]["kind"], "effects_accounted")
-        self.assertFalse(self.engine._outstanding_effects())
+        self.assertFalse(engine_journal.outstanding_effects(self.engine))
         with self.assertRaises(WorkflowRefusal):
             self.begin()
 
@@ -433,7 +463,7 @@ class WorkflowTests(WorkflowFixture):
         self.plan = plan
         self.plan_hash = self.engine.register_plan(self.sid, plan=plan)["data"]["plan_sha256"]
         for reviewer, role in (("purge-review-a", "compatibility_data"), ("purge-review-b", "evidence_security")):
-            self.engine.record_review(self.sid, plan_sha256=self.plan_hash, reviewer_id=reviewer, role=role, verdict="approved", evidence_ids=[self.evidence("review", {"checked": True})], notes="Fictional exact purge review")
+            self.engine.record_review(self.sid, plan_sha256=self.plan_hash, reviewer_id=reviewer, role=role, verdict="approved", evidence_ids=[typed_review(self, reviewer, role)], notes="Fictional exact purge review")
         with self.assertRaises(WorkflowRefusal) as caught:
             self.engine.approve_plan(self.sid, plan_sha256=self.plan_hash, action_ids=["fictional-action"], owner_quote="Apply this plan.", owner_message_id="fictional-purge-plan")
         self.assertEqual(caught.exception.code, "typed-reply-warning")
@@ -490,7 +520,7 @@ class WorkflowTests(WorkflowFixture):
         self.plan = plan
         self.plan_hash = self.engine.register_plan(self.sid, plan=plan)["data"]["plan_sha256"]
         for reviewer, role in (("new-reviewer-a", "compatibility_data"), ("new-reviewer-b", "evidence_security")):
-            self.engine.record_review(self.sid, plan_sha256=self.plan_hash, reviewer_id=reviewer, role=role, verdict="approved", evidence_ids=[self.evidence("review", {"checked": True})], notes="Fictional revised review")
+            self.engine.record_review(self.sid, plan_sha256=self.plan_hash, reviewer_id=reviewer, role=role, verdict="approved", evidence_ids=[typed_review(self, reviewer, role)], notes="Fictional revised review")
         self.engine.approve_plan(self.sid, plan_sha256=self.plan_hash, action_ids=["fictional-action", "fictional-second-action"], owner_quote="Apply these two fictional actions in order.", owner_message_id="fictional-two-actions")
         self.engine.advance_stage(self.sid, evidence_ids=[])
         pending = self.engine.resolve(self.sid)["data"]["pending"]
@@ -635,7 +665,7 @@ class WorkflowTests(WorkflowFixture):
         replacement = copy.deepcopy(original)
         replacement["plan_id"] = "fictional-replacement-b"
         replacement["actions"][0]["action_id"] = "fictional-new-action-b"
-        self.engine._validate_plan_document(self.state(), replacement)
+        engine_plans.validate_plan_document(self.state(), replacement)
         before = self.state()
         with self.assertRaises(WorkflowRefusal):
             self.engine.register_plan(self.sid, plan=replacement)
@@ -693,7 +723,7 @@ class InventoryEvidenceTests(WorkflowFixture):
         return sid
 
     def authorize(self, sid):
-        self.engine.authorize_scope(sid, owner_quote="Read only the fictional selected folder's inventory.", owner_message_id="fictional-inventory-scope")
+        self.engine.authorize_scope(sid, owner_quote="Read only the fictional selected folder's inventory.", owner_message_id="fictional-inventory-scope-" + uuid.uuid4().hex)
 
     def register(self, sid, content, evidence_id="fictional-inventory", scope=None):
         return self.engine.register_evidence(sid, evidence_id=evidence_id, content=content, kind="inventory", scope=scope or self.scope)
@@ -762,11 +792,14 @@ class InventoryEvidenceTests(WorkflowFixture):
         sid = self.real_session()
         storage = encoded({"fictional": True, "entries": [{"name": "fictional.data", "size": 1}]})
         named = encoded({"fictional": True, "entries": [{"name": "platform", "size": 1}]})
-        lock = self.engine.work / sid / ".lock"
         locked = []
 
         def decode(*args, **kwargs):
-            locked.append(lock.exists())
+            try:
+                with self.engine.journal.lock(sid):
+                    locked.append(False)
+            except WorkflowRefusal:
+                locked.append(True)
             return original(*args, **kwargs)
         original = engine_plans.decode_record
         with mock.patch.object(engine_plans, "decode_record", side_effect=decode) as decoder:
@@ -787,7 +820,7 @@ class TypedReplyHelpers:
         if reviewed:
             for reviewer, role in (("typed-review-a", "compatibility_data"), ("typed-review-b", "evidence_security")):
                 self.engine.record_review(self.sid, plan_sha256=self.plan_hash, reviewer_id=reviewer, role=role, verdict="approved",
-                                          evidence_ids=[self.evidence("review", {"reviewed": True})], notes="Fictional review of the exact plan")
+                                          evidence_ids=[typed_review(self, reviewer, role)], notes="Fictional review of the exact plan")
 
     def purge_plan(self, *, reviewed=True):
         """Register a one-action purge plan with verified recovery (one 31-byte file); returns its typed reply."""
@@ -851,7 +884,7 @@ class IrreversibleApprovalTests(TypedReplyHelpers, WorkflowFixture):
         state = self.state()
         self.assertEqual(state["approval"]["irreversible"], {"type": "permanent_data_loss", "action_ids": ["fictional-action"], "number": 1,
                                                              "bytes": 31, "warning_revision": warning["revision"]})
-        self.assertEqual(state["used_message_ids"], ["typed-after-warning"])
+        self.assertEqual(state["used_message_ids"], [state["scope_authorization"]["message_id"], "typed-after-warning"])
 
     def test_used_message_id_never_accepted_again(self):
         phrase = self.purge_plan()
@@ -864,7 +897,8 @@ class IrreversibleApprovalTests(TypedReplyHelpers, WorkflowFixture):
         # Another session of the same engine never accepts a message id that a typed reply already used.
         self.refused("message-id-used", lambda: self.approve(other, "typed-once"))
         self.approve(other, "typed-twice")
-        self.assertEqual((self.engine.read_session(first)["used_message_ids"], self.state()["used_message_ids"]), (["typed-once"], ["typed-twice"]))
+        for state, message_id in ((self.engine.read_session(first), "typed-once"), (self.state(), "typed-twice")):
+            self.assertEqual(state["used_message_ids"], [state["scope_authorization"]["message_id"], message_id])
 
     def test_whole_quote_must_equal_phrase(self):
         phrase = self.purge_plan()
@@ -874,7 +908,7 @@ class IrreversibleApprovalTests(TypedReplyHelpers, WorkflowFixture):
                                         "delete 1,1 files")):
             with self.subTest(refused=quote):
                 self.refused("typed-reply-mismatch", lambda: self.approve(quote, "typed-refused-%d" % number))
-        self.assertEqual((self.state()["approval"], self.state()["used_message_ids"]), (None, []))
+        self.assertEqual((self.state()["approval"], self.state()["used_message_ids"]), (None, [self.state()["scope_authorization"]["message_id"]]))
         # Letter case, spaces, commas and one final full stop do not count.
         for number, quote in enumerate(("Delete 1 Files.", "  delete  1\tfiles ", "DELETE 1 FILES", "delete 1, files")):
             with self.subTest(accepted=quote):
@@ -902,6 +936,7 @@ class IrreversibleApprovalTests(TypedReplyHelpers, WorkflowFixture):
         self.refused("typed-reply-warning", lambda: self.approve(phrase, "typed-replaced"))
         self.warn()
         self.approve(phrase, "typed-current")
+        scope_id = self.state()["scope_authorization"]["message_id"]
         # A settings change clears the warning, the approval and the conditional decisions; the used message ids stay.
         try:
             self.engine.setup(self.sid, control="automatic")
@@ -909,7 +944,7 @@ class IrreversibleApprovalTests(TypedReplyHelpers, WorkflowFixture):
             self.fail("the settings change was refused: " + error.code)
         state = self.state()
         self.assertEqual((state["irreversible_warning"], state["approval"], state["conditional_decisions"], state["used_message_ids"]),
-                         (None, None, [], ["typed-current"]))
+                         (None, None, [], [scope_id, "typed-current"]))
 
     def test_reply_with_other_count_or_device_refused(self):
         phrase = self.purge_plan()
@@ -986,11 +1021,11 @@ class IrreversibleApprovalTests(TypedReplyHelpers, WorkflowFixture):
         phrase = self.purge_plan()
         self.warn()
         before = self.state()
-        with self.engine._registry_lock():
+        with self.engine.journal.registry_lock():
             self.refused("workflow-refusal", lambda: self.approve(phrase, "typed-locked"))
         self.assertEqual(self.state(), before)
         self.approve(phrase, "typed-locked")
-        self.assertEqual(self.state()["used_message_ids"], ["typed-locked"])
+        self.assertEqual(self.state()["used_message_ids"], [self.state()["scope_authorization"]["message_id"], "typed-locked"])
 
     def test_warning_covers_one_kind_of_deletion_or_one_firmware_update(self):
         self.purge_plan(reviewed=False)
@@ -1005,28 +1040,27 @@ class IrreversibleApprovalTests(TypedReplyHelpers, WorkflowFixture):
                       recovery_evidence_ids=[], adapter_payload_evidence_id=self.raw_evidence("adapter_payload", payload), adapter_payload_sha256=digest(payload),
                       adapter_plan_sha256=digest(selected), target_inventory_evidence_id=self.raw_evidence("inventory", inventory),
                       target_inventory_sha256=digest(inventory))
-        # Two kinds of permanent deletion in one plan would share one "delete N files" reply, so the warning refuses.
-        self.register(dict(self.plan, actions=[purge, second]))
-        self.refused("typed-reply-plan", self.warn)
+        # Two kinds of permanent deletion in one plan would share one "delete N files" reply, so registration refuses the plan.
+        self.refused("plan-composition", lambda: self.engine.register_plan(self.sid, plan=dict(self.plan, actions=[purge, second])))
         # A retention release cannot even be planned until its family is built.
         release = {"schema": "patchcairn.storage", "schema_version": 1, "kind": "retention_release", "records": inventory}
         released = dict(payload, operation=pc_records.ADAPTER_STORAGE_RETENTION_RELEASE, storage_plan=release, storage_plan_sha256=digest(release))
         third = dict(second, action_id="fictional-release", kind="retention_release", adapter_id=released["operation"],
                      adapter_payload_evidence_id=self.raw_evidence("adapter_payload", released), adapter_payload_sha256=digest(released),
                      adapter_plan_sha256=digest(release))
-        self.refused("storage-payload", lambda: self.engine.register_plan(self.sid, plan=dict(self.plan, plan_id="fictional-release", actions=[purge, third])))
+        self.refused("storage-payload", lambda: self.engine.register_plan(self.sid, plan=dict(self.plan, plan_id="fictional-release", actions=[third])))
         # A firmware plan holds exactly one device action.
         with mock.patch.object(engine_updates, "update_binding"):
             self.firmware_plan(2)
             firmware = self.plan["actions"][0]
-            self.register(dict(self.plan, actions=[firmware, dict(firmware, action_id="fictional-action-2")]))
-            self.refused("typed-reply-plan", self.warn)
+            self.refused("plan-composition", lambda: self.engine.register_plan(self.sid, plan=dict(self.plan, actions=[firmware, dict(firmware, action_id="fictional-action-2")])))
         self.assertIsNone(self.state()["irreversible_warning"])
 
     def test_used_message_id_cap_refuses_a_new_typed_reply(self):
         phrase = self.purge_plan()
         self.warn()
-        with mock.patch.object(engine_plans, "MAX_USED_MESSAGE_IDS", 2):
+        # The scope decision already used one id of the session.
+        with mock.patch.object(engine_plans, "MAX_USED_MESSAGE_IDS", len(self.state()["used_message_ids"]) + 2):
             self.approve(phrase, "typed-cap-1")
             self.approve(phrase, "typed-cap-2")
             before = self.state()
@@ -1043,6 +1077,1063 @@ class IrreversibleApprovalTests(TypedReplyHelpers, WorkflowFixture):
             self.firmware_plan(2)
             self.refused("typed-reply-required", separate)
         self.assertIsNone(self.state()["irreversible_ack"])
+
+
+CLOCK = "2026-01-02T03:04:05.000006Z"
+ATTESTED = "coordinator-attested"
+
+
+def never_safe(test, text):
+    """A same-disk or partial backup is never called safe or backed up."""
+    test.assertNotRegex(text, r"(?i)\bsafe\b|backed[ -]up")
+
+
+class RuleHelpers(TypedReplyHelpers):
+    """Plans, decisions and follow-up removal plans for the rule tests (mixed into WorkflowFixture classes; defines no
+    test). Package plans bind through engine_updates.update_binding, patched for each test."""
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.object(engine_updates, "update_binding")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def message(name):
+        return "fictional-" + name + "-" + uuid.uuid4().hex
+
+    def package_plan(self, payloads, *, automatic=False, reviewed=True):
+        """Register a plan of package updates a1, a2, ... whose fictional payloads carry ``payloads``' keys; returns its actions.
+        The first call in a session also readies the fixture's scope and plan stage."""
+        if self.state()["plan"] is None:
+            self.plan_ready(automatic=automatic)
+        inventory = {"fictional": True, "packages": len(payloads)}
+        inventory_id = self.raw_evidence("inventory", inventory)
+        actions = []
+        for number, extra in enumerate(payloads, 1):
+            payload = {"fictional_package": "example-%d" % number, "flags": [], **extra}
+            actions.append(dict(self.plan["actions"][0], action_id="a%d" % number, kind="update", target="Fictional package %d" % number,
+                                adapter_id=pc_records.ADAPTER_PACKAGE_UPGRADE, adapter_payload_evidence_id=self.raw_evidence("adapter_payload", payload),
+                                adapter_payload_sha256=digest(payload), adapter_plan_sha256=digest({"fictional plan": number}),
+                                target_inventory_evidence_id=inventory_id, target_inventory_sha256=digest(inventory)))
+        self.register(dict(self.plan, plan_id="fictional-packages-" + uuid.uuid4().hex[:8], actions=actions), reviewed)
+        return actions
+
+    def review_current(self):
+        for reviewer, role in (("rule-review-a", "compatibility_data"), ("rule-review-b", "evidence_security")):
+            self.engine.record_review(self.sid, plan_sha256=self.plan_hash, reviewer_id=reviewer, role=role, verdict="approved",
+                                      evidence_ids=[typed_review(self, reviewer, role)], notes="Fictional assistant review pass")
+
+    def approve_ids(self, action_ids, message_id=None, quote="Approve these exact fictional actions."):
+        return self.engine.approve_plan(self.sid, plan_sha256=self.plan_hash, action_ids=list(action_ids), owner_quote=quote,
+                                        owner_message_id=message_id or self.message("approve"))
+
+    def payload(self, action):
+        return self.engine.action_binding(self.state(), action)
+
+    def policy(self, actions, kinds=("update",)):
+        expiry = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+        self.engine.set_standing_policy(self.sid, action_kinds=list(kinds), targets=[action["target"] for action in actions],
+                                        action_bindings=[{key: action[key] for key in engine_decisions.BINDING_KEYS} for action in actions],
+                                        max_actions=5, expires_utc=expiry, owner_quote="Allow these exact fictional updates.",
+                                        owner_message_id=self.message("policy"))
+
+    def force_apply(self):
+        """Move the session to the apply stage through the test seam, so begin itself is what refuses."""
+        def apply(state):
+            state["stage"] = "apply"
+            return {}, "Fictional stage change for a begin test."
+        self.engine.change(self.sid, "fictional_stage", apply, None)
+
+    def begin_id(self, action_id):
+        action = next(a for a in self.plan["actions"] if a["action_id"] == action_id)
+        facts = {"action_id": action_id, "plan_sha256": self.plan_hash, "identity_matches": True, "scope_matches": True, "content_matches": True,
+                 "compatibility_checked": True, "provenance_checked": True, **{key: action[key] for key in engine_decisions.BINDING_KEYS}}
+        return self.engine.begin_operation(self.sid, action_id=action_id, plan_sha256=self.plan_hash,
+                                           precondition_evidence_ids=[self.evidence("precondition", facts)])["data"]["operation_id"]
+
+    def finish_id(self, operation_id, action_id, outcome="succeeded", **facts):
+        checked = {"result": "updated", "verified_postcondition": True} if outcome == "succeeded" else {}
+        evidence = self.evidence("outcome", {"operation_id": operation_id, "action_id": action_id, "plan_sha256": self.plan_hash, "outcome": outcome,
+                                             **checked, **facts})
+        return self.engine.finish_operation(self.sid, operation_id=operation_id, outcome=outcome, evidence_ids=[evidence],
+                                            summary="Fictional outcome: " + outcome)
+
+    def verify_ids(self, action_ids):
+        evidence = self.evidence("verification", {"verification_passed": True, "checked_action_ids": list(action_ids), "plan_sha256": self.plan_hash})
+        return self.engine.advance_stage(self.sid, evidence_ids=[evidence])
+
+    def fixture_backup(self, base):
+        """The fixture's backup action (plan_ready's payload and inventory evidence), shaped like ``base``."""
+        state = self.state()
+        payload = json.loads((self.engine.work / self.sid / state["evidence"]["fictional-adapter-binding"]["path"]).read_bytes())
+        return dict(base, action_id="fictional-backup", kind="backup_create", adapter_id=pc_records.ADAPTER_STORAGE_BACKUP_CREATE, requires_recovery=False,
+                    recovery_evidence_ids=[], adapter_payload_evidence_id="fictional-adapter-binding",
+                    adapter_payload_sha256=state["evidence"]["fictional-adapter-binding"]["sha256"], adapter_plan_sha256=payload["storage_plan_sha256"],
+                    target_inventory_evidence_id="fictional-inventory-binding",
+                    target_inventory_sha256=state["evidence"]["fictional-inventory-binding"]["sha256"])
+
+    def backup_recovery(self, plan_sha256, **receipt):
+        """A recovery binding (built like the fixture's verified_recovery) whose backup receipt names the backup plan ``plan_sha256``
+        and the facts the follow-up plan reads: outcome, durable, disk_relation and sources_synced (``receipt`` overrides them)."""
+        child = "fictional-followup-" + uuid.uuid4().hex[:8]
+        data, output = b"Fictional recovery payload only", self.root / "work" / child
+        destination = output / "restored-probe"
+        entry = {"entry": "fictional-root/sample.bin", "root_id": "fictional-root", "relative_path": "sample.bin", "size": len(data), "sha256": digest(data)}
+        archive, manifest = output / "backup.zip", output / "backup.zip.manifest.json"
+        archive_sha256 = digest(b"Fictional archive bytes for " + child.encode("ascii"))
+        manifest_data = {"schema": "patchcairn.storage", "schema_version": 1, "kind": "backup_manifest", "required_recovery": True,
+                         "archive_sha256": archive_sha256, "archive_bytes": 64, "plan_sha256": plan_sha256,
+                         "source_roots": [{"root_id": "fictional-root", "path": str(self.root / (child + "-source"))}], "files": [entry]}
+        backup = {"schema": "patchcairn.storage", "schema_version": 1, "kind": "backup_receipt", "required_recovery": True, "plan_sha256": plan_sha256,
+                  "archive": str(archive), "archive_sha256": archive_sha256, "manifest": str(manifest), "manifest_sha256": digest(manifest_data),
+                  "outcome": "succeeded", "durable": True, "changed_count": 0, "disk_relation": "same", "sources_synced": [], **receipt}
+        restore = {"schema": "patchcairn.storage", "schema_version": 1, "kind": "restore_receipt", "plan_sha256": digest({"fictional": "restore", "child": child}),
+                   "backup_plan_sha256": plan_sha256, "backup_archive_sha256": archive_sha256, "backup_manifest_sha256": backup["manifest_sha256"],
+                   "destination": str(destination), "files": [entry]}
+        retained = {str(archive): archive_sha256, str(manifest): backup["manifest_sha256"],
+                    str(output / ("outcome-restore-" + restore["plan_sha256"] + ".json")): digest(restore),
+                    str(destination / "fictional-root" / "sample.bin"): digest(data)}
+        retention_id = self.raw_evidence("retention", {"schema": "patchcairn.recovery.retention", "schema_version": 1, "session_id": self.sid,
+                                                       "required": True, "artifacts": retained})
+        return self.raw_evidence("recovery", {"schema": "patchcairn.recovery.binding", "schema_version": 1, "output_root": str(output),
+                                              "backup_receipt": backup, "restore_receipt": restore, "retention_evidence_id": retention_id})
+
+    def backed_up(self, *, verify=True):
+        """Run the fixture's one-backup plan through apply (and to the verify stage); returns the backup's plan hash."""
+        self.apply_ready()
+        self.finish(self.begin())
+        if verify:
+            self.engine.advance_stage(self.sid, evidence_ids=[])
+        return self.plan["actions"][0]["adapter_plan_sha256"]
+
+    def followup(self, recovery_id, rows=None):
+        """A follow-up plan removing the originals that the recovery binding ``recovery_id`` backed up (not registered)."""
+        binding = self.recovery_binding(recovery_id)
+        inventory = {"fictional": True, "entries": [{"name": "sample.bin", "size": 31}]}
+        rows = rows or [{"root_id": "fictional-root", "relative_path": "sample.bin", "size": 31, "sha256": "0" * 64, "read_only": False}]
+        lower = {"schema": "patchcairn.storage", "schema_version": 1, "kind": "remove_originals", "inventory": inventory, "files": rows}
+        payload = {"schema": "patchcairn.storage.adapter", "schema_version": 1, "operation": pc_records.ADAPTER_STORAGE_REMOVE_ORIGINALS, "storage_plan": lower,
+                   "storage_plan_sha256": digest(lower), "output_root": binding["output_root"], "mode": "fixture", "protected_roots": [],
+                   "delete_count": len(rows), "delete_bytes": sum(row["size"] for row in rows)}
+        action = dict(self.plan["actions"][0], action_id="fictional-removal-" + uuid.uuid4().hex[:8], kind="remove_originals", adapter_id=payload["operation"],
+                      adapter_payload_evidence_id=self.raw_evidence("adapter_payload", payload), adapter_payload_sha256=digest(payload),
+                      adapter_plan_sha256=digest(lower), target_inventory_evidence_id=self.raw_evidence("inventory", inventory),
+                      target_inventory_sha256=digest(inventory), requires_recovery=True, recovery_evidence_ids=[recovery_id])
+        return {"plan_id": "fictional-followup", "summary": "Remove the fictional originals after their checked backup",
+                "evidence_ids": [self.evidence("inventory", {"item_count": 1, "complete": True})], "actions": [action]}
+
+    def register_followup(self, plan):
+        response = self.engine.register_plan(self.sid, plan=plan)
+        self.plan, self.plan_hash = plan, response["data"]["plan_sha256"]
+        return response
+
+
+class PlanRecordTests(RuleHelpers, WorkflowFixture):
+    """The records and rules of approvals, reviews, plan composition, conditional decisions, the standing policy, subset
+    approval and the batch rule."""
+
+    def test_approval_record_marked_coordinator_attested(self):
+        self.plan_ready()
+        self.approve_ids(["fictional-action"], "fictional-attested-approval")
+        state = self.state()
+        self.assertEqual((state["approval"]["attestation"], state["scope_authorization"]["attestation"]), (ATTESTED, ATTESTED))
+        # Golden layout of the approval record (the plan hash and the time vary by run).
+        layout = dict(state["approval"], plan_sha256="0" * 64, recorded_utc=CLOCK)
+        self.assertEqual(encoded(layout), b'{"action_ids":["fictional-action"],"attestation":"coordinator-attested","irreversible":null,'
+                                          b'"message_id":"fictional-attested-approval","owner_id":"owner","permanent_loss_action_ids":[],'
+                                          b'"plan_sha256":"' + b"0" * 64 + b'","quote":"Approve these exact fictional actions.",'
+                                          b'"recorded_utc":"2026-01-02T03:04:05.000006Z","settings_revision":0,"source":"current_owner_chat"}')
+
+    def test_review_record_marked_coordinator_attested(self):
+        self.plan_ready()
+        review = self.state()["reviews"][0]
+        self.assertEqual(review["attestation"], ATTESTED)
+        layout = dict(review, plan_sha256="0" * 64, recorded_utc=CLOCK, evidence_ids=["fictional-review-evidence"])
+        self.assertEqual(encoded(layout), b'{"attestation":"coordinator-attested","evidence_ids":["fictional-review-evidence"],'
+                                          b'"notes":"Fictional independent data-safety review","plan_sha256":"' + b"0" * 64 + b'",'
+                                          b'"recorded_utc":"2026-01-02T03:04:05.000006Z","reviewer_id":"fictional-reviewer-a","role":"compatibility_data",'
+                                          b'"settings_revision":0,"verdict":"approved"}')
+        self.assertIs(pc_records.READERS["patchcairn.review"], engine_decisions.read_review)
+        # Review evidence without the label, or with another one, is refused.
+        self.register(dict(self.plan, plan_id="fictional-relabelled"), reviewed=False)
+        for changes in ({"attestation": None}, {"attestation": "person-verified"}):
+            with self.subTest(changes=changes), self.assertRaises(WorkflowRefusal):
+                self.engine.record_review(self.sid, plan_sha256=self.plan_hash, reviewer_id="label-a", role="compatibility_data", verdict="approved",
+                                          evidence_ids=[typed_review(self, "label-a", "compatibility_data", **changes)], notes="Fictional review pass")
+        self.assertEqual(self.state()["reviews"], [])
+
+    def test_one_message_cannot_authorize_two_decisions(self):
+        self.engine.setup(self.sid, control="automatic", checkpoints=["plan"])
+        self.plan_ready(automatic=True)
+        scope_id = self.state()["scope_authorization"]["message_id"]
+        self.refused("message-id-used", lambda: self.approve_ids(["fictional-action"], scope_id))
+        self.approve_ids(["fictional-action"], "fictional-one-approval")
+        expiry = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+        binding = {key: self.plan["actions"][0][key] for key in engine_decisions.BINDING_KEYS}
+        for message_id in (scope_id, "fictional-one-approval"):
+            with self.subTest(policy=message_id):
+                self.refused("message-id-used", lambda: self.engine.set_standing_policy(
+                    self.sid, action_kinds=["backup_create"], targets=["Fictional component"], action_bindings=[binding], max_actions=1, expires_utc=expiry,
+                    owner_quote="Allow this one fictional backup.", owner_message_id=message_id))
+        self.assertIsNone(self.state()["standing_policy"])
+        self.engine.advance_stage(self.sid, evidence_ids=[])
+        checkpoint = self.engine.resolve(self.sid)["data"]["pending"][0]["pending_id"]
+        self.refused("message-id-used", lambda: self.engine.resolve(self.sid, pending_id=checkpoint, choice="continue", owner_quote="Continue.",
+                                                                    owner_message_id="fictional-one-approval"))
+        self.engine.resolve(self.sid, pending_id=checkpoint, choice="continue", owner_quote="Continue.", owner_message_id="fictional-one-checkpoint")
+        self.assertEqual(self.state()["used_message_ids"], [scope_id, "fictional-one-approval", "fictional-one-checkpoint"])
+
+    def test_reviews_need_distinct_evidence_bound_to_plan(self):
+        self.plan_ready()
+        self.register(dict(self.plan, plan_id="fictional-rereviewed"), reviewed=False)
+        first = typed_review(self, "bound-a", "compatibility_data")
+        self.engine.record_review(self.sid, plan_sha256=self.plan_hash, reviewer_id="bound-a", role="compatibility_data", verdict="approved",
+                                  evidence_ids=[first], notes="Fictional review pass")
+        cases = {"the first review's evidence": [first], "untyped evidence": [self.evidence("review", {"reviewed": True})],
+                 "another plan": [typed_review(self, "bound-b", "evidence_security", plan_sha256="0" * 64)],
+                 "another role": [typed_review(self, "bound-b", "compatibility_data")],
+                 "another verdict": [typed_review(self, "bound-b", "evidence_security", verdict="hold")],
+                 "another reviewer": [typed_review(self, "bound-c", "evidence_security")],
+                 "a good record and the shared one": [typed_review(self, "bound-b", "evidence_security"), first]}
+        for name, evidence_ids in cases.items():
+            with self.subTest(refused=name), self.assertRaises(WorkflowRefusal):
+                self.engine.record_review(self.sid, plan_sha256=self.plan_hash, reviewer_id="bound-b", role="evidence_security", verdict="approved",
+                                          evidence_ids=evidence_ids, notes="Fictional review pass")
+        self.assertEqual(len(self.state()["reviews"]), 1)
+        second = typed_review(self, "bound-b", "evidence_security")
+        self.engine.record_review(self.sid, plan_sha256=self.plan_hash, reviewer_id="bound-b", role="evidence_security", verdict="approved",
+                                  evidence_ids=[second], notes="Fictional review pass")
+
+        def shared(state):
+            state["reviews"][1]["evidence_ids"] = [first]
+            return {}, "Fictional record edit: both reviews cite one evidence id."
+        self.engine.change(self.sid, "fictional_shared_review", shared, None)
+        # Two reviews that cite the same evidence never count as two review passes.
+        with self.assertRaises(WorkflowRefusal):
+            self.approve_ids(["fictional-action"])
+        self.assertIsNone(self.state()["approval"])
+
+    def test_partial_or_same_disk_backup_never_called_safe(self):
+        plan_sha256 = self.backed_up()
+        with self.assertRaises(WorkflowRefusal) as caught:
+            self.engine.register_plan(self.sid, plan=self.followup(self.backup_recovery(plan_sha256, outcome="partial")))
+        self.assertEqual(caught.exception.code, "followup-receipt")
+        never_safe(self, str(caught.exception))
+        message = self.register_followup(self.followup(self.backup_recovery(plan_sha256)))["message"]
+        self.assertIn("This backup is on the same disk as the originals; if the disk fails, both copies are lost.", message)
+        never_safe(self, message)
+        self.review_current()
+        message = self.engine.issue_irreversible_warning(self.sid, plan_sha256=self.plan_hash)["message"]
+        self.assertIn("same disk", message)
+        never_safe(self, message)
+
+    def test_irreversible_plan_holds_one_adapter_kind_only(self):
+        self.purge_plan()
+        purge = self.plan["actions"][0]
+        backup = self.fixture_backup(purge)
+        for actions in ([purge, backup], [backup, purge]):
+            with self.subTest(order=[a["kind"] for a in actions]):
+                self.refused("plan-composition", lambda: self.engine.register_plan(self.sid, plan=dict(self.plan, plan_id="fictional-mixed", actions=actions)))
+        self.register(dict(self.plan, plan_id="fictional-two-purges", actions=[purge, dict(purge, action_id="fictional-action-2")]))
+        self.assertEqual(len(self.state()["plan"]["document"]["actions"]), 2)
+
+    def test_firmware_plan_has_exactly_one_device_action(self):
+        self.plan_ready()
+        backup = dict(self.plan["actions"][0], action_id="fictional-backup")
+        self.firmware_plan(2)
+        firmware = self.plan["actions"][0]
+        for actions in ([firmware, dict(firmware, action_id="fictional-firmware-2")], [firmware, backup], [backup, firmware]):
+            with self.subTest(actions=[a["action_id"] for a in actions]):
+                self.refused("plan-composition", lambda: self.engine.register_plan(self.sid, plan=dict(self.plan, plan_id="fictional-devices", actions=actions)))
+        self.assertEqual([a["action_id"] for a in self.state()["plan"]["document"]["actions"]], ["fictional-action"])
+
+    def test_firmware_reply_names_device_and_recovery_key(self):
+        self.plan_ready()
+        self.firmware_plan(7)
+        data = self.warn()
+        self.assertEqual((data["phrase"], data["number"], data["bytes"]), ("update firmware on device 7, I have my recovery key", 7, None))
+        for number, quote in enumerate(("update firmware on device 2, I have my recovery key", "update firmware on device 17, I have my recovery key",
+                                        "update firmware on device 7", "update firmware on device 7, I have my key", "delete 7 files", "yes")):
+            with self.subTest(refused=quote):
+                self.refused("typed-reply-mismatch", lambda: self.approve(quote, "firmware-refused-%d" % number))
+        self.approve("Update firmware on device 7, I have my recovery key.", "firmware-accepted")
+        reply = self.state()["approval"]["irreversible"]
+        self.assertEqual((reply["type"], reply["number"], reply["bytes"]), ("firmware_risk", 7, None))
+
+    def test_conditional_decisions_are_separate_and_never_policy_covered(self):
+        flagged = {"flags": ["install_scripts"], "conditional": {"run_install_scripts": ["example-helper@1.0.0"]}}
+        [action] = self.package_plan([flagged], automatic=True)
+        self.policy([action])
+        payload = self.payload(action)
+        self.assertFalse(engine_plans.policy_covers(self.state(), action, payload))
+        self.refused("conditional-decision-required", lambda: engine_plans.action_authorization(self.state(), action, payload))
+
+        def decide(decision, names, message_id):
+            # The facade line for this recorder lands with the engine facade; the module function is the same call.
+            return engine_plans.record_conditional_decision(self.engine, self.sid, action_id="a1", decision=decision, names=names,
+                                                            owner_quote="Yes, run the install scripts of example-helper 1.0.0.", owner_message_id=message_id)
+        for number, (decision, names) in enumerate((("run_install_scripts", ["other@1.0.0"]), ("runtime_line_change", []),
+                                                    ("run_install_scripts", ["Example-Helper"]), ("anything", []))):
+            with self.subTest(refused=(decision, names)):
+                self.refused("conditional-decision", lambda: decide(decision, names, "fictional-wrong-decision-%d" % number))
+        scope_id = self.state()["scope_authorization"]["message_id"]
+        self.refused("message-id-used", lambda: decide("run_install_scripts", ["example-helper@1.0.0"], scope_id))
+        row = decide("run_install_scripts", ["example-helper@1.0.0"], "fictional-scripts-decision")["data"]
+        self.assertEqual(encoded(dict(row, payload_sha256="0" * 64, recorded_utc=CLOCK)),
+                         b'{"action_id":"a1","decision":"run_install_scripts","message_id":"fictional-scripts-decision","names":["example-helper@1.0.0"],'
+                         b'"payload_sha256":"' + b"0" * 64 + b'","recorded_utc":"2026-01-02T03:04:05.000006Z"}')
+        self.assertEqual(row["payload_sha256"], action["adapter_payload_sha256"])
+        self.refused("conditional-decision", lambda: decide("run_install_scripts", ["example-helper@1.0.0"], "fictional-scripts-again"))
+        # The decision is its own record: the policy still never covers the action, and only the plan approval authorizes it.
+        self.assertFalse(engine_plans.policy_covers(self.state(), action, payload))
+        self.refused("workflow-refusal", lambda: engine_plans.action_authorization(self.state(), action, payload))
+        self.approve_ids(["a1"])
+        self.assertEqual(engine_plans.action_authorization(self.state(), action, payload)["kind"], "exact_plan")
+        self.refused("conditional-decision-required", lambda: engine_plans.action_authorization(self.state(), action, None))
+        # A new plan clears it; then the stage advance and begin refuse the flagged action.
+        self.register(dict(self.plan, plan_id="fictional-replanned"))
+        self.assertEqual(self.state()["conditional_decisions"], [])
+        self.approve_ids(["a1"])
+        self.refused("conditional-decision-required", lambda: self.engine.advance_stage(self.sid, evidence_ids=[]))
+        self.force_apply()
+        with self.assertRaises(WorkflowRefusal):
+            self.begin_id("a1")
+        self.assertEqual(self.state()["operations"], {})
+
+    def test_policy_never_covers_added_or_downgraded_packages(self):
+        actions = self.package_plan([{}, {"flags": ["adds_packages"]}, {"flags": ["downgrades"]}, {"flags": ["major_jump", "restart_likely"]}], automatic=True)
+        self.policy(actions)
+        state = self.state()
+        self.assertEqual([engine_plans.policy_covers(state, action, self.payload(action)) for action in actions], [True, False, False, True])
+        self.assertFalse(engine_plans.policy_covers(state, actions[0], None))
+        # The policy alone cannot carry the plan to the apply stage while a flagged item is in it; without them it can.
+        self.refused("workflow-refusal", lambda: self.engine.advance_stage(self.sid, evidence_ids=[]))
+        self.register(dict(self.plan, plan_id="fictional-unflagged", actions=[actions[0], actions[3]]))
+        self.assertEqual(self.engine.advance_stage(self.sid, evidence_ids=[])["data"]["stage"], "apply")
+
+    def test_policy_never_covers_high_risk_items(self):
+        actions = self.package_plan([{"flags": ["high_risk", "restart_likely"]}, {"flags": ["high_risk", "firmware"]}], automatic=True)
+        self.policy(actions)
+        state = self.state()
+        self.assertEqual([engine_plans.policy_covers(state, action, self.payload(action)) for action in actions], [False, False])
+        self.refused("workflow-refusal", lambda: self.engine.advance_stage(self.sid, evidence_ids=[]))
+        # Through begin: the policy binds the high-risk payload exactly, and begin still refuses it.
+        self.force_apply()
+        with self.assertRaises(WorkflowRefusal):
+            self.begin_id("a1")
+        self.assertEqual(self.state()["operations"], {})
+
+    def test_subset_approval_needs_its_dependencies(self):
+        self.package_plan([{}, {"depends_on": ["a1"]}, {"depends_on": []}, {}])
+        for approved in (["a2"], ["a4"], ["a2", "a3"], ["a1", "a2", "a4"], ["a3", "a4"]):
+            with self.subTest(refused=approved):
+                self.refused("approval-dependencies", lambda: self.approve_ids(approved))
+        self.assertIsNone(self.state()["approval"])
+        for approved in (["a1"], ["a3"], ["a1", "a2"], ["a1", "a3"], ["a1", "a2", "a3", "a4"]):
+            with self.subTest(accepted=approved):
+                self.approve_ids(approved)
+                self.assertEqual(self.state()["approval"]["action_ids"], approved)
+
+    def test_irreversible_plan_cannot_be_approved_in_part(self):
+        self.purge_plan()
+        purge = self.plan["actions"][0]
+        self.register(dict(self.plan, plan_id="fictional-two-purges", actions=[purge, dict(purge, action_id="fictional-action-2")]))
+        phrase = self.warn()["phrase"]
+        self.assertEqual(phrase, "delete 2 files")
+        for approved in (["fictional-action"], ["fictional-action-2"]):
+            with self.subTest(refused=approved):
+                self.refused("approval-whole", lambda: self.approve_ids(approved, quote=phrase))
+        self.assertIsNone(self.state()["approval"])
+        self.approve_ids(["fictional-action", "fictional-action-2"], quote=phrase)
+        self.assertEqual(self.state()["approval"]["irreversible"]["action_ids"], ["fictional-action", "fictional-action-2"])
+
+    def test_depends_on_names_only_earlier_actions_of_the_same_plan(self):
+        for payloads in ([{}, {"depends_on": ["a3"]}, {}], [{"depends_on": ["a1"]}], [{}, {"depends_on": ["a2"]}], [{}, {"depends_on": ["zz"]}],
+                         [{}, {"depends_on": ["a1", "a1"]}], [{}, {"depends_on": "a1"}], [{}, {"depends_on": [1]}]):
+            with self.subTest(refused=payloads):
+                self.refused("plan-depends-on", lambda: self.package_plan(payloads))
+        actions = self.package_plan([{}, {"depends_on": ["a1"]}, {"depends_on": []}, {"depends_on": ["a3", "a1"]}])
+        self.assertEqual([a["action_id"] for a in self.state()["plan"]["document"]["actions"]], [a["action_id"] for a in actions])
+
+    def test_message_id_used_in_another_session_refused(self):
+        # A non-typed decision: session A's scope message, reused as session B's plan approval or standing policy.
+        self.scope_ready()
+        scope_id = self.state()["scope_authorization"]["message_id"]
+        self.sid = self.engine.create_session(scope=self.scope, checkpoints=[], control="automatic")["session_id"]
+        self.plan_ready(automatic=True)
+        self.refused("message-id-used", lambda: self.approve_ids(["fictional-action"], scope_id))
+        expiry = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+        self.refused("message-id-used", lambda: self.engine.set_standing_policy(
+            self.sid, action_kinds=["backup_create"], targets=["Fictional component"], max_actions=1, expires_utc=expiry,
+            action_bindings=[{key: self.plan["actions"][0][key] for key in engine_decisions.BINDING_KEYS}], owner_quote="Allow it.",
+            owner_message_id=scope_id))
+        state = self.state()
+        self.assertEqual((state["approval"], state["standing_policy"]), (None, None))
+        self.assertNotIn(scope_id, state["used_message_ids"])
+
+    def test_subset_approved_plan_reaches_apply_and_verify(self):
+        self.engine.setup(self.sid, checkpoints=["before_action"])
+        self.plan_ready()
+        backup = self.plan["actions"][0]
+        self.register(dict(self.plan, plan_id="fictional-two-backups", actions=[backup, dict(backup, action_id="fictional-second-backup")]))
+        # Without depends_on the second backup needs the first; the first alone may be approved.
+        self.refused("approval-dependencies", lambda: self.approve_ids(["fictional-second-backup"]))
+        self.approve_ids(["fictional-action"])
+        self.engine.advance_stage(self.sid, evidence_ids=[])
+        pending = self.engine.resolve(self.sid)["data"]["pending"]
+        self.assertEqual([item["action_id"] for item in pending], ["fictional-action"])
+        self.engine.resolve(self.sid, pending_id=pending[0]["pending_id"], choice="continue", owner_quote="Continue with the first backup.",
+                            owner_message_id=self.message("subset-checkpoint"))
+        self.finish(self.begin())
+        # The left-out backup never gets a checkpoint; nothing approved remains, so the plan reaches verify and complete.
+        self.assertEqual(self.engine.resolve(self.sid)["data"]["pending"], [])
+        self.assertEqual(self.engine.advance_stage(self.sid, evidence_ids=[])["data"]["stage"], "verify")
+        data = self.verify_ids(["fictional-action"])["data"]
+        self.assertEqual((data["stage"], data["succeeded"], data["failed"], data["not_run"], data["excluded"]),
+                         ("complete", ["fictional-action"], [], [], ["fictional-second-backup"]))
+        self.assertEqual(self.state()["status"], "completed")
+
+    def test_batch_with_verified_failure_reaches_verify(self):
+        # The real finish path: the update route reports a checked failure of a1; a2 does not need it and runs; a3 needs it.
+        self.package_plan([{}, {"depends_on": []}, {"depends_on": ["a1"]}])
+        self.approve_ids(["a1", "a2", "a3"])
+        self.engine.advance_stage(self.sid, evidence_ids=[])
+        first = self.begin_id("a1")
+        self.finish_id(first, "a1", "failed", result="did_not_update", verified_postcondition=True, actual_effects_recorded=True,
+                       no_active_effects=True, recovery_retained=True)
+        self.assertEqual(self.state()["operations"][first]["resolution"]["kind"], "verified_failure")
+        self.finish_id(self.begin_id("a2"), "a2", result="updated", verified_postcondition=True)
+        self.assertEqual(self.engine.advance_stage(self.sid, evidence_ids=[])["data"]["stage"], "verify")
+        data = self.verify_ids(["a2"])["data"]
+        self.assertEqual((data["stage"], data["succeeded"], data["failed"], data["not_run"]), ("complete", ["a2"], ["a1"], ["a3"]))
+        self.assertEqual(self.state()["status"], "completed")
+
+    def test_begin_passes_the_bound_payload_to_policy_and_conditional_checks(self):
+        # The policy covers an unflagged update at begin, and a recorded conditional decision lets its flagged action begin.
+        [plain] = self.package_plan([{}], automatic=True)
+        self.policy([plain])
+        self.engine.advance_stage(self.sid, evidence_ids=[])
+        operation = self.begin_id("a1")
+        self.assertEqual(self.state()["operations"][operation]["authorization"]["kind"], "standing_policy")
+        self.finish_id(operation, "a1")
+        self.sid = self.engine.create_session(scope=self.scope, checkpoints=[])["session_id"]
+        self.package_plan([{"flags": ["runtime_line_change"], "conditional": {"runtime_line_change": []}}])
+        self.approve_ids(["a1"])
+        engine_plans.record_conditional_decision(self.engine, self.sid, action_id="a1", decision="runtime_line_change", names=[],
+                                                 owner_quote="Yes, move to the new runtime line.", owner_message_id=self.message("line"))
+        self.engine.advance_stage(self.sid, evidence_ids=[])
+        operation = self.begin_id("a1")
+        self.assertEqual(self.state()["operations"][operation]["authorization"]["kind"], "exact_plan")
+
+
+class PlanRuleTests(RuleHelpers, WorkflowFixture):
+    """The standing-policy rule, the binding rules, the stage rules and the resolve wording."""
+
+    def test_policy_covers_is_the_rule_in_session_authorization_uses(self):
+        actions = self.package_plan([{}, {"flags": ["high_risk"]}, {"flags": ["downgrades"]}], automatic=True)
+        self.policy(actions[:2])
+        state = self.state()
+        for action in actions:
+            payload = self.payload(action)
+            try:
+                authorized = engine_plans.action_authorization(state, action, payload)["kind"] == "standing_policy"
+            except WorkflowRefusal:
+                authorized = False
+            with self.subTest(action=action["action_id"]):
+                self.assertEqual(engine_plans.policy_covers(state, action, payload), authorized)
+        self.assertEqual(engine_plans.policy_covers(state, actions[0], self.payload(actions[0])), True)
+
+    def test_finished_paused_held_or_busy_session_never_covered(self):
+        [action] = self.package_plan([{}], automatic=True)
+        self.policy([action])
+        state, payload = self.state(), self.payload(action)
+        self.assertTrue(engine_plans.policy_covers(state, action, payload))
+        past = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat().replace("+00:00", "Z")
+        recorded = (datetime.now(timezone.utc) - timedelta(days=7, minutes=1)).isoformat().replace("+00:00", "Z")
+        open_operation = {"operation_id": "operation-open", "action_id": "fictional-other", "plan_sha256": state["plan"]["sha256"], "outcome": None}
+        changes = {"paused": {"status": "paused"}, "pause pending": {"status": "pause_pending"}, "held": {"status": "held"}, "stopped": {"status": "stopped"},
+                   "completed": {"status": "completed"}, "finished stage": {"stage": "complete"}, "an open operation": {"operations": {"operation-open": open_operation}},
+                   "guided control": {"settings": dict(state["settings"], control="guided")}, "no reviews": {"reviews": state["reviews"][:1]},
+                   "expired": {"standing_policy": dict(state["standing_policy"], expires_utc=past)},
+                   "over seven days": {"standing_policy": dict(state["standing_policy"], recorded_utc=recorded)},
+                   "used up": {"standing_policy": dict(state["standing_policy"], used_actions=5)},
+                   "another scope": {"standing_policy": dict(state["standing_policy"], scope_sha256="0" * 64)},
+                   "another settings revision": {"standing_policy": dict(state["standing_policy"], settings_revision=9)}}
+        for name, change in changes.items():
+            with self.subTest(refused=name):
+                self.assertFalse(engine_plans.policy_covers(dict(copy.deepcopy(state), **change), action, payload))
+        for name, changed in {"another target": dict(action, target="Other"), "another payload hash": dict(action, adapter_payload_sha256="0" * 64),
+                              "protected consent": dict(action, requires_os_consent=True)}.items():
+            with self.subTest(refused=name):
+                self.assertFalse(engine_plans.policy_covers(state, changed, payload))
+
+    def test_external_destination_only_for_a_backup_among_its_protected_roots(self):
+        self.plan_ready()
+        action = self.plan["actions"][0]
+        row = self.state()["evidence"][action["adapter_payload_evidence_id"]]
+        payload = json.loads((self.engine.work / self.sid / row["path"]).read_bytes())
+        outside = str(self.root / "fictional-external-drive")
+        external = dict(payload["storage_plan"], external=True, destination=outside)
+
+        def bind(value, base=action):
+            value = dict(value, storage_plan_sha256=digest(value["storage_plan"]))
+            changed = dict(base, adapter_payload_evidence_id=self.raw_evidence("adapter_payload", value), adapter_payload_sha256=digest(value),
+                           adapter_plan_sha256=value["storage_plan_sha256"])
+            return self.engine.action_binding(self.state(), changed)
+        self.assertEqual(bind(dict(payload, storage_plan=external, backup_destination=outside, protected_roots=[outside]))["backup_destination"], outside)
+        self.refused("backup-destination", lambda: bind(dict(payload, storage_plan=external, backup_destination=outside)))
+        with self.assertRaises(WorkflowRefusal):
+            bind(dict(payload, storage_plan=external, backup_destination=None, protected_roots=[outside]))
+        # Any other storage action that names a destination is refused, even one listed as protected.
+        self.sid = self.engine.create_session(scope=self.scope, checkpoints=[])["session_id"]
+        self.purge_plan(reviewed=False)
+        purge = self.plan["actions"][0]
+        purge_payload = json.loads((self.engine.work / self.sid / self.state()["evidence"][purge["adapter_payload_evidence_id"]]["path"]).read_bytes())
+        self.refused("storage-payload", lambda: bind(dict(purge_payload, backup_destination=outside, protected_roots=[outside]), purge))
+        # The work-tree rule for the output root holds for every action.
+        self.refused("workflow-refusal", lambda: bind(dict(purge_payload, output_root=outside), purge))
+
+    def test_output_containment_compares_parts_and_admits_the_work_tree_itself(self):
+        self.plan_ready()
+        action = self.plan["actions"][0]
+        payload = json.loads((self.engine.work / self.sid / self.state()["evidence"][action["adapter_payload_evidence_id"]]["path"]).read_bytes())
+
+        def bind(output_root, **extra):
+            value = dict(payload, output_root=output_root, **extra)
+            changed = dict(action, adapter_payload_evidence_id=self.raw_evidence("adapter_payload", value), adapter_payload_sha256=digest(value))
+            return self.engine.action_binding(self.state(), changed)
+        work = self.root / "work"
+        self.assertEqual(bind(str(work))["output_root"], str(work))  # a path equal to the work tree passes, as before
+        lookalike = self.root / "worK" / "fictional-output"  # KELVIN SIGN, not the letter k
+        self.refused("workflow-refusal", lambda: bind(str(lookalike)))
+        self.refused("workflow-refusal", lambda: bind(str(work / "out"), restore_probe_destination=str(work / "ouK" / "probe")))
+        self.assertEqual(bind(str(work / "out"), restore_probe_destination=str(work / "out"))["restore_probe_destination"], str(work / "out"))
+
+    def test_evidence_caps_are_read_from_the_journal_when_used(self):
+        with mock.patch.object(engine_journal, "EVIDENCE_MAX_BYTES", 8):
+            self.refused("workflow-refusal", lambda: self.engine.register_evidence(self.sid, evidence_id="fictional-capped", content=b"123456789",
+                                                                                  kind="fixture", scope=self.scope))
+        self.assertNotIn("fictional-capped", self.state()["evidence"])
+        self.engine.register_evidence(self.sid, evidence_id="fictional-capped", content=b"123456789", kind="fixture", scope=self.scope)
+
+    def test_shown_command_only_for_updates_and_repairs_and_bounded(self):
+        [update] = self.package_plan([{}])
+        state = self.state()
+        plan = dict(self.plan, actions=[dict(update, rendered_command="winget upgrade --id Example.Editor --exact --version 2.1.0")])
+        engine_plans.validate_plan_document(state, plan)
+        engine_plans.validate_plan_document(state, dict(plan, actions=[dict(update, rendered_command="x" * 500)]))
+        for name, value in {"too long": "x" * 501, "not text": ["winget"], "blank": " ", "a control character": "winget\x1bupgrade"}.items():
+            with self.subTest(refused=name), self.assertRaises(WorkflowRefusal):
+                engine_plans.validate_plan_document(state, dict(plan, actions=[dict(update, rendered_command=value)]))
+        backup = self.fixture_backup(update)
+        self.refused("rendered-command", lambda: engine_plans.validate_plan_document(state, dict(plan, actions=[dict(backup, rendered_command="copy")])))
+
+    def test_apply_reaches_verify_when_every_run_action_succeeded_or_failed_verifiably(self):
+        self.plan_ready()
+        backup = self.plan["actions"][0]
+        self.register(dict(self.plan, plan_id="fictional-two-backups", actions=[backup, dict(backup, action_id="fictional-second-backup")]))
+        self.approve_ids(["fictional-action", "fictional-second-backup"])
+        self.engine.advance_stage(self.sid, evidence_ids=[])
+        operation = self.begin()
+        self.finish(operation, "failed")
+
+        def settle(kind):
+            def mutate(state):
+                op = state["operations"][operation]
+                op["resolution"] = {"kind": kind, "evidence_ids": op["evidence_ids"], "recorded_utc": op["finished_utc"], "owner_message_id": None}
+                state["pending"]["reconcile-" + operation]["resolved"] = True
+                state["status"] = "active"
+                return {}, "Fictional resolution, as the update route records a checked failure."
+            self.engine.change(self.sid, "fictional_resolution", mutate, None)
+        settle("effects_accounted")
+        # Only a checked failure lets the batch reach verification; its dependent never ran.
+        self.refused("workflow-refusal", lambda: self.engine.advance_stage(self.sid, evidence_ids=[]))
+        settle("verified_failure")
+        self.assertEqual(self.engine.advance_stage(self.sid, evidence_ids=[])["data"]["stage"], "verify")
+        data = self.verify_ids([])["data"]
+        self.assertEqual((data["succeeded"], data["failed"], data["not_run"], data["excluded"]), ([], ["fictional-action"], ["fictional-second-backup"], []))
+
+    def test_warning_message_comes_from_the_text_cards(self):
+        # Stand-ins for engine_text's cards: the message ends with the deletion card, or the firmware card of that device.
+        self.purge_plan()
+        with mock.patch.object(engine_text, "deletion_warning", side_effect=lambda warning, **details: "Deletion card: %d" % warning["number"]):
+            self.assertTrue(self.engine.issue_irreversible_warning(self.sid, plan_sha256=self.plan_hash)["message"].endswith("Deletion card: 1"))
+        self.firmware_plan(3)
+        with mock.patch.object(engine_text, "firmware_warning", side_effect=lambda warning, **details: "Firmware card: %d" % warning["number"]):
+            self.assertTrue(self.engine.issue_irreversible_warning(self.sid, plan_sha256=self.plan_hash)["message"].endswith("Firmware card: 3"))
+
+    def test_warning_message_is_the_text_card_of_the_deletion_or_the_firmware_update(self):
+        self.purge_plan()
+        message = self.engine.issue_irreversible_warning(self.sid, plan_sha256=self.plan_hash)["message"]
+        self.assertTrue(message.endswith(engine_text.deletion_warning(self.state()["irreversible_warning"])))
+        self.firmware_plan(3)
+        message = self.engine.issue_irreversible_warning(self.sid, plan_sha256=self.plan_hash)["message"]
+        self.assertTrue(message.endswith(engine_text.firmware_warning(self.state()["irreversible_warning"], platform="unknown", version="1.2.3")))
+
+    def test_resolve_wording_and_no_restart_choice(self):
+        self.apply_ready()
+        operation = self.begin()
+        self.finish(operation, "failed")
+        response = self.engine.resolve(self.sid)
+        self.assertIn("These items need your decision or a check of what actually happened. Resolving one never marks an action as done and never "
+                      "runs it again. A stopped job stays stopped while its results are recorded.\n- ", response["message"])
+        self.assertEqual(response["data"]["choices"], ["continue", "revise_plan", "keep_held"])
+
+        def restart_item(state):
+            state["pending"]["restart-" + operation] = {"pending_id": "restart-" + operation, "kind": "restart", "operation_id": operation,
+                                                        "created_utc": pc_records.utc_now(), "resolved": False, "settings_revision": state["settings_revision"]}
+            return {}, "Fictional restart item."
+        self.engine.change(self.sid, "fictional_restart_item", restart_item, None)
+        self.assertNotIn("defer", self.engine.resolve(self.sid)["data"]["choices"])
+        # No pending item asks the owner for a restart decision.
+        self.refused("workflow-refusal", lambda: self.engine.resolve(self.sid, pending_id="restart-" + operation, choice="defer",
+                                                                     owner_quote="Restart later.", owner_message_id=self.message("restart")))
+        self.assertFalse(self.state()["pending"]["restart-" + operation]["resolved"])
+
+    def test_resolve_and_replan_record_the_real_source(self):
+        self.engine.setup(self.sid, checkpoints=["plan"])
+        self.apply_ready()
+        checkpoint = self.engine.resolve(self.sid)["data"]["pending"][0]["pending_id"]
+        self.engine.resolve(self.sid, pending_id=checkpoint, choice="continue", owner_quote="Continue.", owner_message_id=self.message("terminal-checkpoint"),
+                            source="current_owner_terminal")
+        self.assertEqual(self.state()["pending"][checkpoint]["owner_instruction"]["source"], "current_owner_terminal")
+        operation = self.begin()
+        self.finish(operation, "failed")
+        evidence = self.evidence("reconciliation", {"operation_id": operation, "action_id": "fictional-action", "plan_sha256": self.plan_hash, "outcome": "failed",
+                                                    "actual_effects_recorded": True, "no_active_effects": True, "recovery_retained": True})
+        item = "reconcile-" + operation
+        self.engine.resolve(self.sid, pending_id=item, choice="revise_plan", evidence_ids=[evidence], owner_quote="Prepare a new plan.",
+                            owner_message_id=self.message("terminal-replan"), source="current_owner_terminal")
+        self.assertEqual(self.state()["pending"][item]["owner_instruction"]["source"], "current_owner_terminal")
+
+    def test_every_recorder_defaults_to_the_session_owner(self):
+        for function in (engine_plans.authorize_scope, engine_plans.approve_plan, engine_plans.record_irreversible_ack, engine_plans.set_standing_policy,
+                         engine_plans.resolve, engine_plans.complete_assessment, engine_plans.record_conditional_decision):
+            with self.subTest(function=function.__name__):
+                self.assertIsNone(inspect.signature(function).parameters["owner_id"].default)
+        # A session whose owner is not called "owner" approves without naming its owner.
+        self.sid = self.engine.create_session(scope=self.scope, checkpoints=[], owner_id="fictional-person")["session_id"]
+        self.plan_ready()
+        self.approve_ids(["fictional-action"])
+        self.assertEqual(self.state()["approval"]["owner_id"], "fictional-person")
+        self.refused("workflow-refusal", lambda: self.engine.approve_plan(self.sid, plan_sha256=self.plan_hash, action_ids=["fictional-action"],
+                                                                          owner_quote="Approve.", owner_message_id=self.message("other"), owner_id="owner"))
+
+
+class FollowupPlanTests(RuleHelpers, WorkflowFixture):
+    """The one follow-up plan that removes originals after this session's checked backup."""
+
+    def test_followup_removal_plan_only_after_verified_backup(self):
+        plan_sha256 = self.backed_up(verify=False)
+        recovery = self.backup_recovery(plan_sha256)
+        # Before verification (the apply stage) no follow-up plan is accepted.
+        self.refused("followup-plan", lambda: self.engine.register_plan(self.sid, plan=self.followup(recovery)))
+        self.engine.advance_stage(self.sid, evidence_ids=[])
+        response = self.register_followup(self.followup(recovery))
+        state = self.state()
+        self.assertEqual((state["stage"], state["reviews"], state["approval"], state["irreversible_warning"]), ("plan", [], None, None))
+        self.assertEqual(response["data"]["followup"]["read_only_files"], [])
+        # A second follow-up, or any later plan, is refused.
+        self.refused("followup-plan", lambda: self.engine.register_plan(self.sid, plan=self.followup(self.backup_recovery(plan_sha256))))
+        self.refused("followup-plan", lambda: self.engine.register_plan(self.sid, plan=dict(self.plan, plan_id="fictional-other")))
+        # Fresh reviews, then one typed reply after the engine's warning: never a plain yes, never a second acknowledgment.
+        self.review_current()
+        action_id = self.plan["actions"][0]["action_id"]
+        phrase = self.engine.issue_irreversible_warning(self.sid, plan_sha256=self.plan_hash)["data"]["phrase"]
+        self.assertEqual(phrase, "delete 1 files")
+        self.refused("typed-reply-mismatch", lambda: self.approve_ids([action_id], quote="yes"))
+        self.refused("typed-reply-required", lambda: self.engine.record_irreversible_ack(
+            self.sid, plan_sha256=self.plan_hash, action_ids=[action_id], acknowledge_irreversible_loss=True, owner_quote="I accept the loss.",
+            owner_message_id=self.message("separate-ack")))
+        self.approve_ids([action_id], quote=phrase)
+        self.assertEqual(self.state()["approval"]["irreversible"]["type"], "permanent_data_loss")
+        self.assertEqual(self.engine.advance_stage(self.sid, evidence_ids=[])["data"]["stage"], "apply")
+
+    def test_followup_plan_refused_after_partial_backup(self):
+        plan_sha256 = self.backed_up()
+        for receipt in ({"outcome": "partial"}, {"durable": False}, {"durable": None}, {"outcome": None}):
+            with self.subTest(receipt=receipt):
+                self.refused("followup-receipt", lambda: self.engine.register_plan(self.sid, plan=self.followup(self.backup_recovery(plan_sha256, **receipt))))
+        self.assertNotIn(pc_records.ADAPTER_STORAGE_REMOVE_ORIGINALS, [a["adapter_id"] for a in self.state()["plan"]["document"]["actions"]])
+        self.register_followup(self.followup(self.backup_recovery(plan_sha256)))
+
+    def test_followup_actions_consume_this_sessions_backup_receipt(self):
+        self.backed_up()
+        # The fixture's other verified recovery names a backup that this session's plan never made.
+        self.refused("followup-receipt", lambda: self.engine.register_plan(self.sid, plan=self.followup(self.verified_recovery())))
+        self.refused("followup-receipt", lambda: self.engine.register_plan(self.sid, plan=self.followup(self.backup_recovery("0" * 64))))
+        self.assertEqual(self.state()["stage"], "verify")
+
+    def test_followup_plan_shows_disk_sync_and_read_only_state(self):
+        plan_sha256 = self.backed_up()
+        rows = [{"root_id": "fictional-root", "relative_path": "sample.bin", "size": 31, "sha256": "0" * 64, "read_only": True}]
+        self.refused("followup-read-only", lambda: self.engine.register_plan(self.sid, plan=self.followup(
+            self.backup_recovery(plan_sha256), [dict(rows[0], read_only=None)])))
+        response = self.register_followup(self.followup(self.backup_recovery(plan_sha256, sources_synced=["OneDrive"], disk_relation="unknown"), rows))
+        notes = response["data"]["followup"]["notes"]
+        self.assertEqual(notes, ["This backup may be on the same disk as the originals; if that disk fails, both copies are lost.",
+                                 "This also removes them from OneDrive on all devices.", "1 of these files are read-only; the plan removes them too."])
+        self.assertEqual(response["data"]["followup"]["read_only_files"], [{"root_id": "fictional-root", "relative_path": "sample.bin"}])
+        self.assertTrue(all(note in response["message"] for note in notes))
+        self.review_current()
+        warning = self.engine.issue_irreversible_warning(self.sid, plan_sha256=self.plan_hash)["message"]
+        self.assertTrue(all(note in warning for note in notes[:2]))
+        # A backup proven to be on a different disk needs no disk warning.
+        self.sid = self.engine.create_session(scope=self.scope, checkpoints=[])["session_id"]
+        plan_sha256 = self.backed_up()
+        notes = self.register_followup(self.followup(self.backup_recovery(plan_sha256, disk_relation="different")))["data"]["followup"]["notes"]
+        self.assertEqual(notes, [])
+
+
+def later(hours):
+    """A patch of pc_records.utc_now under which the test's clock reads ``hours`` later and still moves forward."""
+    current = pc_records.utc_now
+    return mock.patch("pc_records.utc_now", side_effect=lambda: (pc_records.parse_utc(current()) + timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%S.%fZ"))
+
+
+class PackageActionTests(TypedReplyHelpers, WorkflowFixture):
+    """Update and repair actions through the real package binding, begin and finish: each plan binds a frozen golden payload,
+    so nothing is patched between the plan and the engine."""
+
+    def golden_plan(self, adapter_id=pc_records.ADAPTER_PACKAGE_UPGRADE):
+        """Register and review one action of ``adapter_id`` as the service prepares it (its reviewed transaction, no recovery);
+        returns the action."""
+        self.plan_ready()
+        payload = dict(variants()["process_winget_upgrade"]["payload"], operation=engine_updates.OPERATIONS[adapter_id])
+        inventory = {"fictional": True, "packages": 1}
+        facts = pc_records.ADAPTERS[adapter_id]
+        action = dict(self.plan["actions"][0], kind=facts["kinds"][0], adapter_id=adapter_id, requires_os_consent=facts["os_consent"] == "always",
+                      adapter_payload_evidence_id=self.raw_evidence("adapter_payload", payload), adapter_payload_sha256=digest(payload),
+                      adapter_plan_sha256=payload["transaction_sha256"], target_inventory_evidence_id=self.raw_evidence("inventory", inventory),
+                      target_inventory_sha256=digest(inventory))
+        self.register(dict(self.plan, actions=[action]))
+        self.assertEqual((action["requires_recovery"], action["recovery_evidence_ids"]), (False, []))
+        return action
+
+    def approved(self):
+        self.approve("Approve this exact fictional action.", "fictional-package-" + uuid.uuid4().hex)
+        self.engine.advance_stage(self.sid, evidence_ids=[])
+
+    def operation_facts(self, operation, outcome="unknown", **facts):
+        return {"operation_id": operation, "action_id": "fictional-action", "plan_sha256": self.plan_hash, "outcome": outcome, **facts}
+
+    def restart_read(self, operation, signal="required"):
+        """Record the restart signal ``signal``, as a route reads it from the reboot-required file."""
+        self.engine.record_restart_pending(self.sid, operation_id=operation, evidence_id=self.evidence(
+            "outcome", self.operation_facts(operation, restart_signal=signal, restart_source="linux.reboot_required")))
+
+    def waiting(self):
+        """An approved golden action whose operation waits for its restart: (action, operation id)."""
+        action = self.golden_plan()
+        self.approved()
+        operation = self.begin_action()
+        self.restart_read(operation)
+        return action, operation
+
+    def boot(self, operation):
+        """Record a boot seen now, the fresh observation the step needs after its restart."""
+        observed = pc_records.utc_now()
+        record = {"schema": "patchcairn.boot.observation", "schema_version": 1, "last_boot_utc": observed, "boot_id": "fictional-boot-after",
+                  "observed_utc": observed, "source": "fictional_probe"}
+        self.engine.record_boot_observation(self.sid, operation_id=operation, evidence_id=self.evidence(
+            "outcome", self.operation_facts(operation), observed_utc=observed, content=encoded(record)))
+
+    def test_a_repair_begins_without_a_backup_receipt(self):
+        self.golden_plan(pc_records.ADAPTER_PACKAGE_REINSTALL)
+        self.approved()
+        operation = self.begin_action()
+        self.assertEqual(self.state()["operations"][operation]["adapter_id"], pc_records.ADAPTER_PACKAGE_REINSTALL)
+
+    def test_system_repair_keeps_its_own_acknowledgment(self):
+        self.golden_plan(pc_records.ADAPTER_SYSTEM_REPAIR)
+        self.approved()
+        with self.assertRaisesRegex(WorkflowRefusal, "This step still needs your own separate go-ahead"):
+            self.begin_action()
+        self.assertFalse(self.state()["operations"])
+        self.engine.record_irreversible_ack(self.sid, plan_sha256=self.plan_hash, action_ids=["fictional-action"], acknowledge_irreversible_loss=True,
+                                            owner_quote="I accept that this repair cannot be rolled back.", owner_message_id="fictional-ack-" + uuid.uuid4().hex)
+        self.assertEqual(self.state()["irreversible_ack"]["type"], "no_component_rollback")
+        self.assertTrue(self.begin_action())
+
+    def test_step_finishes_after_a_long_wait_for_its_restart(self):
+        action, operation = self.waiting()
+        with later(25):
+            # The original binding holds without the age limit; a new launch of the same action is stale.
+            self.refused("stale-evidence", lambda: self.engine.action_binding(self.state(), action))
+            payload = self.engine.action_binding(self.state(), action, operation_id=operation)
+            self.assertEqual(digest(payload), action["adapter_payload_sha256"])
+            # What the step finds now is observed fresh, and the step closes once.
+            self.boot(operation)
+            self.assertEqual(self.engine.action_binding(self.state(), action, operation_id=operation), payload)
+            evidence = self.evidence("outcome", self.operation_facts(operation, "succeeded", result="updated", verified_postcondition=True))
+            self.engine.finish_operation(self.sid, operation_id=operation, outcome="succeeded", evidence_ids=[evidence], summary="Checked after the restart")
+            self.assertEqual(self.state()["operations"][operation]["outcome"], "succeeded")
+            self.assertEqual(self.engine.action_binding(self.state(), action, operation_id=operation), payload)
+
+    def test_only_an_action_that_ran_skips_the_age_limit(self):
+        action = self.golden_plan()
+        self.approved()
+        read = lambda state, operation_id: self.engine.action_binding(state, action, operation_id=operation_id)
+        self.refused("consumed-binding", lambda: read(self.state(), "operation-" + "0" * 32))
+        operation = self.begin_action()
+        # Open with no restart marker: its run may not have started, so it is still a new launch.
+        self.refused("consumed-binding", lambda: read(self.state(), operation))
+        self.restart_read(operation)
+        self.assertTrue(read(self.state(), operation))
+        changed = {"another action": lambda state: state["plan"]["document"]["actions"][0].update(action_id="fictional-other"),
+                   "another plan": lambda state: state["plan"].update(sha256="0" * 64),
+                   "no plan": lambda state: state.update(plan=None),
+                   "other settings": lambda state: state.update(settings_revision=state["settings_revision"] + 1),
+                   "another adapter": lambda state: state["operations"][operation].update(adapter_id=pc_records.ADAPTER_PACKAGE_REINSTALL),
+                   "another action id": lambda state: state["operations"][operation].update(action_id="fictional-other")}
+        for name, change in changed.items():
+            state = self.state()
+            change(state)
+            with self.subTest(change=name):
+                self.refused("consumed-binding", lambda: read(state, operation))
+
+    def test_consumed_action_still_checks_its_hashes_scope_and_kind(self):
+        action, operation = self.waiting()
+        row = action["adapter_payload_evidence_id"]
+        changed = {"row hash": lambda state: state["evidence"][row].update(sha256="0" * 64),
+                   "row kind": lambda state: state["evidence"][row].update(kind="inventory"),
+                   "row settings": lambda state: state["evidence"][row].update(settings_revision=state["settings_revision"] + 1),
+                   "scope": lambda state: state["evidence"][row]["scope"].update(purpose="Another fictional purpose")}
+        with later(25):
+            for name, change in changed.items():
+                state = self.state()
+                change(state)
+                with self.subTest(change=name):
+                    self.refused("workflow-refusal", lambda: self.engine.action_binding(state, action, operation_id=operation))
+
+    def test_consumed_backup_is_not_asked_for_an_absent_probe(self):
+        # The restore probe exists once the backup ran; only a new launch needs it absent.
+        self.plan_ready()
+        plan = copy.deepcopy(self.plan)
+        action = plan["actions"][0]
+        row = self.state()["evidence"][action["adapter_payload_evidence_id"]]
+        payload = json.loads((self.engine.work / self.sid / row["path"]).read_bytes())
+        destination = self.root / "work" / "fictional-artifacts" / "new-probe"
+        payload["restore_probe_destination"] = str(destination)
+        action.update(adapter_payload_evidence_id=self.raw_evidence("adapter_payload", payload), adapter_payload_sha256=digest(payload))
+        self.register(plan)
+        self.approved()
+        operation = self.begin_action()
+        self.finish(operation)
+        destination.mkdir(parents=True)
+        self.refused("workflow-refusal", lambda: self.engine.action_binding(self.state(), action))
+        self.assertEqual(self.engine.action_binding(self.state(), action, operation_id=operation), payload)
+
+    def restart_failure(self, then):
+        """Run the fixture's action, its restart signal, ``then`` (given the operation), and a failed result; returns the operation."""
+        self.apply_ready()
+        operation = self.begin()
+        self.restart_read(operation)
+        then(operation)
+        self.finish(operation, "failed")
+        return operation
+
+    def replan(self, operation):
+        evidence = self.evidence("reconciliation", self.operation_facts(operation, "failed", actual_effects_recorded=True, no_active_effects=True,
+                                                                        recovery_retained=True))
+        return self.engine.resolve(self.sid, pending_id="reconcile-" + operation, choice="revise_plan", evidence_ids=[evidence], owner_quote="Prepare a new plan.",
+                                   owner_message_id="fictional-replan-" + uuid.uuid4().hex)
+
+    def test_resolve_counts_a_signal_gone_on_a_second_read_as_no_restart(self):
+        operation = self.restart_failure(lambda operation: self.restart_read(operation, "none"))
+        self.replan(operation)
+        self.assertEqual(self.state()["operations"][operation]["resolution"]["kind"], "replan_required")
+
+    def test_resolve_accepts_the_observed_boot(self):
+        operation = self.restart_failure(self.boot)
+        self.replan(operation)
+        self.assertEqual(self.state()["operations"][operation]["resolution"]["kind"], "replan_required")
+
+    def test_resolve_holds_while_the_restart_waits(self):
+        self.apply_ready()
+        operation = self.begin()
+        self.restart_read(operation)
+
+        def failed(state):
+            # Finish refuses this state, so only a state from elsewhere reaches the check in resolve.
+            state["operations"][operation].update(outcome="failed", finished_utc=pc_records.utc_now())
+            state["pending"]["reconcile-" + operation] = {"pending_id": "reconcile-" + operation, "kind": "reconciliation", "operation_id": operation,
+                                                          "created_utc": pc_records.utc_now(), "resolved": False,
+                                                          "settings_revision": state["settings_revision"]}
+            return {}, "Fictional failure."
+        self.engine.change(self.sid, "fictional_failure", failed, None)
+        with self.assertRaisesRegex(WorkflowRefusal, "still needs actual boot accounting"):
+            self.replan(operation)
+        self.assertIsNone(self.state()["operations"][operation]["resolution"])
+
+
+class PreparedRepairTests(SessionFixtures):
+    """Repair actions from the real service preparation into the real engine."""
+
+    def test_prepared_repairs_register_with_no_recovery_evidence(self):
+        for adapter_id in (pc_records.ADAPTER_PACKAGE_REINSTALL, pc_records.ADAPTER_SYSTEM_REPAIR):
+            with self.subTest(adapter_id=adapter_id):
+                sid = self.session(job="diagnosis_repair", platform="linux")
+                with registered(fake_route()):
+                    actions = self.service.prepare_package_action(sid, adapter_id=adapter_id, items=[{"action_id": "fictional-repair", "manager": "pip", "id": "tool-a"}],
+                                                                  probe=RunProbe(), launcher=FakeLauncher(), **PROSE)
+                self.assertEqual((actions[0]["requires_recovery"], actions[0]["recovery_evidence_ids"]), (False, []))
+                plan = {"plan_id": "fictional-repair-plan", "summary": "Fictional repair", "evidence_ids": [actions[0]["target_inventory_evidence_id"]],
+                        "actions": actions}
+                self.assertEqual(self.engine.register_plan(sid, plan=plan)["data"]["action_ids"], ["fictional-repair"])
+
+
+class LeftOutActionTests(RuleHelpers, WorkflowFixture):
+    """An action the owner left out never runs, and a policy-only session keeps plan order (real engine, real begin)."""
+
+    def test_a_later_narrower_approval_refuses_the_left_out_action(self):
+        actions = self.package_plan([{}, {}], automatic=True)
+        self.policy(actions)
+        self.approve_ids(["a1"])
+        self.engine.advance_stage(self.sid, evidence_ids=[])
+        self.finish_id(self.begin_id("a1"), "a1")
+        before = set(self.state()["operations"])
+        self.refused("approval-left-out", lambda: self.begin_id("a2"))
+        self.assertEqual(set(self.state()["operations"]), before)
+        self.refused("approval-left-out", lambda: engine_plans.action_authorization(self.state(), actions[1], self.payload(actions[1])))
+        self.assertEqual(self.engine.advance_stage(self.sid, evidence_ids=[])["data"]["stage"], "verify")
+        data = self.verify_ids(["a1"])["data"]
+        self.assertEqual((data["succeeded"], data["excluded"]), (["a1"], ["a2"]))
+
+    def test_a_policy_only_session_keeps_plan_order(self):
+        actions = self.package_plan([{"depends_on": []}, {"depends_on": []}], automatic=True)
+        self.policy(actions)
+        self.engine.advance_stage(self.sid, evidence_ids=[])
+        before = set(self.state()["operations"])
+        with self.assertRaisesRegex(WorkflowRefusal, "exact reviewed order"):
+            self.begin_id("a2")
+        self.assertEqual(set(self.state()["operations"]), before)
+        operation = self.begin_id("a1")
+        self.assertEqual(self.state()["operations"][operation]["authorization"]["kind"], "standing_policy")
+        self.finish_id(operation, "a1")
+        second = self.begin_id("a2")
+        self.assertEqual(self.state()["operations"][second]["authorization"]["kind"], "standing_policy")
+
+
+class ExpiredActionTests(RuleHelpers, WorkflowFixture):
+    """An approved action past the evidence limit can never start, so it no longer blocks the end of the job."""
+
+    def later(self, hours):
+        return (datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat().replace("+00:00", "Z")
+
+    def test_an_approved_action_past_the_limit_ends_as_not_run(self):
+        self.package_plan([{}, {}])
+        self.approve_ids(["a1", "a2"])
+        self.engine.advance_stage(self.sid, evidence_ids=[])
+        self.finish_id(self.begin_id("a1"), "a1")
+        self.refused("workflow-refusal", lambda: self.engine.advance_stage(self.sid, evidence_ids=[]))  # a2 can still start
+        with mock.patch.object(pc_records, "utc_now", return_value=self.later(25)):
+            self.refused("stale-evidence", lambda: self.engine.action_binding(self.state(), self.plan["actions"][1]))
+            self.assertEqual(self.engine.advance_stage(self.sid, evidence_ids=[])["data"]["stage"], "verify")
+            data = self.verify_ids(["a1"])["data"]
+        self.assertEqual((data["stage"], data["succeeded"], data["not_run"], data["excluded"]), ("complete", ["a1"], ["a2"], []))
+        self.assertEqual(self.state()["status"], "completed")
+
+    def test_a_refusal_other_than_age_still_blocks(self):
+        self.package_plan([{}, {}])
+        self.approve_ids(["a1", "a2"])
+        self.engine.advance_stage(self.sid, evidence_ids=[])
+        self.finish_id(self.begin_id("a1"), "a1")
+        with mock.patch.object(pc_records, "fresh", side_effect=pc_records.Refusal("fictional-other", "Fictional refusal")):
+            with self.assertRaises(pc_records.Refusal) as caught:
+                self.engine.advance_stage(self.sid, evidence_ids=[])
+        self.assertEqual(caught.exception.code, "fictional-other")
+
+
+class WordingTests(RuleHelpers, WorkflowFixture):
+    def test_consent_sentences_claim_no_system_prompt_as_a_check(self):
+        actions = self.package_plan([{}], automatic=True)
+        self.policy(actions)
+        approved = self.approve_ids(["a1"])["message"]
+        self.assertIn("Your approval is recorded for exactly these changes. I check again just before each one, and your computer may still ask you to "
+                      "confirm.", approved)
+        expiry = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+        policy = self.engine.set_standing_policy(self.sid, action_kinds=["update"], targets=[actions[0]["target"]],
+                                                 action_bindings=[{key: actions[0][key] for key in engine_decisions.BINDING_KEYS}], max_actions=1,
+                                                 expires_utc=expiry, owner_quote="Allow this exact fictional update.",
+                                                 owner_message_id=self.message("policy"))["message"]
+        self.assertIn("Your limited standing policy is recorded. Each exact plan still needs two assistant review passes, fresh checks and all selected "
+                      "checkpoints. It never covers a step that needs your own reply or your own action.", policy)
+        for text in (approved, policy):
+            self.assertNotIn("consent", text.lower())
+
+    def test_a_wrong_typed_reply_says_nothing_happened_and_never_to_type_it_for_them(self):
+        phrase = self.purge_plan()
+        self.warn()
+        with self.assertRaises(WorkflowRefusal) as caught:
+            self.approve("yes", "fictional-plain-yes")
+        self.assertEqual(caught.exception.code, "typed-reply-mismatch")
+        self.assertEqual(str(caught.exception), "That reply is not the phrase, so nothing was approved and nothing changed. Ask the person to type it "
+                                                "themselves; never type it for them: " + phrase)
+
+    def test_resolve_with_nothing_open_and_a_reconciled_item_read_plainly(self):
+        self.apply_ready()
+        operation = self.begin()
+        self.finish(operation, "failed")
+        rows = self.evidence("reconciliation", {"operation_id": operation, "action_id": "fictional-action", "plan_sha256": self.plan_hash, "outcome": "failed"})
+        response = self.engine.resolve(self.sid, pending_id="reconcile-" + operation, evidence_ids=[rows], choice="keep_held")
+        self.assertTrue(response["message"].endswith("Recorded. No step was repeated."), response["message"])
+
+    def test_retired_restart_decision_is_refused(self):
+        def plant(state):
+            operation = next(iter(state["operations"].values()))
+            operation["restart_decision"] = {"choice": "defer"}
+            return {}, "Fictional leftover"
+        self.apply_ready()
+        self.begin()
+        with self.assertRaises(WorkflowRefusal):
+            self.engine.change(self.sid, "fictional_leftover", plant, None)
+        self.assertNotIn("restart_decision", next(iter(self.state()["operations"].values())))
+
+
+class ReleaseWarningTests(TypedReplyHelpers, WorkflowFixture):
+    """The warning of a release, through the real issue_irreversible_warning with a bound storage plan."""
+
+    def release_plan(self, notes):
+        self.plan_ready()
+        records = {"entries": [{"name": "retention-fictional", "sha256": "a" * 64}]}
+        lower = {"schema": "patchcairn.storage", "schema_version": 1, "kind": "retention_release", "records": records, "notes": notes,
+                 "rows": [{"name": "retention-fictional", "sha256": "a" * 64, "kind": "backup", "location": "D:\\Fictional\\kept", "size": 2_000_000,
+                           "only_copy_files": 5}], "fixture": True}
+        payload = {"schema": "patchcairn.storage.adapter", "schema_version": 1, "operation": "storage.retention_release", "storage_plan": lower,
+                   "storage_plan_sha256": digest(lower), "output_root": str(self.root / "work" / "output-release"), "mode": "fixture", "protected_roots": [],
+                   "delete_count": 1, "delete_bytes": 2_000_000}
+        plan = copy.deepcopy(self.plan)
+        plan["actions"][0].update(kind="retention_release", adapter_id=payload["operation"], adapter_payload_evidence_id=self.raw_evidence("adapter_payload", payload),
+                                  adapter_payload_sha256=digest(payload), adapter_plan_sha256=digest(lower),
+                                  target_inventory_evidence_id=self.raw_evidence("inventory", records), target_inventory_sha256=digest(records),
+                                  requires_recovery=False, recovery_evidence_ids=[])
+        self.register(plan)
+
+    def test_the_only_copy_note_and_the_rows_reach_the_warning(self):
+        note = "This backup is the only copy of 5 files: their originals were removed on 2026-01-02."
+        self.release_plan([note])
+        message = self.engine.issue_irreversible_warning(self.sid, plan_sha256=self.plan_hash)["message"]
+        self.assertIn(note, message)
+        self.assertIn('- Backup: "D:\\Fictional\\kept" (about 2.0 MB)', message)
+        self.assertLess(message.find("Watch out:"), message.find(note))
+        self.assertLess(message.find(note), message.find("Your reply:"))
+
+    def test_firmware_warning_gets_the_session_platform_and_the_route_flags(self):
+        self.plan_ready()
+        with mock.patch.object(engine_updates, "update_binding"):
+            payload = {"fictional_firmware": True, "flags": ["dual_image"], "device": {"id": "fictional-device", "number": 3, "target_version": "1.2.3"}}
+            inventory = {"fictional": True, "devices": 1}
+            plan = copy.deepcopy(self.plan)
+            plan["actions"][0].update(kind="firmware_update", adapter_id=pc_records.ADAPTER_SYSTEM_FIRMWARE_UPDATE, requires_os_consent=False,
+                                      requires_recovery=False, recovery_evidence_ids=[], adapter_payload_evidence_id=self.raw_evidence("adapter_payload", payload),
+                                      adapter_payload_sha256=digest(payload), adapter_plan_sha256=digest({"fictional": "firmware plan"}),
+                                      target_inventory_evidence_id=self.raw_evidence("inventory", inventory), target_inventory_sha256=digest(inventory))
+            self.register(plan)
+            with mock.patch.object(engine_text, "firmware_warning", return_value="Fictional card") as card:
+                self.engine.issue_irreversible_warning(self.sid, plan_sha256=self.plan_hash)
+        self.assertEqual(card.call_args.kwargs, {"platform": "unknown", "device": None, "version": "1.2.3", "flags": ["dual_image"]})
 
 
 if __name__ == "__main__":
