@@ -1,4 +1,4 @@
-"""Windows in-process file I/O (decision D-008): WindowsRoot over win32_files on real NTFS folders.
+"""Windows in-process file I/O: WindowsRoot over win32_files on real NTFS folders.
 
 Run from the repository root: python -I -S -B -m unittest discover -s tests -p "test_windows_io.py" -v
 Every fixture lives in its own folder under work/test-fixtures/ and is removed afterwards. Faked
@@ -103,7 +103,7 @@ class Fixture(unittest.TestCase):
 
 @unittest.skipUnless(os.name == "nt", WINDOWS_ONLY)
 class WindowsIoTests(Fixture):
-    # G06 tests ----------------------------------------------------------------------------------------
+    # Streaming, handle, reparse, hard-link and identity tests -------------------------------------------
 
     def test_chunked_read_bounded_memory(self):
         root = self.open_root()
@@ -482,7 +482,7 @@ class WindowsIoTests(Fixture):
     def test_refusal_codes_match_retired_helper(self):
         # Every refusal code of the retired C# helper (scripts/Windows.Scoped.cs, listed from the file before it
         # was deleted) is reached, with the code the in-process backend gives for the same condition (RETIRED_CODES).
-        # Exempt (decision D-022): attribute 0x40000 read from handle metadata, which means "has extended attributes".
+        # Exempt: attribute 0x40000 read from handle metadata, which means "has extended attributes".
         root = self.open_root()
         self.path("folder").mkdir()
         record = self.seed(root, "a.txt", b"alpha")
@@ -642,7 +642,7 @@ class WindowsIoTests(Fixture):
             raise OSError(5, "fictional failure", None, 1117)
         with self.patched("flush", flush), root.open_new("synced.txt") as out:
             out.write(b"bytes")
-            self.assertIs(out.commit()["durable"], False)  # create-flush-unresolved is reported, not refused (RR2-6)
+            self.assertIs(out.commit()["durable"], False)  # create-flush-unresolved is reported, not refused
         self.assertTrue(failed_sync)
         outcome["create-flush-unresolved"] = {"durable-false"}
         # Moving and removing.
@@ -872,7 +872,7 @@ class WindowsIoTests(Fixture):
                 call()
             self.assertIn(type(caught.exception), (ScopedFSError, CapabilityHold))
 
-    # Design tests (knowledge/research/windows-backend-design.md) ----------------------------------------
+    # Backend design rules ---------------------------------------------------------------------------------
 
     def test_names_streams_reserved_and_lengths_refused(self):
         root = self.open_root()
@@ -1036,7 +1036,7 @@ class WindowsIoTests(Fixture):
         self.assertEqual(buffer[20:20 + len(target)], target)
         self.assertEqual(buffer[20 + len(target):22 + len(target)], b"\0\0")
 
-    # Review round 1 ------------------------------------------------------------------------------------
+    # Edge cases ------------------------------------------------------------------------------------
 
     def test_commit_syncs_the_folder_after_the_rename(self):
         root = self.open_root()
@@ -1358,8 +1358,8 @@ class WindowsIoTests(Fixture):
 # Every refusal code of the retired C# helper and the code(s) the in-process backend gives for the same condition.
 # path-length-bound is the C# bound of 240 characters on the absolute path, ported as path-too-long. Three codes
 # changed on purpose: a relative path over 200 characters, which the C# refused as invalid-relative-path, is
-# path-too-long (pc_paths); removing a read-only file gives read-only (allowed with allow_read_only, D-022); a missing
-# folder gives missing-entry. create-flush-unresolved became durable False (RR2-6).
+# path-too-long (pc_paths); removing a read-only file gives read-only (allowed with allow_read_only); a missing
+# folder gives missing-entry. create-flush-unresolved became durable False.
 RETIRED_CODES = {
     "access-sharing-or-missing": ("sharing-violation", "access-sharing-or-missing", "missing-entry"),
     "canonical-path-mismatch": ("canonical-path-mismatch",),
@@ -1453,7 +1453,7 @@ class WindowsLockedRangeTests(Fixture):
 
 @unittest.skipUnless(os.name == "nt", WINDOWS_ONLY)
 class WindowsDestinationTests(Fixture):
-    """Backup destinations on other drives (plan RR2-4), with a fake volume-information source."""
+    """Backup destinations on other drives, with a fake volume-information source."""
 
     def admit(self, filesystem, drive_type, **options):
         root = windows_scoped.admit_destination(str(self.path()), volumes=volumes(filesystem, drive_type), **options)

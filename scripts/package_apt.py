@@ -25,7 +25,7 @@ _OFF, _YES = _NO | {""}, frozenset({"true", "yes", "1", "on", "with", "enable"})
 _SOURCE_OPTIONS = ("trusted", "allow-insecure", "allow-weak", "allow-downgrade-to-insecure")
 # apt reads its sources from these locations (sourcelist.cc ReadMainList); any other value would hide sources unchecked.
 # Defaults as `apt-config dump` prints them on Ubuntu 24.04 (apt-pkg/init.cc). FindDir appends "/" to a folder, so a trailing
-# "/" on the two folders names the same folder. posixpath.sep is "/": a "/" literal would be read by G09 as a token.
+# "/" on the two folders names the same folder. posixpath.sep is "/": a "/" literal would be read as a token by the route-token check.
 _APT_DIRS = MappingProxyType({"dir": posixpath.sep, "dir::etc": "etc/apt", "dir::etc::sourcelist": "sources.list", "dir::etc::sourceparts": "sources.list.d"})
 _APT_FOLDERS = ("dir::etc", "dir::etc::sourceparts")
 _C_SPACE = " \t\n\v\f\r"  # isspace() in the C locale, which apt's ParseQuoteWord uses

@@ -134,7 +134,7 @@ class NativeStorageTests(NativeStorageFixture, unittest.TestCase):
         rows = inventory["not_included"]
         self.assertEqual([(row["root_id"], row["parent"], row["reason"]) for row in rows],
                          [("r001", "", "not-portable"), ("r001", "", "not-portable"), ("r001", "", "link"), ("r001", "", "path-too-long"), ("r001", "d" * 120, "path-too-long")])
-        # Exact row layouts (F-011): an inventoried entry, a selected root and a not-included row.
+        # Exact row layouts: an inventoried entry, a selected root and a not-included row.
         self.assertEqual(inventory["entries"][1], {"root_id": "r001", "key": "r001/ok.txt", **record, "relative_path": "ok.txt", "inode": 12})
         self.assertEqual(inventory["roots"], [{"root_id": "r001", "path": str(self.source), "record": {**record, "relative_path": "", "kind": "directory", "inode": 1}}])
         self.assertEqual(rows[0], {"root_id": "r001", "parent": "", "name": "What now?.txt", "reason": "not-portable"})
@@ -152,7 +152,7 @@ class NativeStorageTests(NativeStorageFixture, unittest.TestCase):
 
     @unittest.skipUnless(os.name == "posix", "only on posix: how deep a real Windows fixture can go under the 240-unit full-path cap depends "
                                              "on the checkout path; the storage rule runs everywhere in the fake-root test and the Windows "
-                                             "backend's in W-IO's test_windows_io")
+                                             "backend's in test_windows_io")
     def test_path_beyond_portable_limit_is_not_included(self):
         deep = self.source / ("d" * 120) / ("e" * 90)
         deep.mkdir(parents=True)

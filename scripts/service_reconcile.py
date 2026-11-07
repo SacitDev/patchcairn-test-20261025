@@ -1,4 +1,4 @@
-"""Reconciliation: the reconcile dispatch over every adapter id (PLAN 3.3, RR4, D-071) and the storage outcome check.
+"""Reconciliation: the reconcile dispatch over every adapter id and the storage outcome check.
 
 ``reconcile_operation`` takes the lock and reads the operation's checked original intent, then calls the adapter's
 private ``_reconcile_<id>`` method named in RECONCILE, looked up on the object. Each one is defined in its family's

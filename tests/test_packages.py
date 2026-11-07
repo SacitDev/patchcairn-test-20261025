@@ -1,4 +1,4 @@
-"""Package routes (G09): the winget, Homebrew, apt and dnf5 route classes, on synthetic fixtures and fakes only.
+"""Package routes: the winget, Homebrew, apt and dnf5 route classes, on synthetic fixtures and fakes only.
 
 No test starts a package manager. Parsers read tests/fixtures/packages (fictional package ids); executable resolution
 and the read-only runner use FakeProbe and FakeLauncher below. The fictional Windows folders and the fictional home
@@ -61,10 +61,10 @@ DOC_HOSTS = {"winget": [("learn.microsoft.com", ()), ("github.com", ("microsoft"
              "apt": [("manpages.debian.org", ()), ("manpages.ubuntu.com", ())],
              "dnf": [("dnf.readthedocs.io", ()), ("dnf5.readthedocs.io", ()), ("rpm-software-management.github.io", ())],
              "repair": [("learn.microsoft.com", ()), ("manpages.debian.org", ())]}
-# Forbidden rows per manager: one per token of the design's section 3 (patterns such as globs, `<name>/<release>` or
+# Forbidden rows per manager: one per forbidden token of the route design (patterns such as globs, `<name>/<release>` or
 # dpkg `--force-*` are refused by the grammar instead, and winget --name, apt -o and apt-get -s are allowed rows).
-# brew has one row fewer than section 3: the legacy JSON format flag is not listed literally, because the frozen G03
-# label rule refuses that spelling; render() emits only --json=v2.
+# brew has one row fewer than that list: the legacy JSON format flag is not listed literally, because the
+# no-version-label rule refuses that spelling; render() emits only --json=v2.
 FORBIDDEN_ROWS = {"winget": 64, "brew": 47, "apt": 29, "dnf": 44, "repair": 5}
 
 
@@ -404,7 +404,7 @@ def result_of(classification, verification, *, signal=None):
 
 
 def stored(state):
-    """A parsed installed state after a round trip through the canonical record encoder, as PKG-INT stores it."""
+    """A parsed installed state after a round trip through the canonical record encoder, as a saved record would hold it."""
     return pc_records.decode_strict(pc_records.encoded(state))
 
 

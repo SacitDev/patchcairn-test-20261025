@@ -253,7 +253,7 @@ class InjectedPlatformTests(unittest.TestCase):
             unused.ioctl.assert_not_called()
 
     def test_destination_volume_kinds(self):
-        # Only a native file system on a drive proven fixed is private; elsewhere ids are not stable (D-069).
+        # Only a native file system on a drive proven fixed is private; elsewhere ids are not stable.
         for (filesystem, removable), expected in {("native", False): ("private", True), ("native", True): ("non-private", False),
                                                   ("fat", True): ("fat32", False), ("fat", False): ("fat32", False),
                                                   ("exfat", True): ("non-private", False), ("other", False): ("unsupported", False)}.items():
@@ -505,7 +505,7 @@ class PosixTests(unittest.TestCase):
                 info = (self.source / "a.txt").stat()
                 with (self.source / "a.txt").open("r+b") as out:
                     out.write(b"X")
-                # An explicit time, never the clock (D-056): a write in the same clock tick keeps the old one.
+                # An explicit time, never the clock: a write in the same clock tick keeps the old one.
                 os.utime(self.source / "a.txt", ns=(info.st_atime_ns, info.st_mtime_ns + 10 ** 9))
         with self.assertRaises(fs.ScopedFSError):
             self.root.stream_to("a.txt", expected=row, writer=modify)
@@ -526,7 +526,7 @@ class PosixTests(unittest.TestCase):
 
     def test_read_only_quarantined_file_is_purged_as_before(self):
         # storage_ops purges a quarantine whose plan lists each file's record; a 0444 file (a git object, an extracted
-        # archive member) is removed as the old adapter did, because the approved record shows it read-only (PD-10).
+        # archive member) is removed as the old adapter did, because the approved record shows it read-only.
         os.chmod(self.source / "a.txt", 0o444)
         original = self.hashed()
         with fs.ScopedRoot(self.target, quiet_workspace=True) as quarantine:
@@ -1316,7 +1316,7 @@ class PosixRemovalTests(unittest.TestCase):
         os.utime(moved, ns=(info.st_atime_ns, info.st_mtime_ns))
         self.assertEqual(fs.reconcile_removal(self.removal, expected=draft, removal_name=other), "kept")
         self.assertTrue(moved.exists())
-        # The interrupted original is finished, also when its device number changed with a restart (D-072);
+        # The interrupted original is finished, also when its device number changed with a restart;
         # afterwards nothing has its name.
         renumbered = {**record, "device": record["device"] + 1}
         self.assertEqual(fs.reconcile_removal(self.removal, expected=renumbered, removal_name=name), "removed")

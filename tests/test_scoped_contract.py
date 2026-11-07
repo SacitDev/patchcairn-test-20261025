@@ -535,7 +535,7 @@ class RootContract:
                 self.assertRefused("invalid-option", lambda: self.root.open_new("other.bin", partial=bad).__enter__())
 
     def test_source_root_is_not_a_destination(self):
-        # new_root() admits a source; only the separate destination admission sets destination (plan RR2-4).
+        # new_root() admits a source; only the separate destination admission sets destination.
         self.assertIs(self.root.destination, False)
 
     def test_source_root_is_private(self):
@@ -856,7 +856,7 @@ class RootContract:
                          lambda: self.root.open_read("shortcut", expected={**secret, "relative_path": "shortcut"}).__enter__()):
                 self.assertRaises(ScopedFSError, call)
             self.assertNotIn("shortcut", self.names())
-            # F-368: a link used as a middle component is refused for every operation, even when its target holds
+            # A link used as a middle component is refused for every operation, even when its target holds
             # the named entries, and nothing appears in (or leaves) the target.
             target = self.link_target(self.root)
             if target is not None:
@@ -1432,9 +1432,9 @@ class PosixRootContractTests(RootContract, unittest.TestCase):
     """The contract against the POSIX backend (Linux and macOS), on real folders under work/test-fixtures/.
 
     The hooks change files for real: grow appends, shrink truncates, swap renames another file over the name, and
-    touch and rewrite_in_place set explicit times (D-056). "alias" is absent (POSIX has no 8.3 names); "case-pair" is
+    touch and rewrite_in_place set explicit times. "alias" is absent (POSIX has no 8.3 names); "case-pair" is
     absent exactly when a probe of the fixture folder finds it case-insensitive (the macOS default). A file is
-    "inherited" when its mode is what the umask leaves of the original's bits masked to 0o644 (D-022, D-027), so the
+    "inherited" when its mode is what the umask leaves of the original's bits masked to 0o644, so the
     hooks remember what each open_new call asked for.
     """
 

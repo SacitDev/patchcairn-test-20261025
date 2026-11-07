@@ -116,7 +116,7 @@ TOKENS = (
     Token(token="makecache", allowed=True, manager="dnf", url="https://dnf5.readthedocs.io/en/latest/commands/makecache.8.html"),
     Token(token="reinstall", allowed=True, manager="dnf", url="https://dnf5.readthedocs.io/en/latest/commands/reinstall.8.html"),
     Token(token="/usr/bin/rpm", allowed=True, manager="dnf", url="https://rpm-software-management.github.io/rpm/man/rpm.8.html"),
-    # sudo(8) is not hosted on the dnf documentation hosts G09 allows; this row cites dnf5.conf(5), which separates the
+    # sudo(8) is not hosted on the documentation hosts allowed for dnf rows; this row cites dnf5.conf(5), which separates the
     # root and non-root behaviour of dnf5. sudo itself is documented on the apt row (manpages.debian.org sudo.8).
     Token(token="/usr/bin/sudo", allowed=True, manager="dnf", url="https://dnf5.readthedocs.io/en/latest/dnf5.conf.5.html"),
     Token(token="-q", allowed=True, manager="dnf", url="https://rpm-software-management.github.io/rpm/man/rpm.8.html"),
@@ -245,7 +245,7 @@ TOKENS = (
     Token(token="--adopt", allowed=False, manager="brew", url="https://docs.brew.sh/Manpage"),
     Token(token="--zap", allowed=False, manager="brew", url="https://docs.brew.sh/Manpage"),
     Token(token="--git", allowed=False, manager="brew", url="https://docs.brew.sh/Manpage"),
-    # The legacy JSON format flag is not listed literally: the G03 label rule refuses that spelling; render() emits only --json=v2.
+    # The legacy JSON format flag is not listed literally: the no-version-label rule refuses that spelling; render() emits only --json=v2.
     Token(token="--json", allowed=False, manager="brew", url="https://docs.brew.sh/Manpage"),
     Token(token="install", allowed=False, manager="brew", url="https://docs.brew.sh/Manpage"),
     Token(token="uninstall", allowed=False, manager="brew", url="https://docs.brew.sh/Manpage"),

@@ -1,4 +1,4 @@
-"""Test clock helpers (D-056): stamps go through pc_records' clock seam, and a forward-only clock orders them.
+"""Test clock helpers: stamps go through pc_records' clock seam, and a forward-only clock orders them.
 
 A backward step of the host clock (WSL re-syncing with the host, an NTP step) must not reorder times that one test
 stamps in sequence. Product code is tested for such a step only where a test injects it on purpose; fixed-time

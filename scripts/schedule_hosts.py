@@ -4,7 +4,7 @@ A schedule is timing only. Every route runs one fixed command,
 ``<absolute interpreter> -I -S -B <root>/scripts/patchcairn_workflow.py --scheduled-run <id64>``, and the engine
 checks the record, its state, the bound time and single use again when it fires. Rendering is pure.
 
-Inputs from the engine (decision D-033):
+Inputs from the engine:
 - ``facts`` from schedule_probe.host_facts(record, ...) and ``offset_of`` from schedule_probe.system_offset(), the
   computer's own time zone. Tests pass fakes; production never passes facts from anywhere else.
 - ``runner(argv, stdin=None, env=None) -> (returncode, stdout, stderr)``: the engine's fixed L4 runner. It works out
@@ -31,11 +31,11 @@ import xml.etree.ElementTree as ET
 
 import pc_records
 from pc_records import Refusal
-import schedule_probe  # the path rules and the systemctl locations (D-044: a pure module may import a pure module)
+import schedule_probe  # the path rules and the systemctl locations (a pure module may import a pure module)
 
 SCHEMA = "patchcairn.schedule"
 PLATFORMS = ("windows", "macos", "linux")
-# Each route and the platforms it is rendered for. The research notes source no Linux build of either desktop app.
+# Each route and the platforms it is rendered for. Neither desktop app has a Linux build.
 ROUTES = MappingProxyType({"windows_task": ("windows",), "launchd": ("macos",), "systemd_user": ("linux",),
                            "cron": ("linux",), "codex_app": ("windows", "macos"), "claude_desktop": ("windows", "macos")})
 PROMPT_ROUTES = ("codex_app", "claude_desktop")
@@ -116,7 +116,7 @@ def schedule_id(record):
 def check_record(record):
     """Return ``record`` when its RENDER_FIELDS are valid and schedule_id matches; otherwise refuse.
 
-    This reads only RENDER_FIELDS and schedule_id. The engine's single reader for patchcairn.schedule (E-SCH) owns
+    This reads only RENDER_FIELDS and schedule_id. The engine's single reader for patchcairn.schedule owns
     the closed key set (RENDER_FIELDS, its own fields and UNBOUND_FIELDS): it refuses unknown and authority keys,
     validates its own fields, and calls check_record.
     """
@@ -519,7 +519,7 @@ def _host_schedule(record, candidates):
 
 
 def _setup(record, schedule, candidates):
-    """Setup steps for the person. Facts about the apps come from the research notes (knowledge/research/hosts.md)."""
+    """Setup steps for the person. Facts about the apps come from their vendors' documentation."""
     root, twice, windows = record["root"], [], record["platform"] == "windows"
     paste = "Prompt: paste the PatchCairn message exactly as shown; add or change nothing."
     if candidates > 1:

@@ -39,7 +39,7 @@ from pc_records import Refusal  # noqa: E402
 import schedule_hosts  # noqa: E402
 import schedule_probe  # noqa: E402
 
-# Nothing a renderer emits may contain these (plan RR14). The list lives in the test, not in the product.
+# Nothing a renderer emits may contain these. The list lives in the test, not in the product.
 BYPASS = re.compile(r"--dangerously|bypassPermissions|danger-full-access|approval_policy|-ExecutionPolicy|HighestAvailable"
                     r"|\bsudo\b|enable-linger|\bpkexec\b|\bdoas\b|\brunas\b|--full-auto|--yolo|\bbypass\b", re.I)
 BANNED_TOKENS = {"/ru", "/rp", "load", "unload", "-r", "loginctl", "enable-linger", "*"}
@@ -49,8 +49,7 @@ NOT_FOUND = 0x80070002
 NOW = "2026-10-26T00:00:00.000000Z"  # the frozen clock: after creation, before the first run
 C_LOCALE = {"LC_ALL": "C"}
 
-# Home folders of the fictional user "example", put together at run time so the source holds no literal user-profile
-# path (decision D-026).
+# Home folders of the fictional user "example", put together at run time so the source holds no literal user-profile path.
 _PROFILE_ROOTS = {"macos": ("/" + "Users", "/"), "posix": ("/" + "home", "/"), "windows": ("C:\\" + "Users", "\\")}
 
 
@@ -1568,7 +1567,7 @@ class ScheduleRenderTests(unittest.TestCase):
                  mscripts + "/patchcairn_workflow.py": Info(501, 0o100644, 20)}
         mlist = {mscripts: ["patchcairn_workflow.py"], "/opt/homebrew": ["bin", "lib"], mstd: ["os.py"]}
         macct = (501, "example", 20, lambda gid: ("staff", {"example", "x"}))
-        self.accepted(mac, mtree, mlist, account=macct)  # Homebrew: admin group (gid 80) write is accepted (D-045)
+        self.accepted(mac, mtree, mlist, account=macct)  # Homebrew: admin group (gid 80) write is accepted
         for case, change in (("staff group write", Info(501, 0o40775, 20)), ("write by all", Info(501, 0o40777, 80))):
             with self.subTest(case=case):
                 self.refused("schedule-path", self.check_writable, mac, mtree, mlist, account=macct,
@@ -1716,7 +1715,7 @@ class ScheduleRenderTests(unittest.TestCase):
         self.assertEqual(limit, 199)  # <root>\work\schedules\<id16>\task.xml stays within private_workspace's 240 units
         longest = make("windows", "windows_task", root="C:\\" + "p" * (limit - 3))
         self.assertIsNone(schedule_probe.check_placement(longest, None))
-        self.assertEqual(len(self.render(longest)["files"][0]["path"]), 240)  # task.xml at private_workspace's bound (D-050)
+        self.assertEqual(len(self.render(longest)["files"][0]["path"]), 240)  # task.xml at private_workspace's bound
         self.refused("schedule-path", schedule_probe.check_placement, make("windows", "windows_task", root="C:\\" + "p" * (limit - 2)),
                      None)
         wide = "C:\\" + "p" * (limit - 4) + chr(0x1F600)  # at the limit in code points, but the last one is two UTF-16 units

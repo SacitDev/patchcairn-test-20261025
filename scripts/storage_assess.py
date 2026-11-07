@@ -79,7 +79,7 @@ class StorageAssessment:
                     raise StorageRefusal("Aliased selected roots are refused")
                 identities.add(identity)
                 root_rows.append({"root_id": root_id, "path": str(path), "record": root_record})
-                # D-025: entries the root does not admit are listed as not included (scoped_base rows, names
+                # Entries the root does not admit are listed as not included (scoped_base rows, names
                 # escaped for display), never opened, and never refuse the whole selection.
                 left_out = []
                 pending = [""]

@@ -54,7 +54,7 @@ PARTIAL_NAME = re.compile(r"\.partial-[0-9a-f]{32}\Z")
 # The one plain-language note of a backup destination that cannot keep files private (RootBase.privacy_note).
 NON_PRIVATE_NOTE = ("This drive cannot keep the backup private: anyone who can use the drive, here or on another "
                     "computer, can open the backup.")
-# Destination volumes (plan RR2-4): FAT32 holds no file of 4 GiB or more, and FAT, exFAT and vfat give a file
+# Destination volumes: FAT32 holds no file of 4 GiB or more, and FAT, exFAT and vfat give a file
 # another id when it is renamed or listed again, so files there are bound by size and SHA-256.
 FAT32_MAX_FILE_BYTES = (1 << 32) - 1
 UNSTABLE_ID_KEYS = frozenset({"relative_path", "kind", "size"})
@@ -293,7 +293,7 @@ class RootBase(abc.ABC):
     identity_keys = IDENTITY_KEYS
     # What of CREATED_KEYS lasts for this backend's files (see CREATED_KEYS); empty where a later file can take the same id.
     created_keys = CREATED_KEYS
-    # Admission facts (plan RR2-4). A source keeps these defaults; a backup destination sets the values
+    # Admission facts. A source keeps these defaults; a backup destination sets the values
     # destination_facts() returns.
     destination = False
     private = True

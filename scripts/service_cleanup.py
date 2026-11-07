@@ -1,4 +1,4 @@
-"""Cleanup family: quarantine reservations and mappings, the purge recovery rule and the cleanup dispatch (PLAN 3.3).
+"""Cleanup family: quarantine reservations and mappings, the purge recovery rule and the cleanup dispatch.
 
 Removing originals holds here until its family code is written.
 """

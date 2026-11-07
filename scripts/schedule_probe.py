@@ -33,7 +33,7 @@ from pc_records import Refusal
 SYSTEMCTLS = ("/usr/bin/systemctl", "/bin/systemctl")
 # Without long paths (off by default) a path holds at most 259 UTF-16 units, and a folder an API creates at most
 # 247 (MAX_PATH minus 12; https://learn.microsoft.com/en-us/windows/win32/fileio/maximum-file-path-limitation).
-# private_workspace, which writes task.xml, takes at most 240 (D-050). The longest rendered file is
+# private_workspace, which writes task.xml, takes at most 240. The longest rendered file is
 # <root>\work\schedules\<id16>\task.xml (41 more units) and the folder the engine creates is
 # <root>\work\schedules\<id16> (32 more), so the root may hold min(259 - 41, 247 - 32, 240 - 41) units.
 WINDOWS_ROOT_LIMIT = min(259 - 41, 247 - 32, 240 - 41)
@@ -52,7 +52,7 @@ _WINDOWS_PLAIN = re.compile(r"[A-Za-z]:\\|\\\\(?![?.]\\)[^\\]+\\[^\\]+(?:\\|\Z)"
 # Folders whose contents macOS shows only to apps the person allowed (https://support.apple.com/guide/security/secddd1d86a6),
 # and the cloud-storage folder beside them; a launchd job runs python with nobody's consent, so it could not read there.
 MACOS_PROTECTED = ("Desktop", "Documents", "Downloads", "Library/Mobile Documents", "Library/CloudStorage")
-MACOS_ADMIN_GID = 80  # decision D-045: on macOS the admin group counts like root
+MACOS_ADMIN_GID = 80  # on macOS the admin group counts like root
 _PYTHON = {"windows": re.compile(r"python(?:3(?:\.[0-9]{1,2}t?)?)?\.exe\Z", re.IGNORECASE),
            "posix": re.compile(r"python(?:3(?:\.[0-9]{1,2}t?)?)?\Z")}
 # Windows: quotes and % break the task's command line; POSIX: these characters are quoting, escapes or specifiers
@@ -244,7 +244,7 @@ def check_writable(record, *, writable_by_others=None, stat_of=os.stat, list_dir
     objects up to the filesystem root (on Windows: the drive or share root).
     POSIX: every object and folder above belongs to this user or root and has no group or other write bit, sticky or
     not (a sticky folder still lets anyone create a name that has gone, such as a PatchCairn folder in /tmp after a
-    reboot). A group bit is allowed for the macOS admin group (D-045) and for this user's own private group on Linux
+    reboot). A group bit is allowed for the macOS admin group and for this user's own private group on Linux
     (its name is the user's, it is the user's primary group, nobody else belongs to it, and the path carries no POSIX
     access-control list, whose named entries the group bits would hide). On Linux an object on a mount whose bits do
     not show who else can write (_SHARED_TYPES: WSL's Windows drives, cifs and smb3 shares, VirtualBox folders) is
@@ -358,7 +358,7 @@ def _refuse_shared_mounts(paths, mountinfo):
 
 
 def _group_ok(path, gid, platform, primary, name, members_of, list_xattr):
-    """A group-write bit is harmless for the macOS admin group (D-045) or this user's own private group on Linux,
+    """A group-write bit is harmless for the macOS admin group or this user's own private group on Linux,
     unless a POSIX access-control list on the path grants others write access behind the group bits."""
     if platform == "macos":
         return gid == MACOS_ADMIN_GID

@@ -1,7 +1,7 @@
-"""Restore family: the dispatch and the effects of backup restoration and quarantine restoration (PLAN 3.3).
+"""Restore family: the dispatch and the effects of backup restoration and quarantine restoration.
 
 Both adapters run through the shared steps of service_execute and the shared storage reconciliation of
-service_reconcile; B-RST replaces these bodies.
+service_reconcile.
 """
 from __future__ import annotations
 

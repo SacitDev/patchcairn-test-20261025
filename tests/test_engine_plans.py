@@ -710,7 +710,7 @@ class WorkflowTests(WorkflowFixture):
 
 class InventoryEvidenceTests(WorkflowFixture):
     """Inventory in a real session needs the owner's current scope decision, and a collector-shaped result must be a
-    real collection from the session's own platform (F-445, F-512). Fictional results only; nothing is collected."""
+    real collection from the session's own platform. Fictional results only; nothing is collected."""
 
     def collector_result(self, platform="linux", collection_mode="real"):
         result = {"platform": platform, "observations": [], "coverage": [], "errors": [], "limits": ["Fictional result; nothing was collected."]}

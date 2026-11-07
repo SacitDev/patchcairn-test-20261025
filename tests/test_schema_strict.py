@@ -1,11 +1,11 @@
-"""Strict record schemas (gate G04), driven by the pc_records registry.
+"""Strict record schemas, driven by the pc_records registry.
 
 Every family with a registered reader refuses a schema_version that is not the integer 1 and a schema name that
 is wrong, versioned or missing; containers need the integer version; records in an older PatchCairn format are
 refused with the clear message. The readers are the ones the product modules register when they are imported.
 The golden-layout tests pin the exact bytes or hashes of the engine marker, creation marker, session state and
-journal, service marker and retention registry, diagnostic request, storage attempt record and storage capabilities
-(F-011); the storage inventory rows and fingerprint fields are pinned in test_storage_assess. Fixtures stay under
+journal, service marker and retention registry, diagnostic request, storage attempt record and storage capabilities;
+the storage inventory rows and fingerprint fields are pinned in test_storage_assess. Fixtures stay under
 work/test-fixtures/ss-<id>/.
 """
 from __future__ import annotations
@@ -31,7 +31,7 @@ from work_fixtures import remove_tree
 
 # Short fixture names keep the deepest record path within the Windows private-path cap from a long checkout path.
 WORK = ROOT / "work" / "test-fixtures"
-# A family's reader lives in the lowest module that reads it, named by its layer (D-036 item 2).
+# A family's reader lives in the lowest module that reads it, named by its layer.
 OWNER_PREFIXES = ("workflow_core", "engine_", "workflow_service", "service_", "storage_", "diagnostic_", "report")
 # The kind a sample record carries in the families whose records are told apart by "kind".
 SAMPLE_KINDS = {"patchcairn.storage": "backup_receipt", "patchcairn.diagnostics": "result", "patchcairn.service": "service_marker"}
@@ -267,7 +267,7 @@ class RecordLayoutTests(unittest.TestCase):
         self.assertEqual(workflow_core.digest(engine.read_session(session_id)), "2a059bbee7ffcd2db46769acb725e9f98c5b1c637725118d16c9fa03a3d38ba2")
 
     def test_journal_events_keep_digests_of_changes(self):
-        # D-017: a journal event names each changed field with the digest of its new value, never the value.
+        # A journal event names each changed field with the digest of its new value, never the value.
         engine, session_id = self.engine()
         with mock.patch("pc_records.utc_now", return_value=CLOCK):
             engine.pause(session_id)
@@ -278,7 +278,7 @@ class RecordLayoutTests(unittest.TestCase):
         self.assertEqual(hashlib.sha256(data).hexdigest(), "dc9940db4c64939073cd6ceb03eddb98568fde49115b729b18cf83ad87c124fd")
 
     def test_storage_attempt_record_keeps_digest_plan_file_and_count(self):
-        # D-017: the exact plan is a separate hash-bound file; the attempt record keeps its digest and entry count.
+        # The exact plan is a separate hash-bound file; the attempt record keeps its digest and entry count.
         with mock.patch("pc_records.utc_now", return_value=CLOCK):
             record = storage_ops.attempt_record("backup", "a" * 64, "plan-backup-" + "a" * 64 + ".json", {"files": [{}, {}, {}]})
         self.assertEqual(pc_records.encoded(record),

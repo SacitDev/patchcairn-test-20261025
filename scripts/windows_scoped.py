@@ -155,7 +155,7 @@ def _root_path(root):
 
 
 def _refuse_impersonation():
-    """CreateFileW and every later call use the calling thread's token, so a thread token is refused (M3)."""
+    """CreateFileW and every later call use the calling thread's token, so a thread token is refused."""
     try:
         impersonating = w32.thread_impersonating()
     except OSError:
@@ -185,7 +185,7 @@ class _Job:
 
 
 class _IoThread:
-    """The one thread that runs a root's native calls, each with a deadline (M1)."""
+    """The one thread that runs a root's native calls, each with a deadline."""
 
     def __init__(self):
         self._jobs = queue.SimpleQueue()
@@ -224,7 +224,7 @@ class _IoThread:
         try:
             finished = job.done.wait(seconds)
         except BaseException:
-            # Let the call hand its new handles to their owner before the caller unwinds (M2); drop its refusal (no cycle).
+            # Let the call hand its new handles to their owner before the caller unwinds; drop its refusal (no cycle).
             job.done.wait(seconds)
             job.error = None
             raise
@@ -505,7 +505,7 @@ class WindowsRoot(scoped_base.RootBase):
         return info
 
     def _check_entry(self, dos_path):
-        """From the parent's index and before opening (S1), refuse a reparse point, cloud placeholder or offline entry
+        """From the parent's index and before opening, refuse a reparse point, cloud placeholder or offline entry
         and a name stored differently (an 8.3 alias); return the entry's attributes."""
         try:
             found = w32.find_entry(_EXTENDED + dos_path)
@@ -888,7 +888,7 @@ class WindowsRoot(scoped_base.RootBase):
         return {**expected, "sha256": observed}
 
     def _dispose(self, handle, allow_read_only):
-        # POSIX semantics drop the name when this handle closes (S2); FAT and exFAT refuse them: delete at last close then.
+        # POSIX semantics drop the name when this handle closes; FAT and exFAT refuse them: delete at last close then.
         flags = w32.DISPOSITION_DELETE | w32.DISPOSITION_POSIX_SEMANTICS | (w32.DISPOSITION_IGNORE_READONLY if allow_read_only else 0)
         for dispose in (lambda: w32.set_disposition(handle, flags), lambda: w32.delete_on_close(handle)):
             with suppress(OSError):

@@ -236,7 +236,7 @@ class LinuxPrivacyTests(unittest.TestCase):
             self.assertEqual(closed.call_args_list, [mock.call(10)])
 
     def test_destination_filesystem_kind_from_an_open_descriptor(self):
-        # tmpfs and ramfs live in memory and a read-only mount takes no backup: neither is a destination (D-069),
+        # tmpfs and ramfs live in memory and a read-only mount takes no backup: neither is a destination,
         # although tmpfs stays admitted for the private work folder.
         for filesystem, flags, kind in ((0xEF53, 0, "native"), (0x58465342, 0, "native"), (0x9123683E, 0, "native"),
                                         (0x01021994, 0, "other"), (0x858458F6, 0, "other"), (0xEF53, 1, "other"),
@@ -494,7 +494,7 @@ class DrvfsHoldTests(unittest.TestCase):
             self.assertIsNone(privacy.assert_native_private_filesystem(fixture))
             self.assertEqual(private_workspace.ensure_private_directory(target, create=True), target)
             self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o700)
-            if kind in ("tmpfs", "ramfs"):  # memory: the work folder may live there, a backup never (D-069)
+            if kind in ("tmpfs", "ramfs"):  # memory: the work folder may live there, a backup never
                 with self.assertRaises(scoped_fs.ScopedFSError) as caught:
                     scoped_fs.admit_destination(str(fixture), non_private_destination=True)
                 self.assertEqual(caught.exception.code, "destination-volume-unsupported")

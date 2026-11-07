@@ -43,7 +43,7 @@ from pc_records import SCHEMA_VERSION, digest, encoded
 
 def _forward(function):
     """A method that calls the engine function of this name with this engine, looked up when it runs, and forwards its
-    arguments unchanged (PD-17). If the method itself was assigned onto its module, it calls the original function."""
+    arguments unchanged. If the method itself was assigned onto its module, it calls the original function."""
     module, name = function.__module__, function.__name__
 
     @functools.wraps(function)
