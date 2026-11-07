@@ -1,0 +1,12 @@
+Updating and loading repositories:
+Repositories loaded.
+Package                   Arch    Version          Repository      Size
+Reinstalling:
+ exampletool              x86_64  8.9.1-2.fc41     updates    789.2 KiB
+   replacing exampletool  x86_64  8.9.1-2.fc41     updates    789.2 KiB
+
+Transaction Summary:
+ Reinstalling:       1 package
+ Replacing:          1 package
+
+Operation aborted by the user.

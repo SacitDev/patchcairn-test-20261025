@@ -1,13 +1,14 @@
 """Package routes for winget, Homebrew, apt and dnf5 (layer L2-pure: standard library, pc_records, package_tokens).
 
 This module starts no process. It holds the closed read-only recipes the read-only runner may run, the run argv
-rendered for the coordinator after the ticket (only tokens on an allowed row of package_tokens.TOKENS), parsers that
+the ticket-bound launcher runs (only tokens on an allowed row of package_tokens.TOKENS), parsers that
 turn manager output into validated fields (raw manager text never leaves a parser), plan binding, drift,
 verification, exit and restart classification and package-list age; the apt parsers, plan and verification are in
-package_apt (D-057). A pc_records.Refusal is a hold.
+package_apt. A pc_records.Refusal is a hold.
 """
 from __future__ import annotations
 
+from collections import namedtuple
 from datetime import timedelta
 import ntpath
 from pathlib import PurePosixPath
@@ -64,14 +65,23 @@ _SLOTS = MappingProxyType({"id": W_ID.fullmatch, "version": W_VER.fullmatch, "na
                            "rpm_name": F_NAME.fullmatch, "repoid": F_REPO.fullmatch})
 
 
+# What render() may emit: recipes by id, the allowed (manager, token) rows and the slot grammars.
+Tables = namedtuple("Tables", "recipes allowed slots")
+
+
+def core_tables():
+    """This module's own tables; package_registry.tables() adds what further route modules bring."""
+    return Tables({**RUN_RECIPES, **READ_RECIPES}, ALLOWED, _SLOTS)
+
+
 def needs_quoting(value):
     """True when a token would need quoting in bash, PowerShell or cmd (zsh with EXTENDED_GLOB also treats ~ as a pattern)."""
     return not isinstance(value, str) or not value or not value.isascii() or bool(_UNSAFE.search(value))
 
 
-def variable(slot, value):
+def variable(slot, value, slots=_SLOTS):
     """A variable token matching its grammar: no leading '-', nothing needing shell quoting, no name a manager reads as a file."""
-    check = _SLOTS.get(slot)
+    check = slots.get(slot)
     if (check is None or needs_quoting(value) or len(value) > 256 or value.startswith("-") or not check(value)
             or value.lower().endswith(_FILE_SPECS.get(slot, ("\x00",)))):
         raise Refusal("package-token", f"Refused {slot}: the value does not match the route grammar")
@@ -97,16 +107,16 @@ def _alias_path(path):
     return _windows_path(local) and winget_alias_path(local).lower() == path.lower()
 
 
-def recipe(recipe_id):
+def recipe(recipe_id, tables=None):
     """The read-only or run recipe with this id; anything else is refused."""
-    found = (READ_RECIPES.get(recipe_id) or RUN_RECIPES.get(recipe_id)) if isinstance(recipe_id, str) else None
+    found = (tables or core_tables()).recipes.get(recipe_id) if isinstance(recipe_id, str) else None
     if found is None:
         raise Refusal("package-recipe", "Not a PatchCairn package recipe")
     return found
 
 
-def _literal(manager, token):
-    if (manager, token) not in ALLOWED:
+def _literal(manager, token, tables):
+    if (manager, token) not in tables.allowed:
         raise Refusal("package-token-not-allowed", f"The {manager} route may not emit this token")
     return token
 
@@ -118,7 +128,7 @@ def winget_alias_path(local_appdata):
     return ntpath.join(local_appdata, "Microsoft", "WindowsApps", "winget.exe")
 
 
-def _executable(found, executable):
+def _executable(found, executable, tables):
     """argv[0]: the winget alias path, or a fixed path that is an allowed row of the recipe's manager."""
     if found.executable == "winget":
         if not _alias_path(executable):
@@ -126,34 +136,37 @@ def _executable(found, executable):
         return executable
     choices = tuple(BREW_PATHS.values()) if found.executable == "brew" else (found.executable,)
     path = executable if executable is not None or found.executable == "brew" else found.executable
-    if path not in choices or (found.manager, path) not in ALLOWED:
+    if path not in choices or (found.manager, path) not in tables.allowed:
         raise Refusal("package-executable", "This recipe runs only its fixed executable from the token table")
     return path
 
 
-def _value(manager, element, value, run_folder):
+def _value(manager, element, value, run_folder, tables):
     if element.flag and (value is None or type(value) is bool):
-        return [_literal(manager, element.flag)] if value else []
+        return [_literal(manager, element.flag, tables)] if value else []
     if element.choices and value in element.choices:
-        return [_literal(manager, value)]
+        return [_literal(manager, value, tables)]
     if (element.name in RUN_FILES and _windows_path(value) and _windows_path(run_folder) and RUN_FILES[element.name].fullmatch(ntpath.basename(value))
             and ntpath.normcase(ntpath.dirname(value)) == ntpath.normcase(ntpath.normpath(run_folder))):
         return [value]
     if element.many and isinstance(value, (list, tuple)) and 0 < len(value) <= MAX_ITEMS:
-        return [variable(element.name, item) for item in value]
+        return [variable(element.name, item, tables.slots) for item in value]
     if not (element.flag or element.choices or element.many or element.name in RUN_FILES):
-        return [f"{_literal(manager, element.joined)}={variable(element.name, value)}" if element.joined else variable(element.name, value)]
+        checked = variable(element.name, value, tables.slots)
+        return [f"{_literal(manager, element.joined, tables)}={checked}" if element.joined else checked]
     raise Refusal("package-recipe-values", f"Refused {element.name}: not a value this recipe accepts (winget files stay in the run folder)")
 
 
-def render(recipe_id, values=None, *, executable=None, run_folder=None):
+def render(recipe_id, values=None, *, executable=None, run_folder=None, tables=None):
     """argv (a tuple, never a shell string) of a recipe; values are checked, winget's output and log files sit in run_folder."""
-    found, values = recipe(recipe_id), dict(values or {})
+    tables = tables or core_tables()
+    found, values = recipe(recipe_id, tables), dict(values or {})
     if set(values) - {element.name for element in found.template if isinstance(element, Slot)}:
         raise Refusal("package-recipe-values", "This recipe has no such value")
-    argv = [_executable(found, executable)]
+    argv = [_executable(found, executable, tables)]
     for element in found.template:
-        argv += [_literal(found.manager, element)] if isinstance(element, str) else _value(found.manager, element, values.get(element.name), run_folder)
+        argv += ([_literal(found.manager, element, tables)] if isinstance(element, str)
+                 else _value(found.manager, element, values.get(element.name), run_folder, tables))
     return tuple(argv)
 
 
@@ -211,7 +224,7 @@ def environment(manager, *, home=None, user=None, windows=None, system_dir=None)
 
 
 def refuse_elevated(state):
-    """Hold every package route while PatchCairn itself runs elevated, as root or as SYSTEM (assessment #49)."""
+    """Hold every package route while PatchCairn itself runs elevated, as root or as SYSTEM."""
     if state not in (None, "root", "elevated", "system"):
         raise Refusal("package-elevation", "Unknown elevation state")
     if state is not None:
@@ -274,7 +287,7 @@ def installed_state(packages, unrecognised):
 
 
 def state_changes(before, after, planned, name, skip=(), value=lambda state: state):
-    """Changed packages, those outside the plan and collateral (PD-13) or gone, and whether the diff is complete (unread lines equal)."""
+    """Changed packages, those outside the plan and collateral or gone, and whether the diff is complete (unread lines equal)."""
     keys = set(before["packages"]) | set(after["packages"])
     changed = sorted(k for k in keys if k not in skip and value(before["packages"].get(k) or {}) != value(after["packages"].get(k) or {}))
     return {"changed": changed, "changed_outside_plan": [k for k in changed if name(k) not in planned or k not in after["packages"]],
@@ -504,7 +517,7 @@ def brew_outdated(data):
 
 def _brew_snapshot(kind, item):
     tap = item["tap"] if isinstance(item.get("tap"), str) and B_TAP.fullmatch(item["tap"]) else "other"
-    snap = {"tap": tap, "pinned": _flag(item, "pinned"), "disabled": _flag(item, "disabled")}
+    snap = {"tap": tap, "pinned": _flag(item, "pinned"), "disabled": _flag(item, "disabled"), "deprecated": _flag(item, "deprecated")}
     if kind == "formula":
         installed, linked = [entry.get("version") for entry in _list(item, "installed") if isinstance(entry, dict)], item.get("linked_keg")
         return {**snap, "full_name": item.get("full_name") == item.get("name"), "installed": installed if _brew_versions(installed) else [],
@@ -526,11 +539,14 @@ def brew_info(data):
     return installed_state(packages, unrecognised)
 
 
-def _brew_ineligible(kind, snap):
+def brew_ineligible(kind, snap):
+    """Why a Homebrew package (its brew_info snapshot) is not routed, or None when it is eligible."""
     if snap["tap"] != ("homebrew/core" if kind == "formula" else "homebrew/cask") or not snap.get("full_name", True):
         return "third_party_tap"
     if snap["pinned"] is not False or snap["disabled"] is not False:
         return "pinned_or_disabled"
+    if snap["deprecated"] is not False:
+        return "deprecated"
     if kind == "cask" and (snap["auto_updates"] is not False or snap["latest"]):
         return "self_updating"
     if kind == "cask" and snap["administrator"]:
@@ -544,7 +560,7 @@ def brew_candidates(outdated_data, info_data):
     candidates, reported = [], [{"kind": None, "name": None, "reason": "unrecognised"} for _ in range(unrecognised)]
     for key, entry in sorted(outdated.items()):
         kind, name, snap = *key.split(":", 1), info.get(key)
-        reason = "not_in_info" if snap is None else _brew_ineligible(kind, snap) or ("pinned_or_disabled" if entry["pinned"] else None)
+        reason = "not_in_info" if snap is None else brew_ineligible(kind, snap) or ("pinned_or_disabled" if entry["pinned"] else None)
         if reason:
             reported.append({"kind": kind, "name": name, "reason": reason})
         else:
@@ -553,12 +569,26 @@ def brew_candidates(outdated_data, info_data):
     return candidates, reported
 
 
+# Sections of the summary `brew upgrade --dry-run` prints after its rows (cmd/upgrade.rb, show_final_upgrade_summary), each a typed hold.
+_BREW_HELD_SECTIONS = (
+    (re.compile(r"(?:==> )?[0-9]+ Pinned (?:formula|cask)"), "brew-pinned-dependent",
+     "A package this update touches is pinned (held at its version on purpose), so Homebrew would leave it behind; PatchCairn leaves this update to you"),
+    (re.compile(r"(?:==> )?[0-9]+ Deprecated or disabled package"), "brew-deprecated",
+     "Homebrew marks a package this update touches as deprecated or disabled, so it may stop getting fixes; PatchCairn leaves this update to you"),
+    (re.compile(r"(?:==> )?[0-9]+ homebrew/core formula\w* that would build from source"), "brew-would-build-from-source",
+     "Homebrew would build a package for this update from its source code on this computer; PatchCairn leaves this update to you"))
+
+
 def brew_dependencies(data, name, target):
-    """The other packages `brew upgrade --dry-run` lists under its "Would upgrade"/"Would install" headings (PD-13):
+    """The other packages `brew upgrade --dry-run` lists under its "Would upgrade"/"Would install" headings:
     "<name> <old>[, <old>] -> <new>" or "<name> <new>", columns padded, an optional "(<size>)" at the end. None (the plan
-    holds) when a line is not recognised, or the target is missing or has another version."""
+    holds) when a line is not recognised, or the target is missing or has another version; a pinned, deprecated or
+    build-from-source section holds with its own code."""
     rows, heading = [], False
     for line in (line.strip() for line in text_of(data).splitlines()):
+        for section, code, message in _BREW_HELD_SECTIONS:
+            if section.match(line):
+                raise Refusal(code, message)
         body = re.sub(r"\s*\([^()]*\)\Z", "", line)
         if re.match(r"(?:==> )?Would (?:upgrade|install)\b", line) or not body:
             heading = heading or bool(body)
@@ -572,9 +602,24 @@ def brew_dependencies(data, name, target):
     return [row for row in rows if row["name"] != name] if own == [target] else None
 
 
+def _needs(keg, name):
+    """True when an installed keg lists ``name`` as a runtime dependency, or does not show what it depends on."""
+    found = keg.get("runtime_dependencies") if isinstance(keg, dict) else None
+    return not isinstance(found, list) or any(not isinstance(row, dict) or row.get("full_name") == name for row in found)
+
+
+def brew_outdated_dependent(outdated_data, info_data, name):
+    """True when an outdated formula depends on ``name``. `brew reinstall` upgrades outdated dependents as well and has no dry
+    run, so nothing would show that change first. Reads outdated --json=v2 and info --json=v2 --installed."""
+    outdated = {item.get("name") for kind, item, _ in _brew_items(outdated_data) if kind == "formula" and isinstance(item.get("name"), str)}
+    return any(kind == "formula" and any(_needs(keg, name) for keg in _list(item, "installed"))
+               and any(known in outdated for known in (found, item.get("full_name")) if isinstance(known, str))
+               for kind, item, found in _brew_items(info_data))
+
+
 def check_brew_env(files):
     """The brew.env files ({"system"|"prefix"|"user": bytes or None}), read and never changed, bound by the SHA-256 of
-    their bytes. An allowlist: only the BREW_FIXED keys set to 1 may appear and HOMEBREW_CASK_OPTS is reported; any
+    their bytes. An allowlist: only the BREW_FIXED keys set to 1 may appear and HOMEBREW_CASK_OPTS is reported (it holds casks); any
     other key (another HOMEBREW_* variable such as a remote, a curl or git path, SUDO_ASKPASS) or unread line holds."""
     digests, problems, reported = {}, [], []
     for label in ("system", "prefix", "user"):
@@ -602,27 +647,29 @@ def plan_brew(candidate, *, version, path, machine, env, dependencies):
     if env["problems"]:
         raise Refusal("brew-env", "A brew.env file sets a variable PatchCairn does not allow")
     if not isinstance(dependencies, list):
-        raise Refusal("brew-dependencies", "The dry run gave no recognisable dependency list (PD-13); the plan holds")
+        raise Refusal("brew-dependencies", "The dry run gave no recognisable dependency list; the plan holds")
     return {"manager": "brew", "kind": kind, "name": name, "source": candidate["tap"], "target_version": candidate["target_version"],
             "installed_versions": list(candidate["installed_versions"]), "dependencies": dependencies,
-            "warnings": ["intel_tier3_may_build_from_source"] if machine == "x86_64" and kind == "formula" else [],
             "preflight": {"brew_version": version, "brew_path": path, "prefix": BREW_PREFIXES[machine], "machine": machine,
                           "brew_env_sha256": dict(env["sha256"])},
             "transaction": {"installed_versions": list(candidate["installed_versions"]), "current_version": candidate["target_version"],
                             "eligibility": dict(candidate["eligibility"])}}
 
 
+def brew_at_target(kind, snap, target, bound):
+    """A snapshot after the run stands at ``target``: a cask has it installed; a formula has it installed and linked, or unlinked
+    as a keg-only formula or as it was at plan time (``bound``: the snapshot the plan bound)."""
+    if kind != "formula":
+        return snap.get("installed") == target
+    linked = snap.get("linked_keg")
+    return target in (snap.get("installed") or []) and (linked == target or (linked is None and (snap.get("keg_only") is True or bound.get("linked_keg") is None)))
+
+
 def verify_brew(entry, before, after_data):
     """before: brew_info() before the run. Target installed and linked (or unlinked as at plan time); other changes listed."""
     after = brew_info(after_data)
-    key, target = f"{entry['kind']}:{entry['name']}", entry["target_version"]
-    snap = after["packages"].get(key) or {}
-    if entry["kind"] == "formula":
-        unlinked = entry["transaction"]["eligibility"].get("linked_keg") is None
-        linked = snap.get("linked_keg") == target or (snap.get("linked_keg") is None and (snap.get("keg_only") is True or unlinked))
-        installed = target in (snap.get("installed") or []) and linked
-    else:
-        installed = snap.get("installed") == target
+    key = f"{entry['kind']}:{entry['name']}"
+    installed = brew_at_target(entry["kind"], after["packages"].get(key) or {}, entry["target_version"], entry["transaction"]["eligibility"])
     planned = {row["name"] for row in entry.get("dependencies") or []}
     return {"target_installed": installed,
             **state_changes(before, after, planned, lambda k: k.split(":", 1)[1], skip={key}, value=lambda state: state.get("installed"))}
@@ -736,22 +783,14 @@ def plan_dnf(selected, *, realpath, version, installed, repo_configs, preview):
                             "installed": {f"{i['name']}.{i['arch']}": i["installed_nevras"] for i in items}}}
 
 
-def verify_dnf(entry, before, after_data):
-    """before: rpm_installed() of rpm -qa before the run. Every target NEVRA installed; changes outside the preview listed."""
-    after = rpm_installed(after_data)
-    installed = all(i["target_nevra"] in after["packages"].get(f"{i['name']}.{i['arch']}", []) for i in entry["items"])
-    planned = {i["name"] for i in entry["items"]} | set(entry["collateral"])
-    return {"target_installed": installed, **state_changes(before, after, planned, lambda k: k.rsplit(".", 1)[0])}
-
-
 def dnf_restart(code):
     """`dnf5 needs-restarting`: exit 1 recommended, 0 none, anything else unknown."""
     return {1: "recommended", 0: "none"}.get(code, "unknown") if type(code) is int else "unknown"
 
 
-# --- exit classification and typed outcome ---------------------------------------------------------------------------
+# --- exit classification ----------------------------------------------------------------------------------------------
 RESTART_SIGNALS = ("none", "recommended", "required", "required_before_retry", "initiated_by_installer", "unknown")
-_WINGET_EXITS = {0: ("success", "", "none"), 0x8A150109: ("restart", "", "required"), 0x8A15010B: ("restart", "", "initiated_by_installer"),
+_WINGET_EXITS = {0: ("success", "", "unknown"), 0x8A150109: ("restart", "", "required"), 0x8A15010B: ("restart", "", "initiated_by_installer"),
                  0x8A15010A: ("failed", "", "required_before_retry"), 0x8A15010C: ("failed", "cancelled", "none"),
                  0x8A150068: ("failed", "pinned", "none"), 0x8A150105: ("failed", "disk_full", "none"),
                  0x8A150002: ("failed", "route_held_update_app_installer", "none"),
@@ -759,6 +798,7 @@ _WINGET_EXITS = {0: ("success", "", "none"), 0x8A150109: ("restart", "", "requir
                  **dict.fromkeys((0x8A15002B, 0x8A15004F), ("nothing_to_do", "", "none")),
                  **dict.fromkeys((0x8A150101, 0x8A150102, 0x8A150103, 0x8A150111), ("in_use_retry_later", "", "none")),
                  **dict.fromkeys((0x8A150011, 0x8A15002D, 0x8A15002E, 0x8A15003F), ("integrity_failure", "", "none")),
+                 **dict.fromkeys((0x8A15000A, 0x8A15001A, 0x8A15005E, 0x8A150060), ("integrity_failure", "", "none")),
                  **dict.fromkeys((0x8A150041, 0x8A150046), ("failed", "agreements", "none")),
                  **dict.fromkeys((0x8A15003A, 0x8A15010F), ("failed", "policy", "none")),
                  **dict.fromkeys((0x8A150056, 0x8A15007D), ("failed", "elevated_context", "none"))}
@@ -766,12 +806,17 @@ _POSIX_EXITS = {"brew": {0: ("success", "", "none"), 130: ("failed", "interrupte
                 "apt": {0: ("success", "", "unknown"), 1: ("failed", "elevation_not_completed", "unknown")},
                 "dnf": {0: ("success", "", "unknown"), 2: ("failed", "route_defect", "unknown")},
                 "apt.configure": {0: ("success", "", "unknown"), 1: ("failed", "dpkg_or_elevation_error", "unknown"), 2: ("failed", "dpkg_error", "unknown")}}
+# winget turns an installer's "restart to finish" into exit 0 and only prints this sentence, in its display language.
+_WINGET_RESTART_TEXT = "Restart your PC to finish installation"
+# ChecksumMismatchError's text, and the two lines of Homebrew's download queue, which prints no "mismatch".
+_BREW_CHECKSUM = re.compile(r"SHA-?256 mismatch|reports different checksum|SHA-256 checksum of downloaded file")
 
 
 def classify_exit(manager, code, *, output="", source="process", recipe_id=None):
     """Exit class, reason and restart signal; code & 0xFFFFFFFF, its source ("process", or an 8-bit "shell" status that
-    winget counts as not observed) recorded; None: not observed. output is matched against fixed phrases only. For apt
-    and dnf the restart signal comes from the probes (from_probes). dpkg --configure -a exits 1 or 2 on its own errors."""
+    winget counts as not observed) recorded; None: not observed. output is matched against fixed phrases only. winget's
+    exit 0 alone says nothing about a restart: its printed sentence does. For apt and dnf the restart signal comes from the
+    probes (from_probes). dpkg --configure -a exits 1 or 2 on its own errors."""
     if (manager not in MANAGERS or source not in ("process", "shell") or (code is not None and type(code) is not int)
             or recipe_id not in (None, *RUN_RECIPES) or (recipe_id is not None and RUN_RECIPES[recipe_id].manager != manager)):
         raise Refusal("package-exit", "Unknown manager, exit code, exit source or recipe")
@@ -784,7 +829,9 @@ def classify_exit(manager, code, *, output="", source="process", recipe_id=None)
     else:
         table = _POSIX_EXITS["apt.configure" if recipe_id == "apt.configure" else manager]
         kind, reason, restart = table.get(code, ("failed", "", "none" if manager == "brew" else "unknown"))
-    if (manager, code) == ("brew", 1) and re.search(r"SHA-?256 mismatch", text):
+    if (manager, code) == ("winget", 0) and _WINGET_RESTART_TEXT in text:
+        kind, restart = "restart", "required"
+    elif (manager, code) == ("brew", 1) and _BREW_CHECKSUM.search(text):
         kind = "integrity_failure"
     elif (manager, code) == ("brew", 1) and "requires sudo" in text:
         reason = "needs_sudo"
@@ -793,31 +840,3 @@ def classify_exit(manager, code, *, output="", source="process", recipe_id=None)
     elif (manager, code) == ("apt", 100) and ("Hash Sum mismatch" in text or "cannot be authenticated" in text):
         kind = "integrity_failure"
     return {"exit_code": code, "source": source, "class": kind, "reason": reason, "restart": restart, "from_probes": probes}
-
-
-def typed_outcome(classification, verification, *, restart=None):
-    """Exit class combined with verification. A failure is never upgraded to success, and a change outside the plan is
-    never reported as succeeded (PD-13). restart: the probes' typed signal; by default the exit code's. other_changes:
-    "observed", "not_observed" (the route cannot see them) or "incomplete" (an unreadable line changed)."""
-    restart = classification["restart"] if restart is None else restart
-    if restart not in RESTART_SIGNALS:
-        raise Refusal("package-restart", "Unknown restart signal")
-    kind, present = classification["class"], verification["target_installed"] is True
-    outcome, reason, check = "failed", "", "target_installed" if present else "target_missing"
-    if kind in ("integrity_failure", "in_use_retry_later"):
-        outcome = kind
-    elif kind == "failed":
-        reason = classification["reason"] or ("manager_error_target_present" if present else "manager_error")
-    elif kind == "nothing_to_do":
-        outcome, reason = ("nothing_to_do", "") if present else ("failed", "not_applicable")
-    elif kind == "restart" or present:
-        restarting = kind == "restart" or restart in ("required", "initiated_by_installer")
-        outcome, check = ("succeeded_restart_required" if restarting else "succeeded"), (check if present else "pending_restart")
-    else:
-        reason = "not_completed" if kind == "not_observed" else "verification_mismatch"
-    outside = verification.get("changed_outside_plan")
-    other = "not_observed" if outside is None else "incomplete" if verification.get("diff_complete") is False else "observed"
-    if outcome.startswith("succeeded") and outside:
-        outcome, reason = "failed", "changed_outside_plan"
-    return {"outcome": outcome, "reason": reason, "verification": check, "restart": restart, "other_changes": other,
-            "notice": "PatchCairn never restarts the computer; an installer may close apps or ask to restart"}

@@ -7,7 +7,7 @@ Upgrading:
  examplelib               x86_64  1:2.1-2.fc41     updates     10.0 KiB
    replacing examplelib   x86_64  1:2.1-1.fc41     updates     10.0 KiB
 Installing dependencies:
- exampledep               x86_64  1.0-1.fc41       updates      5.0 KiB
+ exampledep               x86_64  1:1.0-1.fc41     updates      5.0 KiB
 
 Transaction Summary:
  Installing:         1 package

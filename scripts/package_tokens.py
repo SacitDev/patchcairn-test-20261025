@@ -4,7 +4,7 @@ nothing from scripts).
 Every token a package route may emit is an allowed row, and every token the reviewed design refuses is a forbidden
 row; each row cites the manager's official documentation page. package_routes renders only allowed tokens, so a
 token absent from the table is refused as well. The recipes are the only argv shapes: read-only recipes for the
-read-only runner, run recipes rendered for the coordinator after the ticket.
+read-only runner, run recipes for the ticket-bound launcher (service_updates) after the one-use ticket.
 """
 from collections import namedtuple
 import re
@@ -272,6 +272,10 @@ TOKENS = (
     Token(token="--allow-change-held-packages", allowed=False, manager="apt",
           url="https://manpages.debian.org/trixie/apt/apt-get.8.en.html"),
     Token(token="--force-yes", allowed=False, manager="apt", url="https://manpages.debian.org/trixie/apt/apt-get.8.en.html"),
+    Token(token="--allow-insecure-repositories", allowed=False, manager="apt",
+          url="https://manpages.debian.org/trixie/apt/apt-get.8.en.html"),
+    Token(token="--allow-releaseinfo-change", allowed=False, manager="apt",
+          url="https://manpages.debian.org/trixie/apt/apt-get.8.en.html"),
     Token(token="-c", allowed=False, manager="apt", url="https://manpages.debian.org/trixie/apt/apt-get.8.en.html"),
     Token(token="--config-file", allowed=False, manager="apt", url="https://manpages.debian.org/trixie/apt/apt-get.8.en.html"),
     Token(token="APT_CONFIG", allowed=False, manager="apt", url="https://manpages.debian.org/trixie/apt/apt-get.8.en.html"),
@@ -406,9 +410,11 @@ READ_RECIPES = MappingProxyType({
     "dnf.repo_config": Recipe("dnf", "/usr/bin/dnf5", (Slot("repoid", joined="--dump-repo-config"),)),
     # The --assumeno exit code is undocumented; the parser decides.
     "dnf.preview": Recipe("dnf", "/usr/bin/dnf5", ("upgrade", "--assumeno", "--no-allow-downgrade", Slot("nevra", many=True)), frozenset({0, 1})),
+    # The reinstall's own preview: only it names the repository that would supply the package.
+    "dnf.preview_reinstall": Recipe("dnf", "/usr/bin/dnf5", ("reinstall", "--assumeno", "--no-allow-downgrade", Slot("nevra")), frozenset({0, 1})),
     "dnf.needs_restarting": Recipe("dnf", "/usr/bin/dnf5", ("needs-restarting",), frozenset({0, 1})),
 })
-# Changing commands: rendered for the coordinator after the one-use ticket; PatchCairn never runs them itself.
+# Changing commands: only the ticket-bound launcher (service_updates.run_ticket) runs them, after the one-use ticket.
 RUN_RECIPES = MappingProxyType({
     "winget.upgrade": Recipe("winget", "winget", ("upgrade", "--id", Slot("id"), "--exact", "--version", Slot("version"), "--source", "winget",
                                                   "--silent", _W, Slot("package_agreements", flag="--accept-package-agreements"), _CONSENT,

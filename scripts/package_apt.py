@@ -1,4 +1,4 @@
-"""The apt route (layer L2-pure: standard library, pc_records, package_routes; D-057 moved it out of package_routes).
+"""The apt route (layer L2-pure: standard library, pc_records, package_routes; moved out of package_routes).
 
 It starts no process. Parsers for apt-config dump, the sources files, apt-get -s, dpkg-query, apt-cache policy and
 needrestart -b turn manager output into validated fields (raw manager text never leaves a parser); plan binding,
@@ -43,6 +43,7 @@ _APT_LINES = (("upgrade", re.compile(r"Inst (\S+) \[(\S+)\] \((\S+) (.+?) \[(\S+
               ("remove", re.compile(r"Remv (\S+) \[(\S+)\]" + _BREAKS), ("installed_version",)),
               ("remove", re.compile(r"Purg (\S+) \[(\S+)\]" + _BREAKS), ("installed_version",)))
 _ORIGIN = re.compile(r"[A-Za-z0-9.:/_+~ ,-]{1,200}")
+_SUITE = re.compile(r"(?!-)(?!.*:~)[A-Za-z0-9_.+:~-]{1,256}")  # engine_updates' token, the one shape the payload's source may have
 
 
 def apt_config(data):
@@ -195,6 +196,13 @@ def apt_sources(files):
         for fields in [_list_entry(line) for line in lines] if key.endswith(".list") else _stanzas("\n".join(lines), label):
             problems += _source_problems(label, fields, not key.endswith(".list"))
     return {"sha256": pc_records.digest(digests), "problems": problems, "ignored": ignored}
+
+
+def apt_source(origin):
+    """The payload's source from an origin apt printed: "<label>:<version>/<suite>", several joined by ", " for a version in
+    more than one suite. The first suite, or "apt" when it does not fit; the whole origin stays bound through sim_sha256."""
+    suite = origin.split(", ")[0].rpartition("/")[2]
+    return suite if _SUITE.fullmatch(suite) else "apt"
 
 
 def apt_simulation(data, *, exit_code):

@@ -34,7 +34,8 @@ ROOT = Path(__file__).absolute().parent.parent
 FACADES = {"workflow_core", "workflow_service", "storage_ops"}
 L0 = {"pc_records", "pc_paths"}
 L1 = {"scoped_base", "scoped_fs", "windows_scoped", "win32_files", "private_workspace", "linux_privacy", "darwin_privacy"}
-L2_PURE = {"package_routes", "package_tokens", "package_apt", "schedule_hosts", "schedule_probe", "storage_contract", "diagnostic_core"}
+L2_PURE = {"package_routes", "package_tokens", "package_apt", "package_registry", "schedule_hosts", "schedule_probe", "storage_contract",
+           "diagnostic_core"}
 ALLOWED = {"L0": set(), "L1": {"L0", "L1"}, "L2": {"L0", "L1", "L2", "L2-pure"}, "L2-pure": {"L0", "L2-pure"},
            "L3": {"L0", "L2-pure", "L3"}, "L4": {"L0", "L1", "L2", "L2-pure", "L3", "L4"}, "L5": set(), "tool": set()}
 

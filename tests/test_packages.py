@@ -2,31 +2,44 @@
 
 No test starts a package manager. Parsers read tests/fixtures/packages (fictional package ids); executable resolution
 and the read-only runner use FakeProbe and FakeLauncher below. The fictional Windows folders and the fictional home
-folder are not user-profile paths (D-026).
+folder are not user-profile paths.
 Run from the repository root: python3 -I -S -B -m unittest discover -s tests -p "test_packages.py"
 """
 from __future__ import annotations
 
+import ast
+from datetime import datetime, timedelta
 import functools
 import json
 import ntpath
+import os
+import re
+import shlex
+import shutil
 from pathlib import Path, PurePosixPath
 import stat
 import sys
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 import unittest
 from unittest import mock
 from urllib.parse import urlsplit
+import uuid
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).absolute().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 import package_apt as apt  # noqa: E402
+import package_registry  # noqa: E402
 import package_routes as routes  # noqa: E402
 import package_tokens  # noqa: E402
 import pc_records  # noqa: E402
 import readonly_runner  # noqa: E402
+import service_updates  # noqa: E402
 from pc_records import Refusal  # noqa: E402
+from clock_helpers import utc_now  # noqa: E402
+from test_service_state import PROSE, SessionFixtures  # noqa: E402
+from workflow_core import WorkflowRefusal  # noqa: E402
+from workflow_service import ServiceRefusal  # noqa: E402
 
 FIXTURES = ROOT / "tests" / "fixtures" / "packages"
 LOCAL_APPDATA = "D:\\PatchCairnTest\\LocalData"
@@ -43,7 +56,7 @@ HOME = "/var/lib/patchcairn-test/example"
 NOW = "2026-10-25T12:00:00Z"
 ORIGIN = "Example:24.04/example-updates"
 SHELLS = {"cmd", "cmd.exe", "sh", "bash", "zsh", "powershell", "powershell.exe", "pwsh", "pwsh.exe", "/bin/sh", "/bin/bash"}
-# The documentation allowlist per manager: host and path prefix (assessment #27).
+# The documentation allowlist per manager: host and path prefix.
 DOC_HOSTS = {"winget": [("learn.microsoft.com", ()), ("github.com", ("microsoft", "winget-cli"))], "brew": [("docs.brew.sh", ())],
              "apt": [("manpages.debian.org", ()), ("manpages.ubuntu.com", ())],
              "dnf": [("dnf.readthedocs.io", ()), ("dnf5.readthedocs.io", ()), ("rpm-software-management.github.io", ())],
@@ -51,15 +64,15 @@ DOC_HOSTS = {"winget": [("learn.microsoft.com", ()), ("github.com", ("microsoft"
 # Forbidden rows per manager: one per token of the design's section 3 (patterns such as globs, `<name>/<release>` or
 # dpkg `--force-*` are refused by the grammar instead, and winget --name, apt -o and apt-get -s are allowed rows).
 # brew has one row fewer than section 3: the legacy JSON format flag is not listed literally, because the frozen G03
-# label rule refuses that spelling; render() emits only --json=v2 (D-035).
-FORBIDDEN_ROWS = {"winget": 64, "brew": 47, "apt": 27, "dnf": 44, "repair": 5}
+# label rule refuses that spelling; render() emits only --json=v2.
+FORBIDDEN_ROWS = {"winget": 64, "brew": 47, "apt": 29, "dnf": 44, "repair": 5}
 
 
 def fixture(name):
     return (FIXTURES / name).read_bytes()
 
 
-# winget --version prints a leading v; the frozen G03 label rule refuses that literal, so tests compose it (D-035).
+# winget --version prints a leading v; the version-label rule refuses that literal in the source, so tests compose it.
 WINGET_V = "v"
 
 
@@ -98,8 +111,8 @@ def regular(uid=0, mode=0o755):
     return SimpleNamespace(st_mode=stat.S_IFREG | mode, st_uid=uid)
 
 
-def folder(uid=0, mode=0o755):
-    return SimpleNamespace(st_mode=stat.S_IFDIR | mode, st_uid=uid)
+def folder(uid=0, mode=0o755, gid=0):
+    return SimpleNamespace(st_mode=stat.S_IFDIR | mode, st_uid=uid, st_gid=gid)
 
 
 def symlink(uid=0):
@@ -177,6 +190,176 @@ class FakeLauncher:
         return self.code, self.data
 
 
+SUDO = "/usr/bin/sudo"
+FIXTURE_ROOTS = []
+
+
+def fixture_root():
+    """A new fictional root under work/test-fixtures; tearDownModule removes every one."""
+    root = ROOT / "work" / "test-fixtures" / ("pkg-" + uuid.uuid4().hex[:16])
+    FIXTURE_ROOTS.append(root)
+    return root
+
+
+def remove_fixture_roots():
+    while FIXTURE_ROOTS:
+        shutil.rmtree(FIXTURE_ROOTS.pop(), ignore_errors=True)
+
+
+def tearDownModule():
+    remove_fixture_roots()
+
+FAKE_ENV = {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
+UPGRADE, REINSTALL, REPAIR = pc_records.ADAPTER_PACKAGE_UPGRADE, pc_records.ADAPTER_PACKAGE_REINSTALL, pc_records.ADAPTER_SYSTEM_REPAIR
+FIRMWARE, HANDOFF = pc_records.ADAPTER_SYSTEM_FIRMWARE_UPDATE, pc_records.ADAPTER_SYSTEM_UPDATE_HANDOFF
+OPERATION_OF = {UPGRADE: "upgrade", REINSTALL: "reinstall", REPAIR: "repair", FIRMWARE: "firmware_update", HANDOFF: "system_update"}
+
+
+class FakeChild:
+    """The run launcher: records each start (argv, environment, folder, terminal) and returns a fixed exit code and output.
+    It has kill and terminate only so a test can prove nothing ever asks for them."""
+
+    def __init__(self, code=0, tail=b"", events=None, error=None):
+        self.code, self.tail, self.events, self.error, self.calls, self.killed = code, tail, events, error, [], []
+
+    def __call__(self, argv, **keywords):
+        self.calls.append(SimpleNamespace(argv=argv, **keywords))
+        if self.events is not None:
+            self.events.append("start")
+        if self.error:
+            raise self.error
+        return self.code, self.tail
+
+    def kill(self):
+        self.killed.append("kill")
+
+    def terminate(self):
+        self.killed.append("terminate")
+
+
+class FakeTerminal:
+    """The terminal run_ticket runs in: whether stdin and stdout are a TTY, and what the person types at the device line."""
+
+    def __init__(self, tty=True, answer=None, events=None):
+        self.tty, self.answer, self.events, self.prompts = tty, answer, events, []
+
+    def isatty(self):
+        return self.tty
+
+    def ask(self, prompt):
+        self.prompts.append(prompt)
+        if self.events is not None:
+            self.events.append("ask")
+        return self.answer
+
+
+class RunProbe(FakeProbe):
+    """FakeProbe plus the run-folder admission, configuration files and (only when given) the boot time of the fictional
+    computer; nothing on this computer is read."""
+
+    def __init__(self, *args, text_files=None, folders=None, boot=None, **kwargs):
+        kwargs.setdefault("files", {SUDO: regular()})
+        super().__init__(*args, **kwargs)
+        self.text_files, self.folders, self.admitted = dict(text_files or {}), dict(folders or {}), []
+        if boot is not None:
+            self.boot_identity = lambda: dict(boot)
+
+    def private_folder(self, path):
+        self.admitted.append(path)
+        return str(path)
+
+    def read_file(self, path):
+        return self.text_files.get(path)
+
+    def list_names(self, folder):
+        return self.folders.get(folder)
+
+
+def sudo_identity():
+    return readonly_runner.executable_identity("system", SUDO, program=SUDO, probe=RunProbe())
+
+
+def fake_route(events=None, *, manager="pip", recipe="apt.configure", run_kind="terminal", drift=None, result="updated", verified=True,
+               os_consent="not_observed", restart_probe=None, restart=None, classify=None, self_ids=(), item_flags=None, scripts=None,
+               results=None, restart_files=None, dependencies=None):
+    """A built route the service has never seen (a manager the core registry does not build), made only of the descriptor fields;
+    it runs an existing recipe through sudo, reads apt.audit as its verification and records its hooks in ``events``.
+    item_flags, scripts and results map an item id to its flags, install-script names and verification result; dependencies,
+    when given, makes the route list what each item id brings with it (a missing id: nothing)."""
+    events = [] if events is None else events
+
+    def drift_hook(probe, run, payload):
+        events.append("drift")
+        return drift
+
+    def verify(payload, reads):
+        events.append("verify")
+        found = (results or {}).get(payload["id"], result)
+        return {"result": found, "verified_postcondition": verified, "installed_version": payload["version"] if found == "updated" else None,
+                "facts": {"changed_outside_plan": []}}
+
+    def preflight(probe, run, item, operation):
+        events.append("preflight")
+        return {"operation": operation, "id": item["id"], "version": "1.0.0", "source": "fictional", "flags": list((item_flags or {}).get(item["id"], ())),
+                "script_names": list((scripts or {}).get(item["id"], ())), "preflight": {"version": "1.0.0", "item": item["id"]},
+                **({} if dependencies is None else {"dependencies": list(dependencies.get(item["id"], ()))})}
+
+    def plan(candidate, facts):
+        fragment = {"manager": manager, "operation": facts["operation"], "id": candidate["id"], "version": candidate["version"],
+                    "source": candidate["source"], "group": "apps", "flags": sorted(candidate.get("flags") or ()), "preflight": candidate["preflight"],
+                    "dependencies": list(candidate.get("dependencies") or ()), "agreements": sorted(facts.get("agreements") or ()), "run_kind": run_kind,
+                    "recipe": recipe, "run_files": {}, "executable": facts["executable"], **({"depends_on": []} if "dependencies" in candidate else {})}
+        conditional = package_registry.conditional_of(fragment["flags"], candidate.get("script_names") or ())
+        return fragment if conditional is None else {**fragment, "conditional": conditional}
+
+    plan.selection = lambda record: (None if run_kind == "settings" else recipe, run_kind)
+    return MappingProxyType({
+        "manager": manager, "platforms": ("linux",), "group": "apps", "state": "built", "run_kind": run_kind, "flags": tuple(pc_records.ROUTE_FLAGS),
+        "discover": lambda probe, run: {"candidates": [], "left_out": [], "holds": []}, "plan": plan, "drift": drift_hook,
+        "verify_recipes": ("apt.audit",), "verify": verify, "restart_probe": restart_probe, "self_ids": self_ids,
+        "classify_exit": classify or (lambda code, tail: "success" if code == 0 else "not_observed" if code is None else "failed"),
+        "run": MappingProxyType({"recipes": (recipe,), "preflight": preflight, "values": lambda payload, recipe_id, folder: {},
+                                 "executable": lambda probe, recipe_id: {"kind": "system", "path": SUDO, "program": SUDO},
+                                 "environment": lambda probe: dict(FAKE_ENV), "os_consent": os_consent,
+                                 **({"restart": restart} if restart else {}), **({"restart_files": restart_files} if restart_files else {})}),
+    })
+
+
+def fake_payload(route, *, adapter_id=UPGRADE, run_files=None, flags=(), device=None, run_kind=None, settings_page=None):
+    fields = {"manager": route["manager"], "operation": OPERATION_OF[adapter_id], "id": "example-tool", "version": "1.0.0", "source": "fictional",
+              "group": "apps", "flags": sorted(flags), "preflight": {"version": "1.0.0", "item": "example-tool"}, "run_kind": run_kind or route["run_kind"]}
+    if fields["run_kind"] == "settings":
+        return package_registry.payload({**fields, "settings_page": settings_page or "windowsupdate"})
+    fields.update(dependencies=[], agreements=[], recipe=route["run"]["recipes"][0], executable={"kind": "system", "path": SUDO, "identity": sudo_identity()},
+                  run_files={name: pc_records.digest(text.encode("utf-8")) for name, text in sorted((run_files or {}).items())})
+    if device is not None:
+        fields["device"] = device
+    return package_registry.payload(fields, environment=FAKE_ENV)
+
+
+def registered(*routes):
+    """The registry with these routes added (a route for a manager the core does not build plugs in this way)."""
+    return mock.patch.object(package_registry, "DESCRIPTORS", MappingProxyType({**package_registry.DESCRIPTORS,
+                                                                                **{route["manager"]: route for route in routes}}))
+
+
+class ManagerRun:
+    """The run function a route's hooks get, over fictional output {recipe id: bytes}. A recipe in ``failed`` exits with a code its
+    recipe does not expect and prints its output all the same."""
+
+    folder = "fictional-run-folder"
+
+    def __init__(self, outputs, *, failed=(), files=None, folders=None):
+        self.outputs, self.failed, self.read_file, self.list_names = outputs, failed, dict(files or {}).get, dict(folders or {}).get
+
+    def __call__(self, recipe_id, values=None):
+        ok = recipe_id not in self.failed
+        return {"recipe": recipe_id, "ok": ok, "exit_code": 0 if ok else 3, "stdout": self.outputs[recipe_id]}
+
+
+SETTLED_APT = {"apt.config": fixture("apt-config.txt"), "apt.policy": fixture("apt-policy.txt"), "apt.newer": b""}
+
+
 def documented(row):
     parts = urlsplit(row.url)
     path = tuple(parts.path.split("/")[1:])
@@ -209,6 +392,13 @@ def token_problems(manager, argv, values=(), paths=(), shell=True):
 
 def read_recipes(manager):
     return {rid: found for rid, found in routes.READ_RECIPES.items() if found.manager == manager}
+
+
+def result_of(classification, verification, *, signal=None):
+    """The one result function over a parsed exit and a route module's own verification facts."""
+    reported = "differs_from_plan" if verification.get("changed_outside_plan") else "updated" if verification["target_installed"] else "did_not_update"
+    return package_registry.route_result({"run_kind": "process"}, classification, {"result": reported, "verified_postcondition": verification.get("diff_complete") is not False},
+                                         signal=signal)["result"]
 
 
 def stored(state):
@@ -305,12 +495,10 @@ class WingetRouteTests(unittest.TestCase):
         after = routes.verify_winget(entry, fixture("winget-installed-after.txt"))
         self.assertTrue(after["target_installed"])
         self.assertEqual((after["changed"], after["changed_outside_plan"]), (None, None))
-        done = routes.typed_outcome(routes.classify_exit("winget", 0), after)
-        self.assertEqual((done["outcome"], done["other_changes"]), ("succeeded", "not_observed"))
+        self.assertEqual(result_of(routes.classify_exit("winget", 0), after), "updated")
         unchanged = routes.verify_winget(entry, fixture("winget-installed-before.txt"))
         self.assertEqual((unchanged["target_installed"], unchanged["reason"]), (False, "version_differs"))
-        outcome = routes.typed_outcome(routes.classify_exit("winget", 0), unchanged)
-        self.assertEqual((outcome["outcome"], outcome["reason"]), ("failed", "verification_mismatch"))
+        self.assertEqual(result_of(routes.classify_exit("winget", 0), unchanged), "did_not_update")
         newer = fixture("winget-installed-after.txt").replace(b"3.4.1", b"3.5.0")
         self.assertFalse(routes.verify_winget(entry, newer)["target_installed"])
         for gone in (b"No installed package found matching input criteria.\n", fixture("winget-installed-after.txt") * 2):
@@ -343,15 +531,13 @@ class WingetRouteTests(unittest.TestCase):
     def test_restart_signal_is_reported_not_triggered(self):
         cases = {0x8A150109: ("restart", "required"), 0x8A150109 - 2 ** 32: ("restart", "required"),
                  0x8A15010B: ("restart", "initiated_by_installer"), 0x8A15010A: ("failed", "required_before_retry"),
-                 3010: ("restart", "required"), 0: ("success", "none"), 0x8A150123: ("failed", "unknown")}
+                 3010: ("restart", "required"), 0: ("success", "unknown"), 0x8A150123: ("failed", "unknown")}
         for code, expected in cases.items():
             result = routes.classify_exit("winget", code)
             self.assertEqual((result["class"], result["restart"]), expected, hex(code))
             self.assertEqual((result["exit_code"], result["from_probes"]), (code & 0xFFFFFFFF, False))
-        pending = routes.typed_outcome(routes.classify_exit("winget", 0x8A150109), {"target_installed": False})
-        self.assertEqual((pending["outcome"], pending["verification"], pending["restart"]),
-                         ("succeeded_restart_required", "pending_restart", "required"))
-        self.assertIn("never restarts the computer", pending["notice"])
+        pending = routes.classify_exit("winget", 0x8A150109)
+        self.assertEqual(result_of(pending, {"target_installed": False}, signal=pending["restart"]), "restart_needed")
         shell = routes.classify_exit("winget", 9, source="shell")
         self.assertEqual((shell["class"], shell["exit_code"]), ("not_observed", None))
         self.assertNotIn("--allow-reboot", routes.run_argv(self.entry(), log_file=RUN_LOG, run_folder=RUN_FOLDER))
@@ -490,8 +676,7 @@ class WingetRouteTests(unittest.TestCase):
         for code, expected in ((0x8A15002B, "nothing_to_do"), (0x8A150101, "in_use_retry_later"), (0x8A150011, "integrity_failure"),
                                (0x8A150046, "failed"), (0x8A150056, "failed")):
             self.assertEqual(routes.classify_exit("winget", code)["class"], expected)
-        nothing = routes.typed_outcome(routes.classify_exit("winget", 0x8A15002B), {"target_installed": False})
-        self.assertEqual((nothing["outcome"], nothing["reason"]), ("failed", "not_applicable"))
+        self.assertEqual(result_of(routes.classify_exit("winget", 0x8A15002B), {"target_installed": False}), "did_not_update")
         holds(self, "package-exit", routes.classify_exit, "winget", "0")
         holds(self, "package-exit", routes.classify_exit, "winget", 0, recipe_id="apt.configure")
         holds(self, "package-output", routes.text_of, b"x" * (routes.MAX_OUTPUT_BYTES + 1))
@@ -504,6 +689,82 @@ class WingetRouteTests(unittest.TestCase):
         confirm = routes.winget_installed(fixture("winget-installed-before.txt"), candidate["id"])
         holds(self, "winget-source", routes.plan_winget, candidate, confirm, client=WINGET_CLIENT,
               source=dict(routes.WINGET_SOURCE, Type="Microsoft.Rest"), agreements={"source": True, "package": True}, executable=WINGET_EXE)
+
+    def test_security_failures_are_integrity_failures(self):
+        # returnCodes.md: INDEX_INTEGRITY_COMPROMISED, SOURCE_NOT_SECURE, PINNED_CERTIFICATE_MISMATCH, ARCHIVE_SCAN_FAILED.
+        for code in (0x8A15000A, 0x8A15001A, 0x8A15005E, 0x8A150060):
+            with self.subTest(code=hex(code)):
+                found = routes.classify_exit("winget", code)
+                self.assertEqual((found["class"], found["reason"], found["restart"]), ("integrity_failure", "", "none"))
+                exited = {"class": package_registry.WINGET["classify_exit"](code, "")}
+                self.assertEqual(package_registry.route_result({"run_kind": "process"}, exited, {"result": "did_not_update", "verified_postcondition": True}),
+                                 {"result": "integrity_failure", "verified_postcondition": False})
+
+    def test_exit_zero_with_the_restart_sentence_needs_a_restart(self):
+        printed = "Successfully installed\nRestart your PC to finish installation.\n"
+        for output in (printed, printed.encode(), b"\x1b[33mRestart your PC to finish installation.\x1b[0m\r\n"):
+            with self.subTest(output=output):
+                found = routes.classify_exit("winget", 0, output=output)
+                self.assertEqual((found["exit_code"], found["class"], found["restart"]), (0, "restart", "required"))
+        self.assertEqual(package_registry.WINGET["classify_exit"](0, printed), "restart")
+        self.assertEqual(package_registry.WINGET["run"]["exit_restart"](0, printed), "required")
+        # Without the sentence exit 0 says nothing about a restart: another display language stays unknown, never "none".
+        for output in ("", "Successfully installed\n", "Starten Sie den PC neu, um die Installation abzuschliessen.\n"):
+            found = routes.classify_exit("winget", 0, output=output)
+            self.assertEqual((found["class"], found["restart"]), ("success", "unknown"), output)
+        # The sentence changes only exit 0.
+        self.assertEqual(routes.classify_exit("winget", 0x8A150101, output=printed)["class"], "in_use_retry_later")
+        self.assertEqual(routes.classify_exit("winget", 9, output=printed, source="shell")["class"], "not_observed")
+
+    def test_a_dash_word_with_a_dot_is_quoted_for_powershell(self):
+        self.assertEqual(package_registry.shell_line((WINGET, "-name.ext", "--name.ext", "-m", "plain.word")),
+                         f"& '{WINGET}' '-name.ext' --name.ext -m plain.word")
+
+    def test_the_export_is_removed_once_it_was_read(self):
+        def computer(error=None):
+            events = []
+            def run(recipe_id, values=None):
+                events.append(recipe_id)
+                if error and recipe_id == "winget.upgrades":
+                    raise error
+                return {"ok": True, "exit_code": 0, "stdout": b""}
+            run.folder = RUN_FOLDER
+            run.read_file = lambda path: events.append("read") or b""
+            run.discard = lambda path: events.append(path)
+            return run, events
+        run, events = computer()
+        with mock.patch.object(routes, "winget_candidates", return_value=([{"id": "Contoso.NoteTaker"}], [])):
+            self.assertEqual(package_registry._winget_listing(None, run), ([{"id": "Contoso.NoteTaker"}], []))
+        self.assertEqual(events, ["winget.export", "winget.upgrades", "read", EXPORT_FILE])
+        # A listing that holds leaves no inventory behind either.
+        run, events = computer(Refusal("runner-timeout", "fictional"))
+        holds(self, "runner-timeout", package_registry._winget_listing, None, run)
+        self.assertEqual(events[-1], EXPORT_FILE)
+        run, events = computer()
+        with mock.patch.object(routes, "winget_candidates", side_effect=Refusal("winget-table", "fictional")):
+            holds(self, "winget-table", package_registry._winget_listing, None, run)
+        self.assertEqual(events[-1], EXPORT_FILE)
+
+
+def brew_one(name, source):
+    """A fixture narrowed to one package, as `brew outdated` and `brew info` print it for a named package."""
+    document = json.loads(fixture(source))
+    return {part: [item for item in document[part] if name in (item.get("name"), item.get("token"))] for part in ("formulae", "casks")}
+
+
+def brew_run(outputs=None, files=None):
+    """A run function over fictional Homebrew output (recipe id -> bytes), for the registry's Homebrew hooks; brew.env files by path."""
+    table = {"brew.version": fixture("brew-version.txt"), "brew.outdated_one": json.dumps(brew_one("examplefetch", "brew-outdated.json")).encode(),
+             "brew.info_one": json.dumps(brew_one("examplefetch", "brew-info.json")).encode(), "brew.dry_run": fixture("brew-dry-run.txt"), **(outputs or {})}
+    def run(recipe_id, values=None):
+        return {"recipe": recipe_id, "ok": True, "exit_code": 0, "stdout": table[recipe_id]}
+    run.read_file = (files or {}).get
+    return run
+
+
+MAC = "darwin"
+FETCH = {"id": "examplefetch", "kind": "formula"}
+BREW_PREFLIGHT = package_registry.BREW["run"]["preflight"]
 
 
 @refusals_fail
@@ -567,7 +828,7 @@ class HomebrewRouteTests(unittest.TestCase):
                                                  {"name": "examplenew", "installed_versions": [], "target_version": "2.0"}])
         self.assertEqual((entry["preflight"]["brew_version"], entry["preflight"]["brew_path"], entry["preflight"]["prefix"]),
                          ("7.0.10", BREW, "/opt/homebrew"))
-        # Several old versions are comma-separated; packages joined on one line hold instead of hiding a dependency (PD-13).
+        # Several old versions are comma-separated; packages joined on one line hold instead of hiding a dependency.
         self.assertEqual(routes.brew_dependencies(b"==> Would upgrade 1 outdated package:\nexamplefetch 1.24.4, 1.24.5 -> 1.25.0_2\n",
                                                   "examplefetch", "1.25.0_2"), [])
         for dry_run in (b"==> Would upgrade\nexamplefetch 1.24.5 -> 1.25.0_2\nsomething else here\n", b"examplefetch 1.24.5 -> 1.25.0_2\n",
@@ -624,10 +885,10 @@ class HomebrewRouteTests(unittest.TestCase):
         ok = routes.verify_brew(entry, before, fixture("brew-info-after.json"))
         self.assertEqual(ok, {"target_installed": True, "changed": ["formula:exampledep"], "changed_outside_plan": [], "diff_complete": True})
         self.assertEqual(ok, routes.verify_brew(entry, routes.brew_info(fixture("brew-info.json")), fixture("brew-info-after.json")))
-        self.assertEqual(routes.typed_outcome(routes.classify_exit("brew", 0), ok)["outcome"], "succeeded")
+        self.assertEqual(result_of(routes.classify_exit("brew", 0), ok), "updated")
         wrong = routes.verify_brew(entry, before, self.info_with(examplefetch="1.25.0_1"))
         self.assertFalse(wrong["target_installed"])
-        self.assertEqual(routes.typed_outcome(routes.classify_exit("brew", 0), wrong)["reason"], "verification_mismatch")
+        self.assertEqual(result_of(routes.classify_exit("brew", 0), wrong), "did_not_update")
         unlinked = json.loads(fixture("brew-info-after.json"))
         unlinked["formulae"][0]["linked_keg"] = "1.24.5"
         self.assertFalse(routes.verify_brew(entry, before, json.dumps(unlinked).encode())["target_installed"])
@@ -640,8 +901,7 @@ class HomebrewRouteTests(unittest.TestCase):
         self.assertFalse(routes.verify_brew(cask, before, fixture("brew-info-after.json"))["target_installed"])
         outside = routes.verify_brew(entry, before, self.info_with(exampleother="4.1"))
         self.assertEqual(outside["changed_outside_plan"], ["formula:exampleother"])
-        result = routes.typed_outcome(routes.classify_exit("brew", 0), outside)
-        self.assertEqual((result["outcome"], result["reason"]), ("failed", "changed_outside_plan"))
+        self.assertEqual(result_of(routes.classify_exit("brew", 0), outside), "differs_from_plan")
 
     def test_executable_is_absolute_and_no_shell(self):
         launcher = FakeLauncher(fixture("brew-version.txt"))
@@ -677,14 +937,12 @@ class HomebrewRouteTests(unittest.TestCase):
     def test_restart_signal_is_reported_not_triggered(self):
         for code in (0, 1, 130, 7):
             self.assertEqual(routes.classify_exit("brew", code)["restart"], "none")
-        done = routes.typed_outcome(routes.classify_exit("brew", 0), {"target_installed": True})
-        self.assertEqual((done["outcome"], done["restart"]), ("succeeded", "none"))
+        self.assertEqual(result_of(routes.classify_exit("brew", 0), {"target_installed": True}), "updated")
         self.assertEqual(routes.BREW_FIXED["HOMEBREW_NO_UPGRADE_QUIT_CASKS"], "1")
         self.assertEqual(routes.classify_exit("brew", 1, output="Error: SHA256 mismatch")["class"], "integrity_failure")
         self.assertEqual(routes.classify_exit("brew", 1, output="Error: This cask requires sudo")["reason"], "needs_sudo")
         self.assertEqual(routes.classify_exit("brew", 130)["reason"], "interrupted")
-        failed = routes.typed_outcome(routes.classify_exit("brew", 1), {"target_installed": True})
-        self.assertEqual((failed["outcome"], failed["reason"]), ("failed", "manager_error_target_present"))
+        self.assertEqual(result_of(routes.classify_exit("brew", 1), {"target_installed": True}), "differs_from_plan")
 
     def test_environment_is_fixed(self):
         env = routes.environment("brew", home=HOME, user="example")
@@ -757,6 +1015,144 @@ class HomebrewRouteTests(unittest.TestCase):
         candidates, reported = self.candidates()
         self.assertNotIn("-examplebad", [c["name"] for c in candidates] + [r["name"] for r in reported])
         holds(self, "package-recipe-values", routes.render, "brew.info_one", {"kind": "--force", "name": "examplefetch"}, executable=BREW)
+
+    def test_a_tampered_download_is_an_integrity_failure(self):
+        # Homebrew's download queue prints these two lines and no "mismatch"; ChecksumMismatchError prints "SHA-256 mismatch".
+        queue = ("Error: Bottle examplefetch (1.25.0_2) reports different checksum: " + "a" * 64 + "\n"
+                 "       SHA-256 checksum of downloaded file:                        " + "b" * 64 + "\n")
+        for output in (queue, queue.splitlines()[0], queue.splitlines()[1], "Error: SHA-256 mismatch\nExpected: a\n"):
+            with self.subTest(output=output):
+                self.assertEqual(routes.classify_exit("brew", 1, output=output)["class"], "integrity_failure")
+                self.assertEqual(package_registry.BREW["classify_exit"](1, output), "integrity_failure")
+        self.assertEqual(routes.classify_exit("brew", 1, output="Error: Download failed\n")["class"], "failed")
+
+    def test_dry_run_sections_hold_with_their_own_reason(self):
+        rows = "==> Would upgrade 1 requested outdated package\nexamplefetch 1.24.5 -> 1.25.0_2\n"
+        for section, code in (("==> 1 homebrew/core formula that would build from source\nexamplefetch\n", "brew-would-build-from-source"),
+                              ("==> 2 homebrew/core formulae that would build from source\nexamplefetch\nexampledep\n", "brew-would-build-from-source"),
+                              ("==> 1 Deprecated or disabled package\nexampledep (deprecated)\n", "brew-deprecated"),
+                              ("==> 2 Deprecated or disabled packages\nexampledep (deprecated)\nexampleother (disabled)\n", "brew-deprecated"),
+                              ("==> 1 Pinned formula\nexamplepin 2.0 -> 2.1\n", "brew-pinned-dependent"),
+                              ("==> 2 Pinned formulae\nexamplepin 2.0 -> 2.1\nexampleother 4.0 -> 4.1\n", "brew-pinned-dependent"),
+                              ("==> 1 Pinned cask\nexampleviewer 131.0 -> 132.0\n", "brew-pinned-dependent")):
+            with self.subTest(section=section):
+                holds(self, code, routes.brew_dependencies, (rows + section).encode(), "examplefetch", "1.25.0_2")
+                holds(self, code, BREW_PREFLIGHT, FakeProbe(platform=MAC), brew_run({"brew.dry_run": (rows + section).encode()}), FETCH, "upgrade")
+        self.assertNotIn("warnings", self.entry(machine="x86_64"))
+
+    def test_a_deprecated_package_is_not_offered(self):
+        info = json.loads(fixture("brew-info.json"))
+        info["formulae"][0]["deprecated"] = False
+        self.assertIn("examplefetch", [c["name"] for c in self.candidates(info=json.dumps(info).encode())[0]])
+        for value in (True, "yes"):
+            info["formulae"][0]["deprecated"] = info["casks"][0]["deprecated"] = value
+            candidates, reported = self.candidates(info=json.dumps(info).encode())
+            self.assertFalse({"examplefetch", "exampleviewer"} & {c["name"] for c in candidates}, value)
+            self.assertIn({"kind": "formula", "name": "examplefetch", "reason": "deprecated"}, reported)
+            self.assertIn({"kind": "cask", "name": "exampleviewer", "reason": "deprecated"}, reported)
+
+    def test_a_brew_env_file_left_unread_holds(self):
+        user = HOME + "/.homebrew/brew.env"
+        found = BREW_PREFLIGHT(FakeProbe(platform=MAC), brew_run(), FETCH, "upgrade")
+        self.assertEqual(found["preflight"]["brew_env_sha256"], {"system": "absent", "prefix": "absent", "user": "absent"})
+
+        class Refused(FakeProbe):
+            error = OSError
+
+            def lstat(self, path):
+                if path == user:
+                    raise self.error(path)
+                return super().lstat(path)
+
+        Refused.error = NotADirectoryError  # ~/.homebrew is a file: the setting file cannot exist
+        self.assertEqual(BREW_PREFLIGHT(Refused(platform=MAC), brew_run(), FETCH, "upgrade")["preflight"]["brew_env_sha256"]["user"], "absent")
+        for probe in (FakeProbe(platform=MAC, files={user: symlink(1000)}), FakeProbe(platform=MAC, files={user: regular(1000, 0o600)})):
+            holds(self, "brew-env", BREW_PREFLIGHT, probe, brew_run(), FETCH, "upgrade")
+        for error in (PermissionError, OSError, ValueError):
+            Refused.error = error
+            holds(self, "brew-env", BREW_PREFLIGHT, Refused(platform=MAC), brew_run(), FETCH, "upgrade")
+        # The service's own reader leaves an oversize file unread, and the real lstat finds it.
+        root = fixture_root()
+        root.mkdir(parents=True)
+        path = root / "brew.env"
+        with open(path, "wb") as handle:
+            handle.truncate(routes.MAX_OUTPUT_BYTES + 1)
+        reads = service_updates._Reads(root, SimpleNamespace(), None)
+        self.assertIsNone(reads.read_file(str(path)))
+        holds(self, "brew-env", package_registry._brew_env_file, SimpleNamespace(lstat=os.lstat), reads, str(path))
+        self.assertIsNone(package_registry._brew_env_file(SimpleNamespace(lstat=os.lstat), reads, str(root / "missing.env")))
+
+    def test_cask_options_hold_the_cask_only(self):
+        options = {"/etc/homebrew/brew.env": b"HOMEBREW_CASK_OPTS=--appdir=/Applications\n"}
+        info = brew_one("exampleviewer", "brew-info.json")
+        info["casks"][0]["auto_updates"] = False
+        outputs = {"brew.outdated_one": json.dumps(brew_one("exampleviewer", "brew-outdated.json")).encode(), "brew.info_one": json.dumps(info).encode(),
+                   "brew.dry_run": b"==> Would upgrade 1 outdated package:\nexampleviewer 131.0 -> 132.0\n"}
+        cask = {"id": "exampleviewer", "kind": "cask"}
+        self.assertEqual(BREW_PREFLIGHT(FakeProbe(platform=MAC), brew_run(outputs), cask, "upgrade")["version"], "132.0")
+        holds(self, "brew-cask-options", BREW_PREFLIGHT, FakeProbe(platform=MAC), brew_run(outputs, options), cask, "upgrade")
+        holds(self, "brew-cask-options", BREW_PREFLIGHT, FakeProbe(platform=MAC), brew_run(outputs, options), cask, "reinstall")
+        self.assertEqual(BREW_PREFLIGHT(FakeProbe(platform=MAC), brew_run(files=options), FETCH, "upgrade")["id"], "examplefetch")
+
+    def test_a_package_the_update_adds_is_flagged(self):
+        found = BREW_PREFLIGHT(FakeProbe(platform=MAC), brew_run(), FETCH, "upgrade")
+        self.assertEqual((found["flags"], found["dependencies"]), (["adds_packages"], ["exampledep@3.3.1", "examplenew@2.0"]))
+        fragment = package_registry.BREW["plan"](found, {"operation": "upgrade", "executable": {"kind": "brew", "path": BREW}})
+        self.assertEqual(fragment["flags"], ["adds_packages"])
+        self.assertLessEqual(set(fragment["flags"]), set(package_registry.BREW["flags"]))
+        upgrades = b"==> Would upgrade 2 outdated packages:\nexampledep 3.3.0 -> 3.3.1\nexamplefetch 1.24.5 -> 1.25.0_2\n"
+        self.assertEqual(BREW_PREFLIGHT(FakeProbe(platform=MAC), brew_run({"brew.dry_run": upgrades}), FETCH, "upgrade")["flags"], [])
+
+    def test_reinstall_holds_while_an_outdated_formula_depends_on_it(self):
+        none = json.dumps({"formulae": [], "casks": []}).encode()
+        def computer(dependencies, outdated="exampledep"):
+            info = json.loads(fixture("brew-info.json"))
+            for item in info["formulae"]:
+                item["installed"][0]["runtime_dependencies"] = dependencies if item["name"] in ("exampledep", "examplecli") else []
+            listed = brew_one(outdated, "brew-outdated.json")
+            return brew_run({"brew.outdated_one": none, "brew.outdated": json.dumps(listed).encode(), "brew.info": json.dumps(info).encode()})
+        uses_it, other = [{"full_name": "examplefetch", "version": "1.24.5"}], [{"full_name": "exampleother", "version": "4.0"}]
+        found = BREW_PREFLIGHT(FakeProbe(platform=MAC), computer(other), FETCH, "reinstall")
+        self.assertEqual((found["operation"], found["version"]), ("reinstall", "1.24.5"))
+        # Nothing outdated needs it: a dependent that is up to date stays as it is.
+        self.assertEqual(BREW_PREFLIGHT(FakeProbe(platform=MAC), computer(uses_it, outdated="nothing"), FETCH, "reinstall")["id"], "examplefetch")
+        for dependencies, outdated in ((uses_it, "exampledep"), (None, "exampledep"), (["not a row"], "exampledep"), (uses_it, "fabrikam/tools/examplecli")):
+            with self.subTest(dependencies=dependencies, outdated=outdated):
+                holds(self, "brew-reinstall", BREW_PREFLIGHT, FakeProbe(platform=MAC), computer(dependencies, outdated), FETCH, "reinstall")
+        # A dependent that goes out of date between the plan and the run holds at the drift check.
+        payload = {"id": "examplefetch", "operation": "reinstall", "version": found["version"], "source": found["source"], "preflight": found["preflight"],
+                   "transaction_sha256": pc_records.digest(found["preflight"])}
+        self.assertIsNone(package_registry.BREW["drift"](FakeProbe(platform=MAC), computer(other), payload))
+        self.assertEqual((package_registry.BREW["drift"](FakeProbe(platform=MAC), computer(uses_it), payload) or {}).get("hold"), "brew-reinstall")
+        # brew reinstall looks for dependents of formulae only: a cask reads neither list.
+        info = brew_one("exampleviewer", "brew-info.json")
+        info["casks"][0].update(auto_updates=False, installed="131.0")
+        outputs = {"brew.outdated_one": none, "brew.info_one": json.dumps(info).encode()}
+        self.assertEqual(BREW_PREFLIGHT(FakeProbe(platform=MAC), brew_run(outputs), {"id": "exampleviewer", "kind": "cask"}, "reinstall")["version"], "131.0")
+
+    def test_a_group_may_write_a_homebrew_folder_only_as_admin(self):
+        launcher = FakeLauncher(fixture("brew-version.txt"))
+        for path in ("/opt/homebrew", "/opt/homebrew/bin"):
+            with self.subTest(path=path):
+                readonly_runner.run_recipe("brew.version", launcher=launcher, probe=FakeProbe(platform=MAC, files={path: folder(1000, 0o775, gid=80)}))
+                holds(self, "runner-executable", readonly_runner.run_recipe, "brew.version", launcher=launcher,
+                      probe=FakeProbe(platform=MAC, files={path: folder(1000, 0o775, gid=20)}))
+        self.assertEqual(len(launcher.calls), 2)
+
+    def test_the_linked_keg_rule_reads_what_the_plan_bound(self):
+        info = lambda **fields: {"stdout": json.dumps({"formulae": [{"name": "example-tool", "tap": "homebrew/core", "installed": [{"version": "2.0"}], **fields}],
+                                                       "casks": []}).encode(), "ok": True, "exit_code": 0}
+        def verified(bound, after):
+            payload = {"id": "example-tool", "version": "2.0", "operation": "reinstall", "dependencies": [], "preflight": {"kind": "formula", **bound}}
+            return package_registry.BREW["verify"](payload, {"before": {"brew.info": info(linked_keg="2.0")}, "after": {"brew.info": info(**after)}})["result"]
+        linked, unlinked = {"linked_keg": "2.0"}, {"linked_keg": None}
+        for bound, after, result in (({"snapshot": linked}, linked, "updated"), ({"snapshot": linked}, unlinked, "did_not_update"),
+                                     ({"snapshot": unlinked}, unlinked, "updated"), ({"snapshot": linked}, {"linked_keg": "1.0"}, "did_not_update"),
+                                     ({"transaction": {"eligibility": unlinked}}, unlinked, "updated"),
+                                     ({"transaction": {"eligibility": linked}}, unlinked, "did_not_update"),
+                                     ({"snapshot": linked}, {"linked_keg": None, "keg_only": True}, "updated")):
+            with self.subTest(bound=bound, after=after):
+                self.assertEqual(verified(bound, after), result)
 
 
 @refusals_fail
@@ -848,16 +1244,16 @@ class AptRouteTests(unittest.TestCase):
         ok = apt.verify_apt(entry, before, fixture("dpkg-installed-after.txt"))
         self.assertEqual((ok["target_installed"], ok["changed_outside_plan"], ok["diff_complete"]), (True, [], True))
         self.assertEqual(ok, apt.verify_apt(entry, apt.dpkg_installed(fixture("dpkg-installed.txt")), fixture("dpkg-installed-after.txt")))
-        self.assertEqual(routes.typed_outcome(routes.classify_exit("apt", 0), ok, restart="none")["outcome"], "succeeded")
+        self.assertEqual(result_of(routes.classify_exit("apt", 0), ok, signal="none"), "updated")
         for old, new in ((b"8.5.0-2example2\tii ", b"8.5.0-2example3\tii "), (b"8.5.0-2example2\tii ", b"8.5.0-2example2\tiU ")):
             other = apt.verify_apt(entry, before, fixture("dpkg-installed-after.txt").replace(old, new))
             self.assertFalse(other["target_installed"], new)
         outside = apt.verify_apt(entry, before, fixture("dpkg-installed-after.txt").replace(b"6.8.0-45.45", b"6.8.0-47.47"))
         self.assertEqual(outside["changed_outside_plan"], ["examplekernel:amd64"])
-        self.assertEqual(routes.typed_outcome(routes.classify_exit("apt", 0), outside, restart="none")["outcome"], "failed")
+        self.assertEqual(result_of(routes.classify_exit("apt", 0), outside, signal="none"), "differs_from_plan")
         unread = apt.verify_apt(entry, before, fixture("dpkg-installed-after.txt") + b"strange line\n")
         self.assertFalse(unread["diff_complete"])
-        self.assertEqual(routes.typed_outcome(routes.classify_exit("apt", 0), unread, restart="none")["other_changes"], "incomplete")
+        self.assertEqual(result_of(routes.classify_exit("apt", 0), unread, signal="none"), "could_not_check")
 
     def test_executable_is_absolute_and_no_shell(self):
         launcher = FakeLauncher(fixture("apt-config.txt"))
@@ -890,9 +1286,8 @@ class AptRouteTests(unittest.TestCase):
         user = apt.needrestart_facts(b"NEEDRESTART-VER: 3.6\nNEEDRESTART-PID: example-editor=4242\n")
         self.assertEqual(apt.apt_restart(before=False, after=False, **user), {"signal": "unknown", "already_pending": False, "services": []})
         self.assertEqual(apt.needrestart_facts(b""), {"ksta": None, "services": []})
-        result = routes.typed_outcome(routes.classify_exit("apt", 0), {"target_installed": True}, restart="required")
-        self.assertEqual(result["outcome"], "succeeded_restart_required")
-        self.assertEqual(routes.typed_outcome(routes.classify_exit("apt", 0), {"target_installed": True})["restart"], "unknown")
+        self.assertEqual(result_of(routes.classify_exit("apt", 0), {"target_installed": True}, signal="required"), "restart_needed")
+        self.assertEqual(routes.classify_exit("apt", 0)["restart"], "unknown")
         self.assertTrue(routes.classify_exit("apt", 0)["from_probes"])
         argv = routes.run_argv(self.entry())
         self.assertIn("NEEDRESTART_MODE=l", argv)
@@ -1002,6 +1397,9 @@ class AptRouteTests(unittest.TestCase):
                          + ["sources.list.d/example+1.list", "sources.list.d/ubuntu.sources.curtin.orig"])
         self.assertEqual(routes.drift(planned, self.entry(sources=ignored)), ["preflight.sources_sha256"])
         holds(self, "apt-sources-unreadable", apt.apt_sources, {**self.SOURCES, "sources.list.d/extra.list": None})
+        # The route itself: a sources file that cannot be read holds it, so no hidden source escapes the trust check.
+        unreadable = ManagerRun(SETTLED_APT, folders={"/etc/apt": ["sources.list.d"], "/etc/apt/sources.list.d": ["example.sources"]})
+        holds(self, "apt-sources-unreadable", package_registry.APT["run"]["preflight"], FakeProbe(), unreadable, {"id": "examplecurl"}, "upgrade")
 
         def changed(line):
             """The config fixture with this line instead of a line of the same key (a Dir line appears once in a dump)."""
@@ -1101,11 +1499,9 @@ class AptRouteTests(unittest.TestCase):
         # sudo also exits 1 when the owner's authentication fails, so exit 1 cannot prove the elevated step ran.
         for code, reason in ((1, "dpkg_or_elevation_error"), (2, "dpkg_error")):
             self.assertEqual(routes.classify_exit("apt", code, recipe_id="apt.configure")["reason"], reason)
-        for kind, code, output in (("in_use_retry_later", 100, "Could not get lock"), ("integrity_failure", 100, "Hash Sum mismatch")):
-            outcome = routes.typed_outcome(routes.classify_exit("apt", code, output=output), {"target_installed": True})
-            self.assertEqual(outcome["outcome"], kind)
-        unseen = routes.typed_outcome(routes.classify_exit("apt", None), {"target_installed": True}, restart="required")
-        self.assertEqual((unseen["outcome"], unseen["restart"]), ("succeeded_restart_required", "required"))
+        for result, code, output in (("differs_from_plan", 100, "Could not get lock"), ("integrity_failure", 100, "Hash Sum mismatch")):
+            self.assertEqual(result_of(routes.classify_exit("apt", code, output=output), {"target_installed": True}), result)
+        self.assertEqual(result_of(routes.classify_exit("apt", None), {"target_installed": True}, signal="required"), "restart_needed")
         holds(self, "package-exit", routes.classify_exit, "apt", 0, source="clipboard")
         holds(self, "package-exit", routes.classify_exit, "apt", 0, recipe_id="apt.unknown")
         holds(self, "package-plan", self.entry, rows=[], selected=())
@@ -1135,7 +1531,7 @@ class DnfRouteTests(unittest.TestCase):
     def test_discovery_argv_is_read_only(self):
         nevra = "exampletool-0:8.9.1-3.fc41.x86_64"
         values = {"dnf.installed": {"rpm_name": ["exampletool", "examplelib"]}, "dnf.repo_config": {"repoid": "updates"},
-                  "dnf.preview": {"nevra": [nevra]}}
+                  "dnf.preview": {"nevra": [nevra]}, "dnf.preview_reinstall": {"nevra": nevra}}
         argvs = {rid: routes.render(rid, values.get(rid)) for rid in read_recipes("dnf")}
         # No -C: a normal user's dnf5 refreshes its per-user cache copy from root's cache only when the copy has expired.
         self.assertEqual(argvs["dnf.upgrades"], ("/usr/bin/dnf5", "repoquery", "--upgrades", "--latest-limit=1", package_tokens.QUERYFORMAT))
@@ -1143,12 +1539,13 @@ class DnfRouteTests(unittest.TestCase):
         self.assertEqual(argvs["dnf.all_installed"], ("/usr/bin/rpm", "-q", "-a", "--qf", package_tokens.RPMFORMAT))
         self.assertEqual(argvs["dnf.repo_config"], ("/usr/bin/dnf5", "--dump-repo-config=updates"))
         self.assertEqual(argvs["dnf.preview"], ("/usr/bin/dnf5", "upgrade", "--assumeno", "--no-allow-downgrade", nevra))
+        self.assertEqual(argvs["dnf.preview_reinstall"], ("/usr/bin/dnf5", "reinstall", "--assumeno", "--no-allow-downgrade", nevra))
         self.assertFalse(any("-C" in argv for argv in argvs.values()))
         self.assertEqual(argvs["dnf.needs_restarting"], ("/usr/bin/dnf5", "needs-restarting"))
         for argv in argvs.values():
             self.assertNotIn("/usr/bin/sudo", argv)
-            self.assertFalse({"makecache", "install", "remove", "reinstall", "-y"} & set(argv), argv)
-            self.assertTrue("upgrade" not in argv or "--assumeno" in argv, argv)
+            self.assertFalse({"makecache", "install", "remove", "-y"} & set(argv), argv)
+            self.assertTrue(not {"upgrade", "reinstall"} & set(argv) or "--assumeno" in argv, argv)
             self.assertEqual(token_problems("dnf", argv, values=(nevra, "exampletool", "examplelib", "--dump-repo-config=updates"),
                                             shell=False), [])
         self.assertLessEqual(set(argvs), set(readonly_runner.recipes()))
@@ -1200,27 +1597,30 @@ class DnfRouteTests(unittest.TestCase):
         self.assertEqual(table_problems({"dnf"}), [])
 
     def test_verification_requires_planned_version(self):
-        entry, before = self.entry(), stored(routes.rpm_installed(fixture("rpm-all-before.txt")))
-        ok = routes.verify_dnf(entry, before, fixture("rpm-all-after.txt"))
-        self.assertEqual(ok, {"target_installed": True, "changed": ["exampledep.x86_64", "examplelib.x86_64", "exampletool.x86_64"],
-                              "changed_outside_plan": [], "diff_complete": True})
-        self.assertEqual(ok, routes.verify_dnf(entry, routes.rpm_installed(fixture("rpm-all-before.txt")), fixture("rpm-all-after.txt")))
-        wrong = routes.verify_dnf(entry, before, fixture("rpm-all-after.txt").replace(b"8.9.1-3", b"8.9.1-4"))
-        self.assertFalse(wrong["target_installed"])
-        self.assertEqual(routes.typed_outcome(routes.classify_exit("dnf", 0), wrong)["reason"], "verification_mismatch")
-        outside = routes.verify_dnf(entry, before, fixture("rpm-all-after.txt").replace(b"4.0-1.fc41", b"4.0-2.fc41"))
-        self.assertEqual(outside["changed_outside_plan"], ["exampleother.noarch"])
+        target, before, after = "exampletool-0:8.9.1-3.fc41.x86_64", fixture("rpm-all-before.txt"), fixture("rpm-all-after.txt")
+        def verified(before, after):
+            payload = {"id": "exampletool", "version": target, "operation": "upgrade", "preflight": {},
+                       "dependencies": ["examplelib.x86_64@1:2.1-2.fc41/updates", "exampledep.x86_64@1:1.0-1.fc41/updates"]}
+            return package_registry.DNF["verify"](payload, {when: {"dnf.all_installed": {"stdout": data, "ok": True, "exit_code": 0}}
+                                                            for when, data in (("before", before), ("after", after))})
+        def settled(code, verification):
+            return package_registry.route_result({"run_kind": "terminal"}, routes.classify_exit("dnf", code), verification)["result"]
+        ok = verified(before, after)
+        self.assertEqual((ok["result"], ok["verified_postcondition"], ok["installed_version"], ok["facts"]["changed_outside_plan"]), ("updated", True, target, []))
+        self.assertEqual(settled(0, ok), "updated")
+        wrong = verified(before, after.replace(b"8.9.1-3", b"8.9.1-4"))
+        self.assertEqual((wrong["result"], wrong["installed_version"]), ("did_not_update", None))
+        self.assertEqual(settled(0, wrong), "did_not_update")
+        outside = verified(before, after.replace(b"4.0-1.fc41", b"4.0-2.fc41"))
+        self.assertEqual(outside["facts"]["changed_outside_plan"], ["exampleother.noarch"])
         # A package that disappears is never a planned change, even when its name is planned collateral (an obsoleted package).
-        with_dep = stored(routes.rpm_installed(fixture("rpm-all-before.txt") + b"exampledep 0:0.9-1.fc41.x86_64\n"))
-        gone = routes.verify_dnf(entry, with_dep, fixture("rpm-all-after.txt").replace(b"exampledep 0:1.0-1.fc41.x86_64\n", b""))
-        self.assertEqual((gone["target_installed"], gone["changed_outside_plan"]), (True, ["exampledep.x86_64"]))
-        result = routes.typed_outcome(routes.classify_exit("dnf", 0), gone)
-        self.assertEqual((result["outcome"], result["reason"]), ("failed", "changed_outside_plan"))
-        key = routes.verify_dnf(entry, before, fixture("rpm-all-after.txt").replace(b"e99d6ad1-64d2612c", b"0badc0de-65000000"))
-        self.assertEqual((key["target_installed"], key["diff_complete"]), (True, False))
-        self.assertEqual(routes.typed_outcome(routes.classify_exit("dnf", 0), key)["other_changes"], "incomplete")
-        missing = routes.typed_outcome(routes.classify_exit("dnf", None), wrong)
-        self.assertEqual((missing["outcome"], missing["reason"]), ("failed", "not_completed"))
+        gone = verified(before + b"exampledep 0:0.9-1.fc41.x86_64\n", after.replace(b"exampledep 1:1.0-1.fc41.x86_64\n", b""))
+        self.assertEqual((gone["installed_version"], gone["facts"]["changed_outside_plan"]), (target, ["exampledep.x86_64"]))
+        self.assertEqual(settled(0, gone), "differs_from_plan")
+        key = verified(before, after.replace(b"e99d6ad1-64d2612c", b"0badc0de-65000000"))
+        self.assertEqual((key["result"], key["verified_postcondition"]), ("updated", False))
+        self.assertEqual(settled(0, key), "could_not_check")
+        self.assertEqual(settled(None, wrong), "did_not_update")
 
     def test_executable_is_absolute_and_no_shell(self):
         launcher = FakeLauncher(fixture("dnf-version.txt"))
@@ -1236,12 +1636,11 @@ class DnfRouteTests(unittest.TestCase):
     def test_restart_signal_is_reported_not_triggered(self):
         self.assertEqual([routes.dnf_restart(code) for code in (1, 0, 2, None, "1")], ["recommended", "none", "unknown", "unknown", "unknown"])
         self.assertEqual(routes.READ_RECIPES["dnf.needs_restarting"].ok_exits, frozenset({0, 1}))
-        result = routes.typed_outcome(routes.classify_exit("dnf", 0), {"target_installed": True}, restart="recommended")
-        self.assertEqual((result["outcome"], result["restart"]), ("succeeded", "recommended"))
+        self.assertEqual(result_of(routes.classify_exit("dnf", 0), {"target_installed": True}, signal="recommended"), "updated")
         self.assertEqual(routes.classify_exit("dnf", 2)["reason"], "route_defect")
         self.assertEqual(routes.classify_exit("dnf", 1)["class"], "failed")
         self.assertFalse({"reboot", "--reboot", "needs-restarting"} & set(routes.run_argv(self.entry())))
-        holds(self, "package-restart", routes.typed_outcome, routes.classify_exit("dnf", 0), {"target_installed": True}, restart="soon")
+        holds(self, "package-restart", result_of, routes.classify_exit("dnf", 0), {"target_installed": True}, signal="soon")
 
     def test_environment_is_fixed(self):
         env = routes.environment("dnf", home=HOME, user="ignored")
@@ -1256,7 +1655,7 @@ class DnfRouteTests(unittest.TestCase):
         for config in (b"[updates]\npkg_gpgcheck = 0\n", b"[updates]\nname = x\n", b"[updates]\npkg_gpgcheck = 1\ngpgcheck = 0\n"):
             holds(self, "dnf-gpgcheck", self.entry, configs={"updates": config})
         holds(self, "dnf-gpgcheck", self.entry, configs={"other": fixture("dnf-repo-config.txt")})
-        other_repo = fixture("dnf-preview.txt").replace(b"1.0-1.fc41       updates", b"1.0-1.fc41       extras ")
+        other_repo = fixture("dnf-preview.txt").replace(b"1:1.0-1.fc41     updates", b"1:1.0-1.fc41     extras ")
         holds(self, "dnf-gpgcheck", self.entry, preview=other_repo)
         newer = fixture("dnf-version.txt").replace(b"5.2.8.1", b"5.2.9.0")
         self.assertEqual(routes.drift(planned, self.entry(version=newer)), ["preflight.dnf5_version_sha256"])
@@ -1308,6 +1707,873 @@ class DnfRouteTests(unittest.TestCase):
         self.assertEqual(routes.dnf_upgrades(b"-exampletool-0:1.0-1.fc41.x86_64 updates\n", exit_code=0),
                          ([], [{"repoid": "updates", "reason": "nevra-not-routable"}]))
         holds(self, "dnf-repoquery", routes.dnf_upgrades, b"-exampletool-0:1.0-1.fc41.x86_64 --setopt\n", exit_code=0)
+
+
+
+def winget_run(installed=b"", client=WINGET_OUTPUT):
+    """A run function over fictional winget output (recipe id -> result), for the registry's winget hooks."""
+    outputs = {"winget.version": client, "winget.source": fixture("winget-source.json"), "winget.installed": installed}
+    return lambda recipe_id, values=None: {"recipe": recipe_id, "ok": True, "exit_code": 0, "stdout": outputs[recipe_id]}
+
+
+@refusals_fail
+class RegistryTests(unittest.TestCase):
+    def test_validate_descriptor_refuses_bad_shapes(self):
+        for manager, route in package_registry.DESCRIPTORS.items():
+            self.assertIs(package_registry.validate_descriptor(route), route)
+            self.assertEqual(route["manager"], manager)
+        good = dict(fake_route())
+        self.assertIs(package_registry.validate_descriptor(good), good)
+        stub = {"manager": "fwupd", "platforms": ("linux",), "group": "system_drivers", "state": "not built", "run_kind": "terminal", "flags": ()}
+        self.assertIs(package_registry.validate_descriptor(stub), stub)
+        run = dict(good["run"])
+        bad = {"unknown manager": {**good, "manager": "chocolatey"}, "unknown state": {**good, "state": "half built"},
+               "platform": {**good, "platforms": ("linux", "beos")}, "platform list": {**good, "platforms": ["linux"]},
+               "no platform": {**good, "platforms": ()}, "repeated platform": {**good, "platforms": ("linux", "linux")},
+               "group": {**good, "group": "games"}, "run kind": {**good, "run_kind": "shell"}, "flag": {**good, "flags": ("restart_whenever",)},
+               "missing hook": {k: v for k, v in good.items() if k != "drift"}, "hook not callable": {**good, "verify": "verify"},
+               "extra field": {**good, "command": "anything"}, "missing field": {k: v for k, v in good.items() if k != "group"},
+               "verify recipes": {**good, "verify_recipes": "apt.audit"}, "restart probe": {**good, "restart_probe": 3},
+               "run spec": {**good, "run": None}, "run hook": {**good, "run": {**run, "values": None}},
+               "os consent": {**good, "run": {**run, "os_consent": "observed"}}, "no recipes": {**good, "run": {**run, "recipes": ()}},
+               "restart files": {**good, "run": {**run, "restart_files": ["/run/reboot-required"]}},
+               "restart source": {**good, "run": {**run, "restart_files": {"/run/reboot-required": None}}},
+               "restart source path": {**good, "run": {**run, "restart_files": {"/run/reboot-required": "/run/reboot-required"}}},
+               "self ids": {**good, "self_ids": ["pip"]}, "plan without its selection": {**good, "plan": lambda candidate, facts: {}},
+               "not a mapping": [("manager", "pip")]}
+        for name, descriptor in bad.items():
+            with self.subTest(name=name):
+                holds(self, "package-descriptor", package_registry.validate_descriptor, descriptor)
+        one, both = SimpleNamespace(DESCRIPTOR=stub), SimpleNamespace(DESCRIPTOR=stub, DESCRIPTORS=(stub,))
+        self.assertEqual(package_registry.descriptors_of(one), (stub,))
+        self.assertEqual(package_registry.descriptors_of(SimpleNamespace(DESCRIPTORS=(stub, stub))), (stub, stub))
+        for module in (both, SimpleNamespace(), SimpleNamespace(DESCRIPTORS=[stub]), SimpleNamespace(DESCRIPTORS=())):
+            holds(self, "package-descriptor", package_registry.descriptors_of, module)
+        holds(self, "package-manager-unknown", package_registry.descriptor, "pip")
+        with mock.patch.object(package_registry, "DESCRIPTORS", MappingProxyType({**package_registry.DESCRIPTORS, "fwupd": stub})):
+            holds(self, "package-manager-unknown", package_registry.descriptor, "fwupd")
+
+    def test_registry_is_pure_and_shows_only_the_launchers_argv(self):
+        # The registry imports no process module and writes no option of its own; render() shows the argv the launcher runs.
+        tree = ast.parse((ROOT / "scripts" / "package_registry.py").read_text(encoding="utf-8"))
+        imported = {alias.name.split(".")[0] for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names}
+        imported |= {node.module.split(".")[0] for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.module}
+        self.assertFalse(imported & {"subprocess", "asyncio", "multiprocessing", "pty", "os", "readonly_runner"})
+        names = {target.id for node in tree.body if isinstance(node, ast.Assign) for target in node.targets if isinstance(target, ast.Name)}
+        self.assertFalse([name for name in names if "TOKENS" in name])
+        literals = [node.value for node in ast.walk(tree) if isinstance(node, ast.Constant) and isinstance(node.value, str)
+                    and node.value.startswith("-")]
+        self.assertEqual(literals, [])
+        argv = package_registry.argv("apt.upgrade", {"spec": ["example-tool=1.0-1"]}, executable=SUDO, prefix=("prefix",))
+        self.assertEqual(argv[:2], (SUDO, "prefix"))
+        self.assertEqual(package_registry.render("apt.upgrade", {"spec": ["example-tool=1.0-1"]}, executable=SUDO), " ".join(argv[:1] + argv[2:]))
+        shown = package_registry.render("winget.export", {"export_file": EXPORT_FILE}, executable=WINGET, run_folder=RUN_FOLDER)
+        self.assertIn("'" + EXPORT_FILE + "'", shown)
+        self.assertNotIn("--accept-source-agreements", shown)
+        self.assertEqual(set(package_registry.read_recipes()), set(routes.READ_RECIPES))
+        self.assertEqual(set(package_registry.run_recipes()), set(routes.RUN_RECIPES))
+        self.assertEqual(package_registry.allowed(), package_tokens.ALLOWED)
+
+    def test_shown_lines_keep_every_argument_literal_in_their_shell(self):
+        # POSIX: what a shell splits back is exactly the argv.
+        hostile = ["/usr/bin/sudo", "/srv/a b/$(touch x)", "`id`;&|<>*?[]{}", "it's", "~", "a=b", "--flag"]
+        # Single quotes, literally: double quotes would split back the same and still let a shell run the substitution.
+        self.assertEqual(package_registry.shell_line(hostile), "/usr/bin/sudo '/srv/a b/$(touch x)' '`id`;&|<>*?[]{}' 'it'\"'\"'s' '~' a=b --flag")
+        self.assertEqual(shlex.split(package_registry.shell_line(hostile)), hostile)
+        argv = package_registry.argv("apt.upgrade", {"spec": ["example-tool=1.2~rc1-1"]}, executable=SUDO)
+        self.assertEqual(shlex.split(package_registry.render("apt.upgrade", {"spec": ["example-tool=1.2~rc1-1"]}, executable=SUDO)), list(argv))
+        # PowerShell: the call operator for a quoted program; plain words stay; everything else is in single quotes with each
+        # quote doubled, the curly ones PowerShell also reads as quotes among them.
+        self.assertEqual(package_registry.shell_line(["C:\\Tools\\tool.exe", "--id", "-I", "Contoso.NoteTaker", "3.4.1", "$(calc)", "`n", "it's", "a\u2018b\u2019c\u201ad\u201be",
+                                                      "D:\\run folder\\x.log", "a;b", "@file", "a=b"]),
+                         "& 'C:\\Tools\\tool.exe' --id -I Contoso.NoteTaker '3.4.1' '$(calc)' '`n' 'it''s' 'a\u2018\u2018b\u2019\u2019c\u201a\u201ad\u201b\u201be' "
+                         "'D:\\run folder\\x.log' 'a;b' '@file' 'a=b'")
+        self.assertTrue(package_registry.shell_line(["\\\\server\\share\\tool.exe"]).startswith("& '"))
+        # A token no line can carry holds on both shells; a double quote only where PowerShell cannot pass it on.
+        for program in ("/usr/bin/sudo", "C:\\Tools\\tool.exe"):
+            for token in ("new\nline", "carriage\rreturn", "tab\tbed", "esc\x1b[0m", "nul\x00", "bidi\u202eright", "line\u2028sep", "zero\u200bwidth", ""):
+                with self.subTest(program=program, token=token):
+                    holds(self, "package-shown-command", package_registry.shell_line, [program, token])
+        holds(self, "package-shown-command", package_registry.shell_line, ["C:\\Tools\\tool.exe", 'say"hi'])
+        self.assertEqual(shlex.split(package_registry.shell_line(["/usr/bin/sudo", 'say"hi'])), ["/usr/bin/sudo", 'say"hi'])
+        holds(self, "package-shown-command", package_registry.shell_line, [])
+
+    def test_route_module_tables_reach_the_renderer(self):
+        # A further route module brings its recipes, tokens and slot grammar; the registry's argv and render use exactly those.
+        rows = tuple(package_tokens.Token(token=token, allowed=allowed, manager="pip", url="https://docs.python.org/3/")
+                     for token, allowed in (("/opt/example/bin/tool", True), ("install", True), ("--force", False)))
+        recipes = {"example.install": package_tokens.Recipe("pip", "/opt/example/bin/tool", ("install", package_tokens.Slot("example_spec"))),
+                   "example.forced": package_tokens.Recipe("pip", "/opt/example/bin/tool", ("install", "--force"))}
+        module = SimpleNamespace(RUN_RECIPES=recipes, EXAMPLE_TOKENS=rows, SLOTS={"example_spec": re.compile(r"[a-z]+==[0-9.]+").fullmatch})
+        values = {"example_spec": "tool==1.0"}
+        holds(self, "package-recipe", package_registry.argv, "example.install", values, executable="/opt/example/bin/tool")
+        with mock.patch.object(package_registry, "ROUTE_MODULES", (module,)):
+            self.assertEqual(package_registry.argv("example.install", values, executable="/opt/example/bin/tool", prefix=("p",)),
+                             ("/opt/example/bin/tool", "p", "install", "tool==1.0"))
+            self.assertEqual(package_registry.render("example.install", values, executable="/opt/example/bin/tool"), "/opt/example/bin/tool install tool==1.0")
+            # The tables stay checked: a forbidden row, a value outside the grammar and a value the slot does not know all hold.
+            holds(self, "package-token-not-allowed", package_registry.argv, "example.forced", executable="/opt/example/bin/tool")
+            holds(self, "package-token", package_registry.argv, "example.install", {"example_spec": "tool>=1.0"}, executable="/opt/example/bin/tool")
+            holds(self, "package-executable", package_registry.argv, "example.install", values, executable="/opt/other/tool")
+            self.assertEqual(package_registry.argv("apt.configure", {}, executable=SUDO)[0], SUDO)
+        holds(self, "package-recipe", routes.render, "example.install", values, executable="/opt/example/bin/tool")
+
+    def test_one_result_function_selects_every_result(self):
+        process, terminal = {"run_kind": "process"}, {"run_kind": "terminal"}
+        def result(payload, kind, reported, verified=True, signal=None):
+            exited = None if kind is None else {"class": kind}
+            return package_registry.route_result(payload, exited, {"result": reported, "verified_postcondition": verified}, signal=signal)
+        table = ((process, "success", "updated", True, None, ("updated", True)),
+                 (process, "restart", "updated", True, None, ("updated", True)),
+                 (process, "nothing_to_do", "updated", True, None, ("updated", True)),
+                 # No recorded exit: unknown, even when the target reads as installed.
+                 (process, None, "updated", True, None, ("unknown", False)),
+                 # A missing or false postcondition never claims what is installed.
+                 (process, "success", "updated", False, None, ("could_not_check", False)),
+                 (process, "success", "updated", None, None, ("could_not_check", False)),
+                 (process, "success", "updated", "yes", None, ("could_not_check", False)),
+                 (process, "success", "did_not_update", False, None, ("could_not_check", False)),
+                 (process, "success", "not_installed_power", False, None, ("could_not_check", False)),
+                 (process, "success", "did_not_update", True, None, ("did_not_update", True)),
+                 (process, "success", "not_installed_power", True, None, ("not_installed_power", True)),
+                 # A failed or unobserved child is never updated.
+                 (process, "failed", "updated", True, None, ("differs_from_plan", False)),
+                 (process, "in_use_retry_later", "updated", True, None, ("differs_from_plan", False)),
+                 (process, "not_observed", "updated", True, None, ("could_not_check", False)),
+                 (process, "failed", "did_not_update", True, None, ("did_not_update", True)),
+                 # The elevation refused, so the command never ran: it did not update where the read confirms that, and nothing else.
+                 (terminal, "not_started", "did_not_update", True, None, ("did_not_update", True)),
+                 (terminal, "not_started", "did_not_update", True, "required", ("did_not_update", True)),
+                 (terminal, "not_started", "did_not_update", False, None, ("could_not_check", False)),
+                 (terminal, "not_started", "updated", True, None, ("could_not_check", False)),
+                 (terminal, "not_started", "differs_from_plan", True, None, ("could_not_check", False)),
+                 ({**terminal, "operation": "repair"}, "not_started", "did_not_update", True, None, ("could_not_check", False)),
+                 # Integrity beats a restart; a failed terminal run holds, also before a restart signal.
+                 (process, "integrity_failure", "updated", True, "required", ("integrity_failure", False)),
+                 (terminal, "integrity_failure", "did_not_update", True, None, ("integrity_failure", False)),
+                 (terminal, "failed", "did_not_update", True, None, ("could_not_check", False)),
+                 (terminal, "failed", "did_not_update", True, "required", ("could_not_check", False)),
+                 (terminal, "in_use_retry_later", "did_not_update", True, None, ("could_not_check", False)),
+                 (terminal, "not_observed", "did_not_update", True, None, ("did_not_update", True)),
+                 (terminal, "success", "did_not_update", True, None, ("did_not_update", True)),
+                 # Only a signal of the restart class keeps the operation open.
+                 (process, "success", "updated", True, "required", ("restart_needed", False)),
+                 (process, "success", "updated", True, "initiated_by_installer", ("restart_needed", False)),
+                 (process, "success", "updated", True, "recommended", ("updated", True)),
+                 (process, "success", "updated", True, "none", ("updated", True)),
+                 # What a route reports stands only within the closing results.
+                 (process, "success", "differs_from_plan", True, None, ("differs_from_plan", False)),
+                 (process, "success", "device_not_responding", False, None, ("device_not_responding", False)),
+                 (process, "success", "unknown", False, None, ("unknown", False)),
+                 (process, "success", "restart_needed", True, None, ("could_not_check", False)),
+                 (process, "success", "not a result", True, None, ("could_not_check", False)),
+                 (process, "success", ["updated"], True, None, ("could_not_check", False)),
+                 (process, "success", None, True, None, ("could_not_check", False)))
+        for payload, kind, reported, verified, signal, expected in table:
+            with self.subTest(kind=kind, reported=reported, verified=verified, signal=signal, run_kind=payload["run_kind"]):
+                self.assertEqual(result(payload, kind, reported, verified, signal), {"result": expected[0], "verified_postcondition": expected[1]})
+        holds(self, "package-restart", result, process, "success", "updated", True, "soon")
+
+    def apt_reads(self, before, after):
+        return {"before": {"apt.installed": {"ok": True, "stdout": before.encode()}}, "after": {"apt.installed": {"ok": True, "stdout": after.encode()}}}
+
+    def test_apt_postcondition_needs_the_complete_state_of_every_planned_package(self):
+        verify = package_registry.APT["verify"]
+        payload = {"id": "example-tool", "version": "1.2.3-1", "operation": "upgrade", "dependencies": ["libexample:amd64@2.0-1"], "preflight": {"arch": "amd64"}}
+        old = "example-tool\tamd64\t1.2.2-1\tii \nlibexample\tamd64\t1.9-1\tii \n"
+        new = "example-tool\tamd64\t1.2.3-1\tii \nlibexample\tamd64\t2.0-1\tii \n"
+        cases = (("every planned package installed", old, new, "updated", True),
+                 ("nothing changed", old, old, "did_not_update", True),
+                 ("the error flag on the item", old, new.replace("1.2.3-1\tii ", "1.2.3-1\tiiR"), "did_not_update", False),
+                 ("the error flag on a collateral package", old, new.replace("2.0-1\tii ", "2.0-1\tiiR"), "updated", False),
+                 ("half configured collateral package", old, new.replace("2.0-1\tii ", "2.0-1\tiF "), "updated", False),
+                 ("unpacked item", old, new.replace("1.2.3-1\tii ", "1.2.3-1\tiU "), "did_not_update", False),
+                 ("the item gone", old, "libexample\tamd64\t2.0-1\tii \n", None, False),
+                 ("only another architecture of the item", "example-tool\ti386\t1.2.2-1\tii \nlibexample\tamd64\t1.9-1\tii \n",
+                  "example-tool\ti386\t1.2.2-1\tii \nlibexample\tamd64\t1.9-1\tii \n", "did_not_update", False),
+                 ("the item never there", "libexample\tamd64\t1.9-1\tii \n", "libexample\tamd64\t1.9-1\tii \n", "did_not_update", False),
+                 ("the item listed but not installed", "example-tool\tamd64\t\tun \n", "example-tool\tamd64\t\tun \n", "did_not_update", False),
+                 ("collateral missing with the item at its target", "example-tool\tamd64\t1.2.2-1\tii \n", "example-tool\tamd64\t1.2.3-1\tii \n", "updated", False),
+                 ("collateral short of its bound target", old, new.replace("2.0-1\tii ", "1.9-1\tii "), "updated", False),
+                 ("collateral past its bound target", old, new.replace("2.0-1\tii ", "2.0-2\tii "), "updated", False),
+                 # Another architecture of the same name changing is outside the plan, even though the name is planned.
+                 ("another architecture of the collateral moved", old + "libexample\ti386\t1.9-1\tii \n", new + "libexample\ti386\t2.0-1\tii \n", "differs_from_plan", True),
+                 ("an empty read", old, "", None, False))
+        for name, before, after, result, verified in cases:
+            with self.subTest(case=name):
+                found = verify(payload, self.apt_reads(before, after))
+                self.assertEqual((result or found["result"], found["verified_postcondition"]), (found["result"], verified))
+                if not verified:
+                    self.assertNotEqual(package_registry.route_result({"run_kind": "terminal"}, {"class": "success"}, found)["result"], "updated")
+        # A dependency the plan would have added stays absent after a run that changed nothing: nothing is half done.
+        added = {**payload, "dependencies": ["libnew:amd64@1.0-1"]}
+        same = "example-tool\tamd64\t1.2.2-1\tii \n"
+        found = verify(added, self.apt_reads(same, same))
+        self.assertEqual((found["result"], found["verified_postcondition"]), ("did_not_update", True))
+        # The planned package of another architecture is missing: a healthy row of the same name is not it.
+        foreign = {**payload, "dependencies": ["libexample:arm64@2.0-1"]}
+        found = verify(foreign, self.apt_reads(old, "example-tool\tamd64\t1.2.3-1\tii \nlibexample\tamd64\t1.9-1\tii \n"))
+        self.assertEqual((found["result"], found["verified_postcondition"]), ("updated", False))
+        self.assertEqual(package_registry.route_result({"run_kind": "terminal"}, {"class": "success"}, found)["result"], "could_not_check")
+        found = verify(foreign, self.apt_reads(old + "libexample\tarm64\t1.9-1\tii \n", new.replace("2.0-1", "1.9-1") + "libexample\tarm64\t2.0-1\tii \n"))
+        self.assertEqual((found["result"], found["verified_postcondition"]), ("updated", True))
+        # Rows of a foreign architecture, or a removed package's config files, are no reason to doubt a good update.
+        for extra in ("example-tool\ti386\t\trc \n", "example-tool\ti386\t1.0\thi \n", "libexample\ti386\t1.0\trc \n"):
+            with self.subTest(extra=extra):
+                found = verify(payload, self.apt_reads(old + extra, new + extra))
+                self.assertEqual((found["result"], found["verified_postcondition"]), ("updated", True))
+        # A planned package left as config files only, while nothing moved, is not half done either.
+        found = verify(payload, self.apt_reads("example-tool\tamd64\t1.2.2-1\tii \nlibexample\tamd64\t1.9-1\trc \n", "example-tool\tamd64\t1.2.2-1\tii \nlibexample\tamd64\t1.9-1\trc \n"))
+        self.assertEqual((found["result"], found["verified_postcondition"]), ("did_not_update", True))
+        # A foreign architecture of the same name is not the item.
+        both = "example-tool\tamd64\t{}\tii \nexample-tool\ti386\t1.2.2-1\tii \nlibexample\tamd64\t{}\tii \n"
+        found = verify(payload, self.apt_reads(both.format("1.2.2-1", "1.9-1"), both.format("1.2.3-1", "2.0-1")))
+        self.assertEqual((found["result"], found["verified_postcondition"], found["installed_version"]), ("updated", True, "1.2.3-1"))
+
+    def test_apt_repair_needs_a_settled_package_database(self):
+        verify = package_registry.APT["verify"]
+        payload = {"id": "dpkg", "version": "1.22.6", "operation": "repair", "dependencies": [], "preflight": {}}
+        before = "dpkg\tamd64\t1.22.6\tii \nexample-tool\tamd64\t1.0\tiF \n"
+        settled = "dpkg\tamd64\t1.22.6\tii \nexample-tool\tamd64\t1.0\tii \nold-tool\tamd64\t0.9\trc \ngone-tool\tamd64\t\tun \nheld-tool\tamd64\t2.0\thi \n"
+        found = verify(payload, self.apt_reads(before, settled))
+        self.assertEqual((found["result"], found["verified_postcondition"], found["installed_version"]), ("updated", True, "1.22.6"))
+        for name, after in (("the error flag", settled.replace("1.0\tii ", "1.0\tiiR")), ("half configured", settled.replace("1.0\tii ", "1.0\tiF ")),
+                            ("trigger pending", settled.replace("1.0\tii ", "1.0\tit ")), ("unpacked", settled.replace("1.0\tii ", "1.0\tiU ")),
+                            ("an unread line", settled + "strange line\n"), ("dpkg missing", settled.replace("dpkg\tamd64\t1.22.6\tii \n", "")),
+                            ("an empty read", ""), ("dpkg itself broken", settled.replace("1.22.6\tii ", "1.22.6\tiF "))):
+            with self.subTest(case=name):
+                found = verify(payload, self.apt_reads(before, after))
+                self.assertEqual((found["result"], found["verified_postcondition"]), ("did_not_update", False))
+                self.assertEqual(package_registry.route_result({"run_kind": "terminal"}, {"class": "success"}, found),
+                                 {"result": "could_not_check", "verified_postcondition": False})
+
+    def test_brew_and_dnf_postconditions_need_a_known_installed_version(self):
+        info = lambda **versions: json.dumps({"formulae": [{"name": name, "tap": "homebrew/core", "installed": [{"version": version}] if version else []}
+                                                           for name, version in versions.items()], "casks": []}).encode()
+        brew = lambda after, deps=(): package_registry.BREW["verify"](
+            {"id": "example-tool", "version": "2.0", "operation": "upgrade", "dependencies": list(deps), "preflight": {"kind": "formula"}},
+            {"before": {"brew.info": {"ok": True, "stdout": info(**{"example-tool": "1.0", "example-dep": "1.0"})}}, "after": {"brew.info": {"ok": True, "stdout": after}}})
+        for name, after, deps, result, verified in (("at the target", {"example-tool": "2.0", "example-dep": "1.0"}, (), "updated", True),
+                                                    ("not moved", {"example-tool": "1.0", "example-dep": "1.0"}, (), "did_not_update", True),
+                                                    ("no installed version", {"example-tool": None, "example-dep": "1.0"}, (), "did_not_update", False),
+                                                    ("a planned package without one", {"example-tool": "2.0", "example-dep": None}, ("example-dep@2.0",), "updated", False)):
+            with self.subTest(route="brew", case=name):
+                found = brew(info(**after), deps)
+                self.assertEqual((found["result"], found["verified_postcondition"]), (result, verified))
+        # A versioned formula is one name: "python@3.12" at 3.12.4 is the dependency "python@3.12@3.12.4".
+        versioned = package_registry.BREW["verify"](
+            {"id": "example-tool", "version": "2.0", "operation": "upgrade", "dependencies": ["python@3.12@3.12.4"], "preflight": {"kind": "formula"}},
+            {"before": {"brew.info": {"ok": True, "stdout": info(**{"example-tool": "1.0", "python@3.12": "3.12.3"})}},
+             "after": {"brew.info": {"ok": True, "stdout": info(**{"example-tool": "2.0", "python@3.12": "3.12.4"})}}})
+        self.assertEqual((versioned["result"], versioned["verified_postcondition"]), ("updated", True))
+        rpm = lambda *rows: "".join(f"{name} 0:{version}.x86_64\n" for name, version in rows).encode()
+        target = "example-tool-0:2.0-1.fc41.x86_64"
+        dnf = lambda after, deps=(): package_registry.DNF["verify"](
+            {"id": "example-tool", "version": target, "operation": "upgrade", "dependencies": list(deps), "preflight": {}},
+            {"before": {"dnf.all_installed": {"ok": True, "stdout": rpm(("example-tool", "1.0-1.fc41"))}}, "after": {"dnf.all_installed": {"ok": True, "stdout": after}}})
+        for name, after, deps, result, verified in (("at the target", rpm(("example-tool", "2.0-1.fc41")), (), "updated", True),
+                                                    ("not moved", rpm(("example-tool", "1.0-1.fc41")), (), "did_not_update", True),
+                                                    ("a planned package missing", rpm(("example-tool", "2.0-1.fc41")), ("example-dep.x86_64@1.0-1/updates",),
+                                                     "updated", False),
+                                                    ("a planned package there", rpm(("example-tool", "2.0-1.fc41"), ("example-dep", "1.0-1")),
+                                                     ("example-dep.x86_64@1.0-1/updates",), "updated", True),
+                                                    ("a planned package at another version", rpm(("example-tool", "2.0-1.fc41"), ("example-dep", "1.0-2")),
+                                                     ("example-dep.x86_64@1.0-1/updates",), "updated", False)):
+            with self.subTest(route="dnf", case=name):
+                found = dnf(after, deps)
+                self.assertEqual((found["result"], found["verified_postcondition"]), (result, verified))
+
+    def test_the_reboot_file_is_named_by_its_source_id(self):
+        probe = {"files": {"/run/reboot-required": True}}
+        self.assertEqual(package_registry.restart_signal(package_registry.APT, probe), ("required", "linux.reboot_required"))
+        self.assertEqual(pc_records.identifier("linux.reboot_required"), "linux.reboot_required")
+        self.assertEqual(package_registry.restart_signal(package_registry.APT, {"files": {"/run/reboot-required": False}}), ("unknown", None))
+        # A file that stood before the run was pending already, so this step does not wait for it; one that came with the run does.
+        now, reboot = {"/run/reboot-required": True}, "/run/reboot-required"
+        self.assertEqual(package_registry.restart_signal(package_registry.APT, {"files": now, "files_before": {reboot: True}}), ("unknown", None))
+        self.assertEqual(package_registry.restart_signal(package_registry.APT, {"files": now, "files_before": {reboot: False}}), ("required", "linux.reboot_required"))
+        self.assertEqual(package_registry.restart_signal(package_registry.APT, {"files": now, "files_before": {reboot: None}}), ("required", "linux.reboot_required"))
+        # A file that could not be read is no "absent": only a required restart stands beside it.
+        probe = fake_route(restart_files={reboot: "linux.reboot_required"}, restart_probe="apt.needrestart", restart=lambda found: "none")
+        self.assertEqual(package_registry.restart_signal(probe, {"files": {reboot: None}, "after": {"apt.needrestart": {}}}), ("unknown", None))
+        self.assertEqual(package_registry.restart_signal(probe, {"files": {reboot: False}, "after": {"apt.needrestart": {}}}), ("none", "apt.needrestart"))
+        required = fake_route(restart_files={reboot: "linux.reboot_required"}, restart_probe="apt.needrestart", restart=lambda found: "required")
+        self.assertEqual(package_registry.restart_signal(required, {"files": {reboot: None}, "after": {"apt.needrestart": {}}}), ("required", "apt.needrestart"))
+        for route in package_registry.DESCRIPTORS.values():
+            for source in route["run"].get("restart_files", {}).values():
+                pc_records.identifier(source)
+
+    def test_held_repairs_name_their_reason(self):
+        for name, code in (("dism", "repair-held-dism"), ("sfc", "repair-guidance-only"), ("winget_repair", "repair-guidance-only")):
+            with self.subTest(route=name):
+                holds(self, code, package_registry.descriptor, name)
+        self.assertFalse(set(package_registry.HELD) & set(package_registry.DESCRIPTORS))
+
+    def test_core_verification_requires_the_planned_version(self):
+        payload = {"id": "Contoso.NoteTaker", "version": "3.4.1", "operation": "upgrade", "dependencies": [], "preflight": {}}
+        winget = package_registry.WINGET["verify"]
+        after = {"after": {"winget.installed": {"ok": True, "stdout": fixture("winget-installed-after.txt")}}}
+        self.assertEqual(winget(payload, after)["result"], "updated")
+        for installed in (fixture("winget-installed-before.txt"), fixture("winget-installed-after.txt").replace(b"3.4.1", b"3.5.0")):
+            found = winget(payload, {"after": {"winget.installed": {"ok": True, "stdout": installed}}})
+            self.assertEqual((found["result"], found["verified_postcondition"]), ("did_not_update", True))
+        self.assertEqual(winget(payload, {"after": {}})["result"], "could_not_check")
+        line = "example-tool\tamd64\t{}\tii \n"
+        apt_payload = {"id": "example-tool", "version": "1.2.3-1", "operation": "upgrade", "dependencies": [], "preflight": {}}
+        reads = lambda before, after: {"before": {"apt.installed": {"ok": True, "stdout": line.format(before).encode()}},
+                                       "after": {"apt.installed": {"ok": True, "stdout": line.format(after).encode()}}}
+        self.assertEqual(package_registry.APT["verify"](apt_payload, reads("1.2.2-1", "1.2.3-1"))["result"], "updated")
+        self.assertEqual(package_registry.APT["verify"](apt_payload, reads("1.2.2-1", "1.2.4-1"))["result"], "did_not_update")
+        half = {"before": reads("1.2.2-1", "1.2.3-1")["before"], "after": {"apt.installed": {"ok": True, "stdout": b"example-tool\tamd64\t1.2.3-1\tiF \n"}}}
+        self.assertEqual(package_registry.APT["verify"](apt_payload, half)["verified_postcondition"], False)
+        other = {"before": reads("1.2.2-1", "1.2.3-1")["before"], "after": {"apt.installed": {"ok": True, "stdout": (line.format("1.2.3-1") + "other-tool\tamd64\t2.0\tii \n").encode()}}}
+        self.assertEqual(package_registry.APT["verify"](apt_payload, other)["result"], "differs_from_plan")
+
+    def test_apt_sources_read_into_exact_keys(self):
+        # sources.list (when present) and sources.list.d/<name>, each the bytes or None when unreadable: exactly what
+        # package_apt.apt_sources reads.
+        files = {"/etc/apt/sources.list": b"deb http://deb.example.invalid/ stable main\n", "/etc/apt/sources.list.d/a.list": b"",
+                 "/etc/apt/sources.list.d/b.sources": None}
+        folders = {"/etc/apt": ["apt.conf.d", "sources.list", "sources.list.d"], "/etc/apt/sources.list.d": ["b.sources", "a.list", "README"]}
+        run = SimpleNamespace(read_file=files.get, list_names=folders.get)
+        found = package_registry.apt_source_files(run)
+        self.assertEqual(found, {"sources.list": files["/etc/apt/sources.list"], "sources.list.d/a.list": b"", "sources.list.d/README": None,
+                                 "sources.list.d/b.sources": None})
+        folders["/etc/apt"] = ["sources.list.d"]
+        self.assertNotIn("sources.list", package_registry.apt_source_files(run))
+        for gone in ("/etc/apt", "/etc/apt/sources.list.d"):
+            with self.subTest(gone=gone):
+                broken = dict(folders, **{gone: None}, **({"/etc/apt": ["sources.list.d"]} if gone != "/etc/apt" else {}))
+                holds(self, "apt-sources-unreadable", package_registry.apt_source_files, SimpleNamespace(read_file=files.get, list_names=broken.get))
+
+    def test_tool_catalog_matches_route_table(self):
+        catalog = pc_records.decode_strict((ROOT / "templates" / "tool-catalog.json").read_bytes())
+        self.assertIs(pc_records.require_container(catalog, "tool_catalog"), catalog)
+        self.assertEqual([key for key in catalog if "version" in key], ["schema_version"])
+        self.assertNotIn("ledger", json.dumps(catalog).lower())
+        tools = {tool["id"]: tool for tool in catalog["tools"]}
+        routes_of = {"winget": "winget", "homebrew": "brew", "linux-apt": "apt", "linux-dnf": "dnf"}
+        self.assertEqual(sorted(routes_of.values()), sorted(routes.MANAGERS))
+        platforms = {"windows": "windows", "darwin": "macos", "linux": "linux"}
+        for tool_id, manager in routes_of.items():
+            with self.subTest(manager=manager):
+                route = package_registry.descriptor(manager)
+                self.assertLessEqual({platforms[name] for name in route["platforms"]}, set(tools[tool_id]["supported_os"]))
+                self.assertNotIn("handoff", json.dumps(tools[tool_id]))
+        self.assertFalse({"windows-msiexec-local", "macos-installer-local", "linux-dpkg-local"} & set(tools))
+        self.assertFalse(any(word in json.dumps(catalog) for word in ("msiexec.install", "installer.pkg", "install_local")))
+        cited = {source for tool in catalog["tools"] for source in tool["source_ids"]}
+        self.assertEqual({source["id"] for source in catalog["sources"]}, cited)
+
+
+class PackageEngineFixture(SessionFixtures):
+    """Package actions through the real engine and service: the steps every engine test here and in test_service_updates shares.
+    It defines no test."""
+
+    def prepared(self, route, items, *, sid=None, adapter_id=None):
+        sid = sid or self.session(job="security_updates", platform="linux")
+        self.service.elevation_probe = lambda: False
+        self.route = route
+        with registered(route):
+            actions = self.service.prepare_package_action(sid, adapter_id=adapter_id or UPGRADE, items=items, probe=RunProbe(), launcher=FakeLauncher(),
+                                                          **PROSE)
+        return sid, actions
+
+    def registered_plan(self, sid, actions):
+        required = {"scope": ("scope_confirmation", {"scope_confirmed": True}), "inventory": ("inventory", {"complete": True, "item_count": 1}),
+                    "research": ("research", {"applicability_checked": True, "official_sources_checked": True}),
+                    "candidates": ("candidates", {"candidates_reviewed": True, "excluded_private": True})}
+        while self.state(sid)["stage"] != "plan":
+            kind, facts = required[self.state(sid)["stage"]]
+            self.engine.advance_stage(sid, evidence_ids=[self.evidence(kind, facts, sid=sid)])
+        plan = {"plan_id": "plan-" + uuid.uuid4().hex, "summary": "Exact synthetic package plan",
+                "evidence_ids": [actions[0]["target_inventory_evidence_id"]], "actions": actions}
+        return self.engine.register_plan(sid, plan=plan)["data"]["plan_sha256"]
+
+    def approved(self, sid, actions, sha, *, advance=True):
+        for reviewer, role in (("fixture-reviewer-data", "compatibility_data"), ("fixture-reviewer-security", "evidence_security")):
+            review = {"schema": "patchcairn.review", "schema_version": 1, "plan_sha256": sha, "role": role, "verdict": "approved",
+                      "reviewer_id": reviewer, "attestation": "coordinator-attested"}
+            self.engine.record_review(sid, plan_sha256=sha, reviewer_id=reviewer, role=role, verdict="approved",
+                                      evidence_ids=[self.evidence("review", {"reviewed": True}, sid=sid, content=pc_records.encoded(review))],
+                                      notes="Independent synthetic review of this exact bounded plan")
+        self.engine.approve_plan(sid, plan_sha256=sha, action_ids=[action["action_id"] for action in actions],
+                                 owner_quote="Apply only these exact synthetic package actions.", owner_message_id="fixture-package-" + uuid.uuid4().hex)
+        if advance:
+            self.engine.advance_stage(sid, evidence_ids=[])
+        return sha
+
+    def ticket(self, sid, action, sha):
+        with registered(self.route):
+            return self.service.execute_action(sid, action_id=action["action_id"], plan_sha256=sha,
+                                               precondition_evidence_ids=[self.precondition(action, sha, sid=sid)])
+
+    def launched(self, route, issued, child=None, probe=None, reader=None):
+        with registered(route):
+            return self.service.run_ticket(ticket_id=issued["ticket_id"], launcher=child or FakeChild(), probe=probe or RunProbe(), reader=reader or FakeLauncher(),
+                                           terminal=FakeTerminal())
+
+    def ticketed(self, route):
+        """One approved action of ``route`` with its ticket: (session id, the ticket response)."""
+        sid, actions = self.prepared(route, [{"action_id": "update-tool", "manager": "pip", "id": "example-tool"}])
+        return sid, self.ticket(sid, actions[0], self.approved(sid, actions, self.registered_plan(sid, actions)))
+
+    def operation(self, sid, issued):
+        return self.state(sid)["operations"][issued["operation_id"]]
+
+    def reconciled(self, route, sid, issued):
+        """reconcile_operation with a practice session's fakes: a fictional computer, and every read a fake that prints nothing."""
+        with registered(route), mock.patch.object(readonly_runner, "run_recipe", return_value={"ok": True, "stdout": b"", "exit_code": 0}):
+            return self.service.reconcile_operation(sid, operation_id=issued["operation_id"], probe=RunProbe(), reader=FakeLauncher())
+
+    @staticmethod
+    def boot():
+        return RunProbe(boot={"last_boot_utc": utc_now(), "boot_id": "boot-after", "source": "fictional_probe"})
+
+    def needing_restart(self):
+        """An approved action whose run left a required restart: (route, session id, ticket response)."""
+        route = fake_route(restart_probe="apt.needrestart", restart=lambda found: "required")
+        sid, issued = self.ticketed(route)
+        self.assertIsNone(self.launched(route, issued)["outcome"])
+        return route, sid, issued
+
+    def payload_of(self, sid, action):
+        row = self.state(sid)["evidence"][action["adapter_payload_evidence_id"]]
+        return json.loads((self.engine.work / sid / row["path"]).read_bytes())
+
+
+@refusals_fail
+class PackageEngineTests(PackageEngineFixture):
+    """Package actions through the real engine and service: the package payload binding, the batch rule, the conditional
+    decisions, the shown-command field of the plan validator and the action builder, and the service's elevation probe."""
+
+    def test_payload_builder_matches_golden_contract(self):
+        golden = json.loads((ROOT / "tests" / "fixtures" / "package-payload.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(golden["variants"]), 4)
+        derived = ("schema", "schema_version", "transaction_sha256", "environment_sha256")
+        for variant in golden["variants"]:
+            with self.subTest(variant=variant["name"]):
+                fields = {key: value for key, value in variant["payload"].items() if key not in derived}
+                built = package_registry.payload(fields, environment=variant.get("inputs", {}).get("environment"))
+                self.assertEqual(pc_records.encoded(built).decode("ascii"), variant["encoded"])
+                self.assertEqual(pc_records.digest(built), variant["sha256"])
+                self.assertEqual(built["transaction_sha256"], pc_records.digest(fields["preflight"]))
+        process = {key: value for key, value in golden["variants"][0]["payload"].items() if key not in derived}
+        settings = {key: value for key, value in golden["variants"][2]["payload"].items() if key not in derived}
+        environment = golden["variants"][0]["inputs"]["environment"]
+        for name, fields, keywords in (("unknown key", {**process, "command": "anything"}, {"environment": environment}),
+                                       ("settings with recipe", {**settings, "recipe": "winget.upgrade"}, {}),
+                                       ("settings with environment", settings, {"environment": environment}),
+                                       ("process with settings_page", {**process, "settings_page": "windowsupdate"}, {"environment": environment}),
+                                       ("process without environment", process, {}),
+                                       ("process without executable", {k: v for k, v in process.items() if k != "executable"}, {"environment": environment}),
+                                       ("manager outside the registry", {**process, "manager": "chocolatey"}, {"environment": environment}),
+                                       ("operation", {**process, "operation": "uninstall"}, {"environment": environment})):
+            with self.subTest(refused=name):
+                holds(self, "package-payload", package_registry.payload, fields, **keywords)
+
+    def test_local_installer_handoffs_removed(self):
+        # The service half, the engine half and the registry entries together.
+        import service_execute
+        import service_reconcile
+        import service_updates
+        import workflow_core
+        from workflow_service import WorkflowService
+        for name in ("prepare_external_action", "record_external_preflight", "complete_external", "complete_external_after_restart",
+                     "_external_sources", "_external_preflight", "_artifact", "_external_receipt", "_record_restart_pending", "_restart_boot",
+                     "ARTIFACT_EXTENSIONS", "OFFICIAL_DOMAINS"):
+            self.assertFalse(hasattr(service_updates, name) or hasattr(WorkflowService, name), name)
+        for name in ("validate_external_plan", "external_preflight", "record_protected_consent", "decide_restart", "record_restart_verification"):
+            self.assertFalse(hasattr(workflow_core.WorkflowEngine, name), name)
+        self.assertNotIn("system.reviewed_external", pc_records.ADAPTERS)
+        self.assertNotIn("system.reviewed_external", service_execute.EXECUTE)
+        self.assertNotIn("system.reviewed_external", service_reconcile.RECONCILE)
+        retired = {name for name in pc_records.SCHEMAS if name.startswith("patchcairn.external.")}
+        retired |= {"patchcairn.installer.metadata", "patchcairn.publisher.signature", "patchcairn.windows.boot.observation"} & pc_records.SCHEMAS
+        self.assertEqual(retired, set())
+        catalog = (ROOT / "templates" / "tool-catalog.json").read_text(encoding="utf-8")
+        self.assertNotIn("msiexec.install", catalog)
+
+    def test_action_binds_the_reviewed_transaction_of_its_preflight(self):
+        # The package route's half of test_action_binds_the_lower_level_plan_each_caller_names: the action's adapter_plan_sha256
+        # is the hash of the preflight inside its payload, which the engine's binding compares with transaction_sha256.
+        sid, actions = self.prepared(fake_route(), [{"action_id": "update-tool", "manager": "pip", "id": "example-tool"}])
+        row = self.state(sid)["evidence"][actions[0]["adapter_payload_evidence_id"]]
+        payload = json.loads((self.engine.work / sid / row["path"]).read_bytes())
+        self.assertEqual(actions[0]["adapter_plan_sha256"], pc_records.digest(payload["preflight"]))
+        self.assertEqual(actions[0]["adapter_plan_sha256"], payload["transaction_sha256"])
+
+    def test_update_runs_only_after_reviews_approval_and_ticket(self):
+        route = fake_route()
+        sid, actions = self.prepared(route, [{"action_id": "update-tool", "manager": "pip", "id": "example-tool"}])
+        sha = self.registered_plan(sid, actions)
+        with self.assertRaises((ServiceRefusal, WorkflowRefusal)):
+            self.ticket(sid, actions[0], sha)
+        self.assertEqual(self.state(sid)["operations"], {})
+        with self.assertRaises((ServiceRefusal, WorkflowRefusal, OSError)):
+            self.service.run_ticket(ticket_id="ticket-" + "0" * 32, launcher=FakeChild(), probe=RunProbe(), reader=FakeLauncher(), terminal=FakeTerminal())
+        self.approved(sid, actions, sha)
+        issued = self.ticket(sid, actions[0], sha)
+        self.assertIsNone(self.state(sid)["operations"][issued["operation_id"]]["outcome"])
+        child = FakeChild()
+        result = self.launched(route, issued, child)
+        self.assertEqual((result["outcome"], result["receipt"]["result"], len(child.calls)), ("succeeded", "updated", 1))
+        self.assertEqual(child.calls[0].argv[0], SUDO)
+        with self.assertRaises(ServiceRefusal):
+            self.launched(route, issued, child)
+        self.assertEqual(len(child.calls), 1)
+
+    def test_drift_between_plan_and_run_holds(self):
+        # The winget route reads the item again right before the run; any change of the bound preflight holds.
+        route = package_registry.WINGET
+        candidate = route["run"]["preflight"](None, winget_run(fixture("winget-installed-before.txt")), {"id": "Contoso.NoteTaker"}, "upgrade")
+        fragment = route["plan"](candidate, {"operation": "upgrade", "executable": {"kind": "winget", "path": WINGET, "identity": {"package": APP_FOLDER}},
+                                             "agreements": []})
+        payload = package_registry.payload(fragment, environment={"fictional": True})
+        self.assertIsNone(route["drift"](None, winget_run(fixture("winget-installed-before.txt")), payload))
+        newer = fixture("winget-installed-before.txt").replace(b"3.4.1", b"3.4.2")
+        changed = {"newer offer": winget_run(newer), "client": winget_run(fixture("winget-installed-before.txt"), client=winget_version("1.12.400\n").encode()),
+                   "no longer offered": winget_run(fixture("winget-installed-after.txt"))}
+        for name, run in changed.items():
+            with self.subTest(change=name):
+                held = route["drift"](None, run, payload)
+                self.assertIsInstance(held, dict)
+                self.assertIn(held["hold"], ("package-drift", "winget-confirm"))
+        # Through the launcher: a drift starts nothing and writes no effect boundary.
+        from test_service_updates import harness
+        made = harness(fake_route(drift={"hold": "package-drift", "message": "The item changed"}))
+        ticket = made.issue()["ticket_id"]
+        child = FakeChild()
+        with self.assertRaises(ServiceRefusal):
+            made.run(ticket, child=child)
+        self.assertEqual((child.calls, made.entered(), made.finished), ([], False, []))
+
+    def test_failed_item_stops_only_its_dependents(self):
+        route = fake_route(results={"tool-a": "did_not_update"}, dependencies={"tool-b": ["tool-a@1.0.0"]})
+        sid, actions = self.prepared(route, [{"action_id": "a", "manager": "pip", "id": "tool-a"}, {"action_id": "b", "manager": "pip", "id": "tool-b"},
+                                             {"action_id": "c", "manager": "pip", "id": "tool-c"}])
+        sha = self.approved(sid, actions, self.registered_plan(sid, actions))
+        by_id = {action["action_id"]: action for action in actions}
+        first = self.launched(route, self.ticket(sid, by_id["a"], sha))
+        self.assertEqual((first["outcome"], first["receipt"]["result"], first["receipt"]["verified_postcondition"]), ("failed", "did_not_update", True))
+        self.assertEqual(self.state(sid)["status"], "active")
+        with self.assertRaises((ServiceRefusal, WorkflowRefusal)):
+            self.ticket(sid, by_id["b"], sha)
+        third = self.launched(route, self.ticket(sid, by_id["c"], sha))
+        self.assertEqual(third["outcome"], "succeeded")
+
+    def test_unknown_outcome_stops_the_batch(self):
+        route = fake_route(results={"tool-a": "unknown"}, dependencies={})
+        sid, actions = self.prepared(route, [{"action_id": "a", "manager": "pip", "id": "tool-a"}, {"action_id": "c", "manager": "pip", "id": "tool-c"}])
+        sha = self.approved(sid, actions, self.registered_plan(sid, actions))
+        first = self.launched(route, self.ticket(sid, actions[0], sha))
+        self.assertEqual(first["outcome"], "unknown")
+        with self.assertRaises((ServiceRefusal, WorkflowRefusal)):
+            self.ticket(sid, actions[1], sha)
+        self.assertEqual(len(self.state(sid)["operations"]), 1)
+
+    def test_runtime_line_change_needs_its_own_decision(self):
+        route = fake_route(item_flags={"runtime": ["runtime_line_change"]})
+        sid, actions = self.prepared(route, [{"action_id": "runtime", "manager": "pip", "id": "runtime"}])
+        self.assertEqual(self.payload_of(sid, actions[0])["conditional"], {"runtime_line_change": []})
+        sha = self.approved(sid, actions, self.registered_plan(sid, actions), advance=False)
+        # The plan's approval does not cover it: the apply stage waits for the decision of its own.
+        with self.assertRaises((ServiceRefusal, WorkflowRefusal)):
+            self.engine.advance_stage(sid, evidence_ids=[])
+        self.engine.record_conditional_decision(sid, action_id="runtime", decision="runtime_line_change", names=[],
+                                                owner_quote="Move this fictional runtime to its new line.", owner_message_id="fixture-line-" + uuid.uuid4().hex)
+        self.engine.advance_stage(sid, evidence_ids=[])
+        self.assertEqual(self.launched(route, self.ticket(sid, actions[0], sha))["outcome"], "succeeded")
+
+    def test_install_scripts_need_their_own_decision(self):
+        route = fake_route(item_flags={"tool": ["install_scripts"]}, scripts={"tool": ["example-tool@1.0.0"]})
+        sid, actions = self.prepared(route, [{"action_id": "tool", "manager": "pip", "id": "tool"}])
+        self.assertEqual(self.payload_of(sid, actions[0])["conditional"], {"run_install_scripts": ["example-tool@1.0.0"]})
+        sha = self.approved(sid, actions, self.registered_plan(sid, actions), advance=False)
+        with self.assertRaises((ServiceRefusal, WorkflowRefusal)):
+            self.engine.record_conditional_decision(sid, action_id="tool", decision="run_install_scripts", names=["other-tool@1.0.0"],
+                                                    owner_quote="Let these fictional scripts run.", owner_message_id="fixture-scripts-" + uuid.uuid4().hex)
+        with self.assertRaises((ServiceRefusal, WorkflowRefusal)):
+            self.engine.advance_stage(sid, evidence_ids=[])
+        self.engine.record_conditional_decision(sid, action_id="tool", decision="run_install_scripts", names=["example-tool@1.0.0"],
+                                                owner_quote="Let these fictional scripts run.", owner_message_id="fixture-scripts-" + uuid.uuid4().hex)
+        self.engine.advance_stage(sid, evidence_ids=[])
+        self.assertEqual(self.launched(route, self.ticket(sid, actions[0], sha))["outcome"], "succeeded")
+
+    def assert_held_for_a_check(self, route):
+        sid, issued = self.ticketed(route)
+        result = self.launched(route, issued)
+        self.assertEqual((result["outcome"], result["receipt"]["result"], result["receipt"]["verified_postcondition"]), ("failed", "could_not_check", False))
+        self.assertEqual((self.state(sid)["status"], self.operation(sid, issued)["resolution"]), ("held", None))
+        self.assertEqual(self.state(sid)["evidence"][result["evidence_id"]]["facts"]["result"], "could_not_check")
+
+    def test_a_false_postcondition_is_held_through_the_engine(self):
+        self.assert_held_for_a_check(fake_route(verified=False))
+
+    def test_an_unverified_failure_is_no_verified_failure_through_the_engine(self):
+        self.assert_held_for_a_check(fake_route(verified=False, result="did_not_update"))
+
+    def test_a_terminal_failure_holds_the_session_through_the_engine(self):
+        # apt exit 100 in a terminal: the text that would show an integrity failure went to the person, so nothing may continue.
+        route = fake_route(classify=package_registry.APT["classify_exit"], result="did_not_update", restart_probe="apt.needrestart", restart=lambda found: "required")
+        sid, issued = self.ticketed(route)
+        result = self.launched(route, issued, FakeChild(code=100))
+        self.assertEqual((result["outcome"], result["receipt"]["result"]), ("failed", "could_not_check"))
+        operation = self.operation(sid, issued)
+        self.assertEqual((self.state(sid)["status"], operation["resolution"], operation.get("restart_pending")), ("held", None, None))
+
+    def test_an_interrupted_run_stays_unknown_through_the_engine(self):
+        route = fake_route(result="updated")
+        sid, issued = self.ticketed(route)
+        with self.assertRaises(KeyboardInterrupt):
+            self.launched(route, issued, FakeChild(error=KeyboardInterrupt()))
+        result = self.reconciled(route, sid, issued)
+        self.assertEqual((result["outcome"], result["receipt"]["result"]), ("unknown", "unknown"))
+        self.assertEqual((self.operation(sid, issued)["outcome"], self.state(sid)["status"]), ("unknown", "held"))
+        self.assertEqual(self.reconciled(route, sid, issued)["held"], True)
+        self.assertEqual(self.operation(sid, issued)["outcome"], "unknown")
+
+    def test_a_recorded_exit_reconciles_through_the_engine(self):
+        route = fake_route(result="updated")
+        sid, issued = self.ticketed(route)
+        with mock.patch.object(self.service, "_complete", side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
+            self.launched(route, issued)
+        result = self.reconciled(route, sid, issued)
+        self.assertEqual((result["outcome"], result["receipt"]["result"]), ("succeeded", "updated"))
+        self.assertEqual(self.operation(sid, issued)["outcome"], "succeeded")
+        # The unknown of a run cut off after its exit closes in reconciliation too.
+        sid, issued = self.ticketed(fake_route(result="updated"))
+        with mock.patch.object(self.service, "_complete", side_effect=ValueError("cut off")):
+            self.assertEqual(self.launched(route, issued)["outcome"], "unknown")
+        self.reconciled(route, sid, issued)
+        self.assertEqual(self.operation(sid, issued)["outcome"], "succeeded")
+
+    def test_a_pause_during_the_checks_starts_nothing_through_the_engine(self):
+        route = fake_route()
+        sid, issued = self.ticketed(route)
+        pausing = MappingProxyType({**route, "drift": lambda probe, run, payload: self.engine.pause(sid) and None})
+        child = FakeChild()
+        result = self.launched(pausing, issued, child)
+        self.assertEqual((child.calls, result["outcome"], result["receipt"]["adapter_invoked"]), ([], "failed", False))
+        self.assertEqual(self.state(sid)["status"], "paused")
+        self.assertEqual((result["receipt"]["result"], result["receipt"]["reason"]), ("not_run", "owner_paused_or_stopped"))
+
+    def test_the_reboot_file_enters_the_restart_class_through_the_engine(self):
+        route = fake_route(restart_files=dict(package_registry.APT["run"]["restart_files"]))
+        sid, issued = self.ticketed(route)
+        probe = RunProbe()
+        def child(argv, **keywords):
+            probe.files["/run/reboot-required"] = regular()
+            return 0, b""
+        result = self.launched(route, issued, child, probe=probe)
+        self.assertEqual((result["outcome"], result["receipt"]["result"]), (None, "restart_needed"))
+        self.assertEqual(self.operation(sid, issued)["restart_pending"], {"signal": "required", "source": "linux.reboot_required"})
+        self.assertIsNone(self.operation(sid, issued)["outcome"])
+
+    def test_a_boot_recorded_before_an_interruption_is_reused_through_the_engine(self):
+        route, sid, issued = self.needing_restart()
+        with mock.patch.object(self.service, "_complete", side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
+            self.launched(route, issued, probe=self.boot())
+        recorded = self.operation(sid, issued)["restart_verification"]
+        self.assertIs(recorded["boot_observed"], True)
+        self.assertIsNone(self.operation(sid, issued)["outcome"])
+        # The probe of the next run cannot read a boot at all: the recorded one carries it.
+        child = FakeChild()
+        result = self.launched(route, issued, child, probe=RunProbe())
+        self.assertEqual((child.calls, result["outcome"], result["receipt"]["boot_evidence_id"]), ([], "succeeded", recorded["evidence_id"]))
+        self.assertEqual(self.operation(sid, issued)["restart_verification"], recorded)
+
+    def test_reconciliation_recognises_a_recorded_boot_through_the_engine(self):
+        route, sid, issued = self.needing_restart()
+        with self.assertRaises(ServiceRefusal) as caught:
+            self.reconciled(route, sid, issued)
+        self.assertEqual(caught.exception.code, "package-restart-class")
+        with mock.patch.object(self.service, "_complete", side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
+            self.launched(route, issued, probe=self.boot())
+        result = self.reconciled(route, sid, issued)
+        self.assertEqual((result["outcome"], result["receipt"]["result"]), ("succeeded", "updated"))
+        self.assertEqual(self.operation(sid, issued)["outcome"], "succeeded")
+
+    def test_the_check_after_a_restart_has_no_time_limit_but_a_new_launch_has(self):
+        def later(hours):
+            real = pc_records.utc_now
+            def shifted():
+                value = datetime.fromisoformat(real().replace("Z", "+00:00")) + timedelta(hours=hours)
+                return value.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            return mock.patch("pc_records.utc_now", side_effect=shifted)
+        route, sid, issued = self.needing_restart()
+        with later(30):
+            child = FakeChild()
+            result = self.launched(route, issued, child, probe=self.boot())
+        self.assertEqual((child.calls, result["outcome"], result["receipt"]["after_restart"]), ([], "succeeded", True))
+        # A ticket that never ran keeps the freshness limit of a new launch.
+        route = fake_route()
+        sid, issued = self.ticketed(route)
+        child = FakeChild()
+        with later(30), self.assertRaises((ServiceRefusal, WorkflowRefusal)):
+            self.launched(route, issued, child)
+        self.assertEqual(child.calls, [])
+
+    def test_a_pending_restart_records_the_boot_it_ran_in_through_the_engine(self):
+        route = fake_route(restart_probe="apt.needrestart", restart=lambda found: "required")
+        sid, issued = self.ticketed(route)
+        same = {"last_boot_utc": "2026-01-01T00:00:00Z", "boot_id": "boot-before", "source": "fictional_probe"}
+        result = self.launched(route, issued, probe=RunProbe(boot=same))
+        self.assertEqual(self.state(sid)["evidence"][result["evidence_id"]]["facts"]["boot_id"], "boot-before")
+        # The same boot read again is no restart.
+        with self.assertRaises(WorkflowRefusal) as caught:
+            self.launched(route, issued, probe=RunProbe(boot=same))
+        self.assertEqual(caught.exception.code, "no-later-boot")
+        self.assertIsNone(self.operation(sid, issued)["outcome"])
+
+
+
+def winget_exits(route):
+    """``route`` with winget's own exit hooks, so the real classification goes through the real service and engine."""
+    return MappingProxyType({**route, "classify_exit": package_registry.WINGET["classify_exit"],
+                             "run": MappingProxyType({**route["run"], "exit_restart": package_registry.WINGET["run"]["exit_restart"]})})
+
+
+class BrewComputer:
+    """A fictional Mac: read-only Homebrew commands answer from what is installed, and the run replaces it with ``after``."""
+
+    def __init__(self, after, info=None):
+        self.info, self.after, self.started = info or json.loads(fixture("brew-info.json")), after, []
+
+    def __call__(self, argv, *, env, cwd, timeout, max_bytes):
+        command = argv[1:]
+        if command[0] == "--version":
+            return 0, fixture("brew-version.txt")
+        if command[0] == "outdated":
+            return 0, json.dumps(brew_one("examplefetch", "brew-outdated.json")).encode()
+        if command[0] == "upgrade":
+            return 0, fixture("brew-dry-run.txt")
+        current = self.after if self.started else self.info
+        return 0, json.dumps(current if "--installed" in command else
+                             {"formulae": [item for item in current["formulae"] if item["name"] == "examplefetch"], "casks": []}).encode()
+
+    def child(self, argv, **keywords):
+        self.started.append(argv)
+        return 0, b""
+
+
+@refusals_fail
+class RouteThroughTheEngineTests(SessionFixtures):
+    """The Homebrew route and winget's exit hooks in a real run: the real service, engine and completion, on a fictional computer."""
+    prepared, registered_plan, approved, ticket = PackageEngineTests.prepared, PackageEngineTests.registered_plan, PackageEngineTests.approved, PackageEngineTests.ticket
+    launched, ticketed, operation = PackageEngineTests.launched, PackageEngineTests.ticketed, PackageEngineTests.operation
+    reconciled, payload_of = PackageEngineTests.reconciled, PackageEngineTests.payload_of
+
+    def brew_run(self, computer):
+        """One approved Homebrew update, run to its end: (session id, approved action, the run's result)."""
+        sid, probe = self.session(job="security_updates", platform="macos"), RunProbe(platform=MAC)
+        self.service.elevation_probe, self.route = lambda: False, package_registry.BREW
+        actions = self.service.prepare_package_action(sid, adapter_id=UPGRADE, items=[{"action_id": "update-fetch", "manager": "brew", **FETCH}],
+                                                      probe=probe, launcher=computer, **PROSE)
+        issued = self.ticket(sid, actions[0], self.approved(sid, actions, self.registered_plan(sid, actions)))
+        return sid, actions[0], self.service.run_ticket(ticket_id=issued["ticket_id"], launcher=computer.child, probe=probe, reader=computer, terminal=FakeTerminal())
+
+    @staticmethod
+    def after_run(**fetch):
+        """What brew info prints after the update: the new versions, the added package, and examplefetch with ``fetch`` on top."""
+        after = json.loads(fixture("brew-info-after.json"))
+        after["formulae"][0].update(fetch)
+        after["formulae"].append({"name": "examplenew", "full_name": "examplenew", "tap": "homebrew/core", "pinned": False, "disabled": False,
+                                  "keg_only": False, "linked_keg": "2.0", "installed": [{"version": "2.0", "installed_on_request": False}]})
+        return after
+
+    def test_an_old_version_left_linked_is_no_update(self):
+        sid, action, result = self.brew_run(BrewComputer(self.after_run()))
+        self.assertEqual((result["outcome"], result["receipt"]["result"], result["receipt"]["installed_version"]), ("succeeded", "updated", "1.25.0_2"))
+        self.assertIs(result["receipt"]["verified_postcondition"], True)
+        self.assertEqual(self.payload_of(sid, action)["flags"], ["adds_packages"])
+        for fetch in ({"linked_keg": "1.24.5"}, {"linked_keg": None}):
+            with self.subTest(fetch=fetch):
+                _sid, _action, result = self.brew_run(BrewComputer(self.after_run(**fetch)))
+                self.assertEqual((result["outcome"], result["receipt"]["result"], result["receipt"]["installed_version"]), ("failed", "did_not_update", None))
+
+    def test_an_unlinked_keg_stands_where_the_plan_allows_it(self):
+        _sid, _action, result = self.brew_run(BrewComputer(self.after_run(linked_keg=None, keg_only=True)))
+        self.assertEqual((result["outcome"], result["receipt"]["result"]), ("succeeded", "updated"))
+        info = json.loads(fixture("brew-info.json"))
+        info["formulae"][0]["linked_keg"] = None
+        _sid, _action, result = self.brew_run(BrewComputer(self.after_run(linked_keg=None), info))
+        self.assertEqual((result["outcome"], result["receipt"]["result"]), ("succeeded", "updated"))
+
+    def waits_for(self, signal, code, tail=b""):
+        route = winget_exits(fake_route(run_kind="process"))
+        sid, issued = self.ticketed(route)
+        result = self.launched(route, issued, FakeChild(code=code, tail=tail))
+        self.assertEqual((result["outcome"], result["receipt"]["result"], result["receipt"]["exit"]["restart"]), (None, "restart_needed", signal))
+        self.assertEqual(self.operation(sid, issued)["restart_pending"], {"signal": signal, "source": "exit_code"})
+
+    def test_a_restart_the_installer_started_keeps_its_name(self):
+        self.waits_for("initiated_by_installer", 0x8A15010B)
+
+    def test_a_restart_from_the_msi_code_keeps_its_name(self):
+        self.waits_for("initiated_by_installer", 1641)
+
+    def test_the_restart_sentence_at_exit_zero_waits_for_the_restart(self):
+        self.waits_for("required", 0, b"Successfully installed\r\nRestart your PC to finish installation.\r\n")
+
+    def test_a_failed_install_that_needs_a_restart_first_says_so(self):
+        route = winget_exits(fake_route(run_kind="process", result="did_not_update"))
+        sid, issued = self.ticketed(route)
+        result = self.launched(route, issued, FakeChild(code=0x8A15010A))
+        self.assertEqual((result["outcome"], result["receipt"]["result"]), ("failed", "did_not_update"))
+        self.assertEqual(result["receipt"]["restart"], {"signal": "required_before_retry", "source": "exit_code"})
+        self.assertFalse(self.operation(sid, issued).get("restart_pending"))
+
+    def test_an_exit_without_a_restart_sentence_leaves_the_restart_unknown(self):
+        route = winget_exits(fake_route(run_kind="process"))
+        _sid, issued = self.ticketed(route)
+        result = self.launched(route, issued, FakeChild(code=0, tail=b"Successfully installed\r\n"))
+        self.assertEqual((result["outcome"], result["receipt"]["result"]), ("succeeded", "updated"))
+        self.assertEqual(result["receipt"]["restart"], {"signal": "unknown", "source": None})
+
+    def record_lost(self, route, child, *, boot_fails=False):
+        """A run whose restart signal could not be recorded: the engine refused the record, or the boot could not be read. The
+        step closes as unknown; (session id, ticket response)."""
+        sid, issued = self.ticketed(route)
+        probe = RunProbe()
+        if boot_fails:
+            probe.boot_identity = mock.Mock(side_effect=OSError("the boot time cannot be read"))
+        refusal = None if boot_fails else WorkflowRefusal("Session is locked by another writer")
+        with mock.patch.object(self.engine, "record_restart_pending", side_effect=refusal):
+            self.assertEqual(self.launched(route, issued, child, probe=probe)["outcome"], "unknown")
+        return sid, issued
+
+    def stays_unknown(self, route, child, **keywords):
+        sid, issued = self.record_lost(route, child, **keywords)
+        result = self.reconciled(route, sid, issued)
+        self.assertEqual((result["outcome"], result.get("held")), ("unknown", True))
+        self.assertNotIn("receipt", result)
+        self.assertEqual(self.operation(sid, issued)["outcome"], "unknown")
+
+    def test_a_probed_restart_survives_a_refused_record(self):
+        self.stays_unknown(fake_route(restart_probe="apt.needrestart", restart=lambda found: "required"), FakeChild())
+
+    def test_a_probed_restart_survives_an_unreadable_boot(self):
+        self.stays_unknown(fake_route(restart_probe="apt.needrestart", restart=lambda found: "required"), FakeChild(), boot_fails=True)
+
+    def test_the_exit_code_restart_survives_a_refused_record(self):
+        self.stays_unknown(winget_exits(fake_route(run_kind="process")), FakeChild(code=0x8A15010B))
+
+    def test_the_exit_code_restart_survives_an_unreadable_boot(self):
+        self.stays_unknown(winget_exits(fake_route(run_kind="process")), FakeChild(code=0x8A15010B), boot_fails=True)
+
+    def test_a_signal_gone_after_a_failed_record_closes_the_step(self):
+        signals = ["required"]
+        route = fake_route(restart_probe="apt.needrestart", restart=lambda found: signals[-1])
+        sid, issued = self.record_lost(route, FakeChild())
+        signals.append("none")
+        result = self.reconciled(route, sid, issued)
+        self.assertEqual((result["outcome"], result["receipt"]["result"]), ("succeeded", "updated"))
+
+    def test_the_ticket_names_the_shell_of_its_command(self):
+        _sid, issued = self.ticketed(fake_route())
+        self.assertEqual(issued.get("shell"), "powershell" if os.name == "nt" else "posix")
+        self.assertEqual(issued["command"].startswith("& "), issued.get("shell") == "powershell")
 
 
 if __name__ == "__main__":
