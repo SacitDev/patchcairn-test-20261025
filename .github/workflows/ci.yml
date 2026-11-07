@@ -24,7 +24,7 @@ jobs:
           - os: macos-latest
             timeout: 60
     runs-on: ${{ matrix.os }}
-    # Windows Python helpers reuse an owned serial worker; native checks stay per operation.
+    # Windows file operations run in the Python process; each native call has its own deadline.
     timeout-minutes: ${{ matrix.timeout }}
     env:
       TZ: UTC

@@ -20,12 +20,12 @@ from pc_records import SCHEMA_VERSION
 COMMANDS = ("start", "help", "status", "options", "cost", "settings", "pause", "resume", "stop", "resolve")
 JOBS = {
     "security_updates": {"label": "Security and updates",
-                         "description": "Find out-of-date apps, Python and Node packages, drivers, firmware and system software, and "
-                                        "update what you approve.",
+                         "description": "Find out-of-date software and update what you approve. Not updated yet: Windows Update, macOS "
+                                        "system updates, firmware, Python and Node packages.",
                          "stages": ["scope", "inventory", "research", "plan", "apply", "verify", "complete"]},
     "storage_cleanup": {"label": "Storage and cleanup",
-                        "description": "See what fills your drive; delete files for good, set them aside (can be undone; frees no space) "
-                                       "or back them up first (may need extra space).",
+                        "description": "See what fills your drive; set files aside (can be undone; frees no space) or back them up "
+                                       "first (may need extra space).",
                         "stages": ["scope", "inventory", "candidates", "plan", "apply", "verify", "complete"]},
     "diagnosis_repair": {"label": "Diagnosis and repair",
                          "description": "Find out why something goes wrong and fix what I can: update an app, reinstall the same version "

@@ -32,6 +32,8 @@ These are read-only diagnostic observations. They do not inventory all installed
 | `windows.system_event_metadata` | `["window_hours:N","max_events:N"]` | Up to 50 `events`: `event_id`, fixed `provider`, `level`, `observed_utc` | Fixed System event providers/IDs; window 1–24 hours, count 1–50. No payload or log-path parameter. Native permissions may cause a hold. |
 | `windows.update_event_metadata` | `["window_hours:N","max_events:N"]` | Same event metadata | Fixed Windows Update Client Operational channel. Same count/window limits and no message payload. An empty query does not establish update health. |
 
+`windows.dism_check_health` and `windows.sfc_verify_only` (they need an administrator prompt) and `linux.dpkg_audit` and `linux.rpm_verify` (their behavior without administrator rights is not verified) are listed and always hold.
+
 The core validates exact typed fact fields and rejects additional fields, foreign platforms, arbitrary command keys, unknown recipe IDs, malformed numbers or unexpected output. Event providers are fixed to `Microsoft-Windows-WindowsUpdateClient`, `Microsoft-Windows-Kernel-Power`, `EventLog`, `Microsoft-Windows-WHEA-Logger`, `disk`, `Ntfs`, `Microsoft-Windows-Ntfs` and `volmgr`; the Windows adapter further binds provider/ID combinations. Permissions are never elevated or bypassed by this API.
 
 The POSIX adapter requires the actual matching native platform, Python 3.12+, explicit current coordinator call authority, and an existing root-owned system binary with no group/other write permission and protected ancestry. It never searches `PATH`. Recipes run through the shared read-only runner (`readonly_runner.py`): fixed arguments, an isolated minimal child environment, `shell=False`, disabled stdin, discarded stderr, a five-second observation timeout and a 4,096-byte stdout bound are enforced. A killed child receives at most five additional seconds to exit; an uninterruptible OS process remains an explicit failure/limit. Missing tools, incompatible formats, denied access and unavailable capabilities remain held or failed observations with empty facts. There is no fallback to a less bounded tool, installer or shell script.
@@ -81,7 +83,7 @@ Every write returns:
 }
 ```
 
-The abbreviated example describes the envelope, not a complete result. File names bind immutable canonical JSON bytes to their SHA-256. Repeated creation of an existing identical record is refused. Reads verify the actual content hash, ordinary single-link identity and schema/request identity before returning data. Caller edits to returned objects do not change stored records. All generated records remain below `work/` and are excluded from public source exports.
+The abbreviated example describes the envelope, not a complete result. File names bind immutable canonical JSON bytes to their SHA-256. Repeated creation of an existing identical record is refused. Reads verify the actual content hash, ordinary single-link identity and schema/request identity before returning data. Caller edits to returned objects do not change stored records. All generated records remain below `work/` and are excluded from published source.
 
 A complete request has exactly `schema` (`patchcairn.diagnostics`), `schema_version` (the integer 1), `kind` (`request`), `request_id` (`diag-` plus 32 lowercase hex), `platform`, `recipe_id`, `mode` (`fixture` or `real`), sanitized `symptom`, categorical `scope` and `observed_utc`.
 

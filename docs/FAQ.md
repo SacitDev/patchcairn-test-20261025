@@ -40,11 +40,11 @@ It immediately prevents new actions. An active operation must be recorded and br
 
 `PatchCairn: resolve` examines an identified pending decision or operation and explains the evidence or bounded choice needed. It cannot turn an unknown failure into success, bypass a hold, or blindly retry a consumed action. A recovery or repair needs reviewed scope and actual verification.
 
-## Why can a Windows update be installed but still unfinished?
+## Why can an update be installed but still unfinished?
 
-An update can be installed and still need a restart to finish. When the update tool reports that, PatchCairn keeps the step open and does not run it again; only a backup can start meanwhile. Save your work and restart when you are ready: PatchCairn never restarts the computer. Afterwards it checks that the computer really started again, then reads the result of the update.
+An update can be installed and still need a restart to finish. PatchCairn never restarts the computer itself, but an installer may close apps or start a restart on its own, so save your work before you approve an update. When a restart is needed, PatchCairn keeps the step open and does not run it again; until then only a backup or a read-only check can start. When you are ready, save your work, choose Restart (not Shut down), then open your assistant in the PatchCairn folder and say `PatchCairn: resume` (after `PatchCairn: stop`, say `PatchCairn: status`). PatchCairn then confirms that the computer really started again and reads the result from the package manager.
 
-Afterward, the result is read from the package manager again. A failed check supports only a failed or partial result, with actual effects and retained recovery reviewed before a new plan. An elapsed wait or a new version string cannot replace the check after the restart. Any pause still applies to later work. After stop, that check still runs for the same open step; the session stays stopped, with no new job action. Without a later restart the step stays open, and security remediation is a separate finding.
+A failed check supports only a failed or partial result, with actual effects and retained recovery reviewed before a new plan. An elapsed wait or a new version string cannot replace the check after the restart. Any pause still applies to later work. After stop, that check still runs for the same open step; the session stays stopped, with no new job action. Without a later restart the step stays open, and security remediation is a separate finding.
 
 ## What if I only want findings and no changes?
 
@@ -60,11 +60,11 @@ Assistant usage, downloads, storage, paid products, time, and interruptions can 
 
 Only concrete authorized actions proceed. “Latest” does not permit replacing an application-owned runtime, removing required versions, changing security policy, restarting without authority, or bypassing consent. The owning publisher's current tools and channel still need review. The [official tool catalog](TOOLS.md) supports investigation; it is not an installer bundle or permission grant.
 
-Updates run through the package manager that owns the software: **winget** on Windows, **Homebrew** on macOS, and **apt or dnf** on Linux. PatchCairn reads what the manager offers, puts the exact package, version, source and command into the plan, and after your approval runs only that step through a one-use ticket. On Linux the step runs in your own Terminal, where sudo may ask for your password. Windows Update, macOS system updates, firmware, and Python and Node packages remain held in this version.
+Updates run through the package manager that owns the software: **winget** on Windows, **Homebrew** on macOS, and **apt** or **dnf5** (Fedora 41 or later) on Linux; a system with only dnf 4, such as RHEL 9 and its rebuilds, holds. PatchCairn reads what the manager offers, puts the exact package, version, source and command into the plan, and after your approval runs only that step, once; it is never run a second time. It does not run while PatchCairn has administrator rights: if you opened your assistant with Run as administrator or with sudo, close it and open it normally. On Linux the step runs in your own Terminal, where sudo may ask for your password. Windows Update, macOS system updates, firmware, and Python and Node packages are not updated in this version.
 
 ## Can it repair my operating system or guide me through another official tool?
 
-It can diagnose selected symptoms, compare evidence, research official procedures, and explain a proposed repair with its risks and recovery requirements. The repairs it can run are an app update, a same-version reinstall (Homebrew on macOS, apt on Linux) and finishing an interrupted package setup on Debian and Ubuntu. It does not repair Windows itself: a DISM repair is held, and System File Checker and winget repair are guidance only. An ordinary-file ZIP is not Windows component-store, operating-system, application, or package-state rollback.
+It can diagnose selected symptoms, compare evidence, research official procedures, and explain a proposed repair with its risks and recovery requirements. The repairs it can run are an app update, a same-version reinstall (Homebrew on macOS, apt or dnf on Linux) and finishing an interrupted package setup on Debian and Ubuntu. It does not repair Windows itself: a DISM repair is held, and System File Checker and winget repair are guidance only. An ordinary-file ZIP is not Windows component-store, operating-system, application, or package-state rollback.
 
 The assistant may explain a concrete official owner-performed procedure within the agreed scope. That guidance does not create a missing integrated adapter, allow an arbitrary-command fallback around a hold, or establish that a repair succeeded. Any supported coordinator action still needs its actual contract, exact plan, independent reviews, current authority, normal protected consent, and outcome verification. When the route is unavailable, expect a clear recommendation and remaining hold.
 
@@ -74,7 +74,7 @@ No. An expected installed version is one observation. Support, advisory applicab
 
 ## Why can storage assessment find duplicates without offering deletion?
 
-Equal bytes do not prove a file is unnecessary. Applications may require separate copies, links may share storage, and selected folders may omit context. Assessment starts with metadata. Ordinary-file hashing needs appropriate scope; cleanup needs exact candidates, freshness and identity checks, authority, and a supported safe operation. See the [storage and backup reference](STORAGE_BACKUP_API.md).
+Equal bytes do not prove a file is unnecessary. Applications may require separate copies, links may share storage, and selected folders may omit context. Assessment starts with metadata. Ordinary-file hashing needs appropriate scope; cleanup needs exact candidates, freshness and identity checks, authority, and a supported safe operation. In this version one cleanup handles files of at most 16 MiB each and 48 MiB in total, and frees less than 32 MiB (about 33.6 MB). See the [storage and backup reference](STORAGE_BACKUP_API.md).
 
 ## Does cleanup remove browser caches, chats, or system stores?
 
@@ -84,7 +84,7 @@ No. Browser history, cookies, caches, profiles, saved passwords, and chat sessio
 
 A normal ZIP is not encrypted. Choose contents, destination, storage, and handling accordingly. Hash and entry checks establish specific archive facts. Restoration checks address whether reviewed data can be restored as intended. No backup promises every application, permission, or system setting is recoverable. Required recovery stays protected until release is explicitly justified.
 
-A backup holds up to **100,000 selected files** and streams them into the archive. It goes to PatchCairn's private work folder or to a folder you choose on another drive; a folder synced to the cloud is refused. PatchCairn's own restore handles archives up to **32 MiB** and files up to **16 MiB**; a larger backup is checked but not restored by PatchCairn. A larger recovery need requires a narrower selection or a separately reviewed supported approach. It does not silently exclude files, split them into automatic chunks, choose a destination for you, or label a partial archive complete.
+A backup holds up to **100,000 selected files** and streams them into the archive. It goes to PatchCairn's private work folder or to a folder you choose on another drive. PatchCairn refuses a folder it recognises as synced by OneDrive, iCloud Drive, Dropbox or Google Drive, but that check is best effort, so do not choose a synced folder yourself. Network drives and NAS shares are refused. A USB drive, or a drive formatted exFAT or FAT32, cannot keep the backup private, so PatchCairn asks you to accept that first. PatchCairn's own restore handles archives up to **32 MiB** (about 33.6 MB) and files up to **16 MiB**; a larger backup is still written and checked, but PatchCairn cannot restore it for you or use it as the safety copy for deleting files. A larger recovery need requires a narrower selection or a separately reviewed supported approach. It does not silently exclude files, split them into automatic chunks, choose a destination for you, or label a partial archive complete.
 
 ## Does diagnosis always find the original cause?
 

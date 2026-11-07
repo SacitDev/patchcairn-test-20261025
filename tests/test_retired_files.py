@@ -13,7 +13,7 @@ RETIRED_LEDGER = (
     "scripts/posix_core.py", "scripts/patchcairn.py", "scripts/Toolkit.Core.psm1", "scripts/Invoke-Toolkit.ps1",
     "scripts/Collect-WindowsBaseline.ps1", "scripts/Private.Workspace.ps1", "scripts/Windows.Native.cs",
     "templates/ledger-contract.json", "templates/cleanup-approval.example.json", "templates/export-allowlist.json",
-    "tests/fictional-ledger.json", "tests/test_posix_core.py", "LEDGER_SPEC.md",
+    "tests/fictional-ledger.json", "tests/test_posix_core.py", "LEDGER_SPEC.md", "references/HELPER_API.md",
 )
 RETIRED_WORKER = (
     "scripts/windows_worker.py", "scripts/Windows.Scoped.Dispatch.ps1", "scripts/Windows.Scoped.cs",

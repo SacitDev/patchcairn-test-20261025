@@ -583,6 +583,10 @@ class TextTests(unittest.TestCase):
         repairs = JOBS["diagnosis_repair"]["description"]
         self.assertIn("frees no space", JOBS["storage_cleanup"]["description"])
         self.assertIn("fills your drive", JOBS["storage_cleanup"]["description"])
+        # The menu promises only built routes: permanent deletion is not offered there, and the update routes not built yet are named.
+        self.assertNotIn("delete files for good", JOBS["storage_cleanup"]["description"])
+        self.assertIn("Not updated yet: Windows Update, macOS system updates, firmware, Python and Node packages",
+                      JOBS["security_updates"]["description"])
         for repair in ("update an app", "reinstall the same version", "finish a cut-off software install"):
             self.assertIn(repair, repairs)
         for row in JOBS.values():
