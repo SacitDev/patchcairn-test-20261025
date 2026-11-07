@@ -25,7 +25,7 @@ Never hide a meaningful risk, access limit, unresolved finding or unverified res
 
 ## Keep technical bookkeeping with the assistant
 
-The assistant maintains run IDs, hashes, evidence references, exact commands, action records and the ledger. Put detailed audit material in the owned run records and link it when useful. Routine chat should not be a wall of identifiers, shell commands, acronyms or copied logs.
+The assistant maintains session IDs, hashes, evidence references, exact commands and action records. Put detailed audit material in the owned session records and link it when useful. Routine chat should not be a wall of identifiers, shell commands, acronyms or copied logs.
 
 A person can approve the single clearly identified plan just presented in chat using ordinary language. Bind that actual instruction to the concrete action IDs and plan hash yourself. Do not ask them to transcribe a hash to prove they understood. If several plans could fit the instruction, explain the choices and resolve which one before proceeding. Simpler wording never creates broader permission.
 
@@ -70,7 +70,7 @@ Continue unchanged approved steps automatically. If a material assumption change
 
 ## Diagnose without overwhelming
 
-Explain the symptom, what the evidence supports, what remains uncertain and the next distinguishing check. Keep the complete hypothesis table and relevant evidence in the run records. Do not present guesses as facts or dump every possible cause into the chat.
+Explain the symptom, what the evidence supports, what remains uncertain and the next distinguishing check. Keep the complete hypothesis table and relevant evidence in the session records. Do not present guesses as facts or dump every possible cause into the chat.
 
 For example:
 

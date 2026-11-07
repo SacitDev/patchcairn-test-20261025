@@ -1,8 +1,8 @@
 # Linux maintenance reference
 
-Status: PatchCairn's conversation workflow starts at `scripts/patchcairn_workflow.py`. Its bounded native Linux installed-metadata component is implemented in `scripts/collect_linux.py`; the coordinator supplies caller authorization and private evidence handling. Approved system changes still use reviewed official tools through the coordinator; these helpers are not a general Linux updater or repair executor.
+Status: PatchCairn's conversation workflow starts at `scripts/patchcairn_workflow.py`. Its bounded native Linux installed-metadata component is implemented in `scripts/collect_linux.py`; the coordinator supplies caller authorization and private evidence handling. Create the engine session (which admits private storage) before calling `collect()`. Approved apt and dnf updates and repairs run only as the reviewed step of a one-use ticket, in the owner's own Terminal; these helpers are not a general Linux updater or repair executor.
 Reviewed against official documentation on 2026-10-23 at 19:11 UTC. Refresh release, lifecycle and advisory evidence during each run.
-The toolkit's root instructions, approved scope and action ledger govern this adapter. Examples describe capabilities; they are not an approved batch to execute.
+The toolkit's root instructions, approved scope and session records govern this adapter. Examples describe capabilities; they are not an approved batch to execute.
 
 ## Start PatchCairn on Linux
 
@@ -18,7 +18,7 @@ Private records need actual effective-user ownership and directory/file modes `0
 
 WSL itself is not rejected: a supported native Linux filesystem within WSL can meet the same requirements. On a Windows-mounted WSL folder, the private-storage hold is expected while the read-only menu remains available. Do not weaken checks, repair an existing store's permissions, remount a filesystem or relocate development fixtures to manufacture a pass. Existing unsafe stores remain held without adoption.
 
-The conversation workflow is the single start for all four jobs. `scripts/patchcairn.py` supplies assessment-record utilities for the coordinator, rather than another product or first-run choice. Internal backend and schema markers identify which component can handle an existing record; they are not product versions. Keep those markers unchanged, do not automatically convert incompatible records, and never promote a fictional record into a real one.
+The conversation workflow is the single start for all four jobs. Internal record names identify which component can handle an existing record; they are not product versions. Records in an older format are refused, never converted, and a fictional record never becomes a real one.
 
 ## Implemented collection and test boundary
 
@@ -29,7 +29,7 @@ The conversation workflow is the single start for all four jobs. `scripts/patchc
 - RPM queries disable plugins and user rc/macro loading and select the standard database path; installations requiring another path or distribution macro configuration can remain unavailable. Failure is recorded without repair or fallback configuration changes.
 - No APT/DNF refresh or update-offer query, runtime execution/discovery, per-user Flatpak inspection, repository dump, project scan, journal collection or app update runs automatically.
 - Every result includes scope/coverage/errors and explicit limits; an installed version is not a claim of currentness, support, security or full-machine discovery.
-- Current Linux readiness verification: 19 fictional/parser/mocked tests plus three native Linux pipe fixtures passed on a WSL Linux Python 3.12 runtime. Pipe fixtures spawn only the test interpreter with fixed fictional output or sleep; no package command or live inventory was executed. Read-only first-menu/start/help checks also passed without private allocation. The Windows-mounted fixture filesystem correctly held private record creation; that refusal is not positive native-filesystem workflow or recovery validation.
+- The collector tests use fictional output, parsers and mocks; no package command or live inventory is executed. On a Windows-mounted WSL folder, private record creation holds; that refusal is not positive native-filesystem workflow or recovery validation.
 - Native Linux desktop, each distribution/package-manager integration and real authorized collection remain untested. WSL fixture success is not evidence of macOS behavior, update safety or complete native-platform validation.
 
 ## 1. Establish the environment before assessment
@@ -98,7 +98,7 @@ Application-bundled runtimes belong to the application publisher. Keep their fin
 3. Disclose package-manager writes outside the executing toolkit root's `work/` directory, including installed locations, native logs, indexes and download caches. Toolkit-generated evidence and helpers remain inside that `work/` directory.
 4. Check free space, power, concurrent package activity and recovery readiness using bounded evidence. A recovery plan must be specific; do not promise that every package downgrade is supported.
 5. Use the approved distribution/vendor channel. Execute one bounded transaction, capture its exact exit status, affected packages and redacted output, then verify before the next transaction.
-6. Let the owner handle normal `sudo`, polkit or graphical authentication. Never request, record, type or pipe a password; never weaken authentication to automate the step.
+6. Let the owner handle normal `sudo`, polkit or graphical authentication; an apt or dnf step runs in the owner's own Terminal, so sudo's prompt reaches them. sudo asks only when it asks: a recent sudo use or a NOPASSWD rule shows no prompt, so a finished step shows that sudo ran the command, not that the owner typed a password. Never request, record, type or pipe a password; never weaken authentication to automate the step.
 7. Stop on unexpected removals, vendor switches, dependency conflicts, configuration-file questions, signature failures, unavailable sources or changed targets. Explain choices and consequences in the chat.
 8. Preserve active application data and services. A service restart, session termination or system reboot needs the approved interruption boundary and saved-work check.
 9. Re-read installed versions and test a narrowly scoped application capability. Check whether running processes still use old libraries and whether the active kernel differs from the newly installed kernel.
@@ -124,19 +124,19 @@ Computer use is a fallback for supported desktop tools when CLI/API routes are i
 
 ## 7. WSL is a separate boundary
 
-Host WSL version, WSL1/WSL2 choice, guest distribution release, guest packages and host Windows servicing are separate ledger items. [S12]
+Host WSL version, WSL1/WSL2 choice, guest distribution release, guest packages and host Windows servicing are separate inventory items. [S12]
 Updating WSL does not update every guest package; updating a guest does not patch the Windows host. Do not equate a guest kernel package with the kernel actually used by WSL2.
 `wsl --list --verbose` describes installed distributions, state and WSL generation; it does not authorize guest startup or expose a complete guest software inventory. [S12]
 Never unregister, reset, export/import, convert generations or run `wsl --shutdown` during routine assessment. Those actions can remove data, terminate work or change architecture and need a separate plan.
 
 ## 8. Finish and clean only owned work
 
-Save private machine evidence only in the executing toolkit root's admitted `work/` namespaces; keep public reference documentation free of machine facts and credentials. Conversation sessions and their service, diagnostic and storage evidence remain separately bound internal stores. Assessment-record utilities keep each record run in `work/<run-id>/`. Internal compatibility markers, ownership and scope determine which component may handle those records; the stores and their cleanup authority are not interchangeable.
-After reconciliation and approved retention decisions, the coordinator uses only the supported exact cleanup operation for positively identified toolkit-generated disposable files. Completed assessment-record run deletion is narrow housekeeping, not a general session or evidence-store deletion API. Required recovery and unresolved records stay protected. Follow [recovery and cleanup](../RECOVERY_AND_CLEANUP.md), rather than treating a `work/` parent as deletion authority.
+Save private machine evidence only in the executing toolkit root's admitted `work/` namespaces; keep public reference documentation free of machine facts and credentials. Conversation sessions and their service, diagnostic and storage evidence remain separately bound internal stores; they and their cleanup authority are not interchangeable.
+After reconciliation and approved retention decisions, the coordinator uses only the supported exact deletion plan for kept backups and recovery data. Required recovery and unresolved records stay protected. Follow [recovery and cleanup](../RECOVERY_AND_CLEANUP.md), rather than treating a `work/` parent as deletion authority.
 Reject symlinks, traversal, unexpected mounts, empty/root targets and ownership mismatches; preview exact resolved targets before removal.
 Browser profiles, cookies, cache and history; saved chat/development sessions; project environments, datasets and application state are excluded from cleanup.
 Do not run generic home/cache sweeps, package autoremove, journal vacuum, Snap revision deletion, Flatpak unused-runtime removal or container pruning as end-of-run cleanup.
-Native package logs and caches outside the run are not toolkit-owned trash. Any separate cleanup requires an evidence-backed plan, exact scope and approval.
+Native package logs and caches outside `work/` are not toolkit-owned trash. Any separate cleanup requires an evidence-backed plan, exact scope and approval.
 
 ## Official sources
 

@@ -12,7 +12,7 @@ No. Use ordinary language or the `PatchCairn:` requests in your local assistant'
 
 Download and extract the complete source ZIP, then open its source folder in an already installed capable local assistant. Keep `.agents`, `AGENTS.md`, and `scripts` together. There is no separate PatchCairn desktop installer. Copy the opening prompt from [getting started](GETTING_STARTED.md#1-download-and-extract-the-source) into the assistant's chat; it opens the menu before any host collection.
 
-The source includes platform-specific implementations for Windows, Linux, and macOS, but implementation and tested native behavior differ. Existing supported Python 3.12+ is required for portable helpers; Windows's assessment-record helpers use PowerShell. The assistant checks your actual tools, permissions, and private-storage/native capabilities. Missing prerequisites are an explained setup choice, and unsupported routes remain held. See [platform support](PLATFORM_SUPPORT.md) for actual evidence rather than assuming every platform passed the same tests.
+The source includes platform-specific implementations for Windows, Linux, and macOS, but implementation and tested native behavior differ. Existing supported Python 3.12+ is required for PatchCairn's helpers; on Windows, the event and update-history diagnostic checks also use the built-in Windows PowerShell. The assistant checks your actual tools, permissions, and private-storage/native capabilities. Missing prerequisites are an explained setup choice, and unsupported routes remain held. See [platform support](PLATFORM_SUPPORT.md) for actual evidence rather than assuming every platform passed the same tests.
 
 ## Does Start immediately check my computer?
 
@@ -42,9 +42,9 @@ It immediately prevents new actions. An active operation must be recorded and br
 
 ## Why can a Windows update be installed but still unfinished?
 
-The supported MSI installer can return code 3010: installation completed and a restart is still needed. PatchCairn preserves that original result and the same unfinished operation. You choose whether to defer or separately authorize the exact owner-handled restart after saving your work. It does not restart Windows or run the installer again automatically.
+An update can be installed and still need a restart to finish. When the update tool reports that, PatchCairn keeps the step open and does not run it again; only a backup can start meanwhile. Save your work and restart when you are ready: PatchCairn never restarts the computer. Afterwards it checks that the computer really started again, then reads the result of the update.
 
-Afterward, the assistant needs actual evidence of the boot transition, selected installation, and original behavior. Success requires the reviewed target and all behavior checks to pass. A failed check supports only a failed or partial result, with actual effects and retained recovery reviewed before a new plan. Update approval, an elapsed wait, or a new version string cannot replace those checks. Any pause still applies to later work. After stop, you may still defer or authorize only the owner-handled restart needed to account for that same retained unfinished operation; the session stays stopped, with no new job action. Missing decision or boot evidence leaves it unfinished, and security remediation is a separate finding.
+Afterward, the result is read from the package manager again. A failed check supports only a failed or partial result, with actual effects and retained recovery reviewed before a new plan. An elapsed wait or a new version string cannot replace the check after the restart. Any pause still applies to later work. After stop, that check still runs for the same open step; the session stays stopped, with no new job action. Without a later restart the step stays open, and security remediation is a separate finding.
 
 ## What if I only want findings and no changes?
 
@@ -60,11 +60,11 @@ Assistant usage, downloads, storage, paid products, time, and interruptions can 
 
 Only concrete authorized actions proceed. “Latest” does not permit replacing an application-owned runtime, removing required versions, changing security policy, restarting without authority, or bypassing consent. The owning publisher's current tools and channel still need review. The [official tool catalog](TOOLS.md) supports investigation; it is not an installer bundle or permission grant.
 
-Current integrated updates are exact reviewed local MSI, PKG, or DEB handoffs, each limited to a **64 MiB artifact** and the documented fixed arguments. Package-manager update routes remain held because their current integration cannot force the transaction to consume the exact reviewed bytes. A handoff records the approved action for the coordinator's actual official-tool call; it does not itself install a package.
+Updates run through the package manager that owns the software: **winget** on Windows, **Homebrew** on macOS, and **apt or dnf** on Linux. PatchCairn reads what the manager offers, puts the exact package, version, source and command into the plan, and after your approval runs only that step through a one-use ticket. On Linux the step runs in your own Terminal, where sudo may ask for your password. Windows Update, macOS system updates, firmware, and Python and Node packages remain held in this version.
 
 ## Can it repair my operating system or guide me through another official tool?
 
-It can diagnose selected symptoms, compare evidence, research official procedures, and explain a proposed repair with its risks and recovery requirements. The current integrated OS/application repair routes remain held until component-specific recovery is supported. An ordinary-file ZIP is not Windows component-store, operating-system, application, or package-state rollback.
+It can diagnose selected symptoms, compare evidence, research official procedures, and explain a proposed repair with its risks and recovery requirements. The repairs it can run are an app update, a same-version reinstall (Homebrew on macOS, apt on Linux) and finishing an interrupted package setup on Debian and Ubuntu. It does not repair Windows itself: a DISM repair is held, and System File Checker and winget repair are guidance only. An ordinary-file ZIP is not Windows component-store, operating-system, application, or package-state rollback.
 
 The assistant may explain a concrete official owner-performed procedure within the agreed scope. That guidance does not create a missing integrated adapter, allow an arbitrary-command fallback around a hold, or establish that a repair succeeded. Any supported coordinator action still needs its actual contract, exact plan, independent reviews, current authority, normal protected consent, and outcome verification. When the route is unavailable, expect a clear recommendation and remaining hold.
 
@@ -78,13 +78,13 @@ Equal bytes do not prove a file is unnecessary. Applications may require separat
 
 ## Does cleanup remove browser caches, chats, or system stores?
 
-No. Browser history, cookies, caches, profiles, saved passwords, and chat sessions are protected. Credential stores, unrelated projects, and broad system locations are excluded. Host cleanup uses selected reviewed targets. Toolkit housekeeping follows the matching record-family contract; assessment-record run-cleanup helpers cannot delete conversation sessions. Neither route implies a global cleaner, package autoremove, ACL bypass, or recursive-delete workaround.
+No. Browser history, cookies, caches, profiles, saved passwords, and chat sessions are protected. Credential stores, unrelated projects, and broad system locations are excluded. Host cleanup uses selected reviewed targets. Deleting PatchCairn's own kept backups is a separate reviewed plan that you approve by typing its exact phrase. Neither route implies a global cleaner, package autoremove, ACL bypass, or recursive-delete workaround.
 
 ## Is a ZIP backup encrypted? Does a successful backup prove I can recover?
 
 A normal ZIP is not encrypted. Choose contents, destination, storage, and handling accordingly. Hash and entry checks establish specific archive facts. Restoration checks address whether reviewed data can be restored as intended. No backup promises every application, permission, or system setting is recoverable. Required recovery stays protected until release is explicitly justified.
 
-The built-in route supports selected ordinary-file contents up to **16 MiB per file, 48 MiB total selected content, and 64 MiB per archive**. A larger recovery need requires a narrower selection or a separately reviewed supported approach. It does not silently exclude oversized files, split them into automatic chunks, choose an external destination, or label a partial archive complete.
+A backup holds up to **100,000 selected files** and streams them into the archive. It goes to PatchCairn's private work folder or to a folder you choose on another drive; a folder synced to the cloud is refused. PatchCairn's own restore handles archives up to **32 MiB** and files up to **16 MiB**; a larger backup is checked but not restored by PatchCairn. A larger recovery need requires a narrower selection or a separately reviewed supported approach. It does not silently exclude files, split them into automatic chunks, choose a destination for you, or label a partial archive complete.
 
 ## Does diagnosis always find the original cause?
 
@@ -96,11 +96,11 @@ These are excluded from ordinary assessment, along with credential files, keycha
 
 ## What are the records for? Can I share them?
 
-Private state, event history, evidence, and reports support resume and verification. They can contain computer-specific information. Share a reviewed minimal example when seeking help, not a whole run. Source export and the documentation site use exact public file lists and exclude `work/` and Git history. An ignore file or secret scan alone cannot prove privacy.
+Private state, event history, evidence, and reports support resume and verification. They can contain computer-specific information. Share a reviewed minimal example when seeking help, not a whole session. Published source and the documentation site exclude `work/` and Git history; the site builder uses an exact list of public files. An ignore file or secret scan alone cannot prove privacy.
 
 ## Can I delete everything after a session?
 
-The current service has no general session-deletion or required-retention-release executor. Keep its records and required recovery material when no supported cleanup path exists. The assistant matches housekeeping to the exact component that created the files; another helper's cleanup route cannot authorize deleting a conversation session. Do not remove the work root while operations, unresolved outcomes, or needed recovery remain. Any supported cleanup needs reviewed exact targets and consequences. Deleting records does not undo updates or erase external logs. See [recovery and cleanup](../RECOVERY_AND_CLEANUP.md).
+PatchCairn can delete its kept backups and recovery data, for items you choose or for one finished job, through a reviewed plan that you approve by typing the exact phrase it shows, such as "delete 2 backups". The session records themselves stay; no command deletes a whole session. Do not remove the work root while operations, unresolved outcomes, or needed recovery remain. Any supported cleanup needs reviewed exact targets and consequences. Deleting records does not undo updates or erase external logs. See [recovery and cleanup](../RECOVERY_AND_CLEANUP.md).
 
 ## Does this replace security software or professional support?
 

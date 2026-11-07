@@ -14,7 +14,7 @@ If you use a terminal, an existing supported Python 3.12+ can show the same menu
 python -I -S -B scripts/patchcairn_workflow.py
 ```
 
-The [engine/CLI guide](docs/WORKFLOW_ENGINE.md) documents further arguments and handlers. CLI fixture mode is the default. A real session is a separate record, not collection or change permission. If a required runtime or host capability is missing, the assistant explains the available choices instead of installing it silently. See [assistant compatibility](docs/ASSISTANT_COMPATIBILITY.md).
+The [engine/CLI guide](docs/WORKFLOW_ENGINE.md) documents further arguments and handlers. CLI fixture mode is the default: when you choose a job, the assistant adds `--mode real` to that command, because without it the choice opens a practice session that never reads or changes your computer. A real session is a separate record, not collection or change permission. If a required runtime or host capability is missing, the assistant explains the available choices instead of installing it silently. See [assistant compatibility](docs/ASSISTANT_COMPATIBILITY.md).
 
 ## Choose one of the four jobs
 
@@ -40,7 +40,7 @@ Do not paste passwords, tokens, keys, raw logs or private configuration. Diagnos
 
 > Start backup and recovery for the ordinary files I select. Show the exact contents, exclusions, destination, extra space needed and privacy/recovery limits before reading their contents or writing a backup. After approval, verify the archive and a checked restoration. Explain what this local file-content backup can recover and what it does not preserve.
 
-The current bounded helper keeps output under owned toolkit work and does not support external/cloud destinations or an entire-system image. Compression is not encryption, and a backup on the same drive is not off-device disaster protection. Restoration uses a new reviewed destination and does not overwrite originals. [Backup/recovery procedure](references/BACKUP_RECOVERY_WORKFLOW.md).
+The backup goes to PatchCairn's private work folder or to a folder you choose on another drive; a cloud-synced folder is refused, and an entire-system image is not supported. Compression is not encryption, and a backup on the same drive is not off-device disaster protection. Restoration uses a new reviewed destination and does not overwrite originals. [Backup/recovery procedure](references/BACKUP_RECOVERY_WORKFLOW.md).
 
 ## Set how and when the work proceeds
 
@@ -85,12 +85,12 @@ A host conversation resume is different from PatchCairn outcome reconciliation. 
 
 ## Retain or share the result
 
-> Explain the final result, remaining uncertainty and anything I need to do. Show which toolkit-owned working files could be cleaned separately, with exact sizes and what evidence or recovery would be retained or lost. Wait for my decision on that exact preview.
+> Explain the final result, remaining uncertainty and anything I need to do. Show which backups and recovery files PatchCairn still keeps, with exact sizes and what would be lost if they were deleted. Wait for my decision on that exact list.
 
-This is toolkit-work housekeeping, distinct from the storage job. Required recovery, quarantined originals, active work and unresolved receipts remain protected. The current service has no general session-deletion or required-retention-release executor; if no exact supported cleanup path exists, retain the files. Any supported record deletion needs the specific loss decision and component checks in [recovery and cleanup](RECOVERY_AND_CLEANUP.md). Approved tools and the OS can keep records outside work; deleting work does not erase those records or reverse installed changes.
+This is separate from the storage job. Required recovery, quarantined originals, active work and unresolved receipts remain protected. Deleting kept backups is its own plan: you approve it by typing the exact phrase PatchCairn shows, such as "delete 2 backups". See [recovery and cleanup](RECOVERY_AND_CLEANUP.md). Approved tools and the OS can keep records outside work; deleting work does not erase those records or reverse installed changes.
 
-> Prepare a reusable source-only package for another computer. Verify its exact allowlisted contents and exclude work, private sessions, inventories, logs, backups, credentials and Git history. Do not upload or publish it.
+> Explain how to copy PatchCairn to another computer. Name exactly what to copy, and make sure work, private sessions, inventories, logs, backups, credentials and Git history stay behind. Do not upload or publish it.
 
 The next computer needs fresh scope, facts and authority. Public-site documentation does not operate your computer. See [publication guidance](PUBLICATION.md) for a separately authorized publication.
 
-The assistant selects suitable internal record helpers as part of this same workflow; you do not choose another product version or startup route. The [record helper reference](references/HELPER_API.md) documents component markers, record IDs and reports for maintainers. Records remain bound to their creating component: no fixture promotion, marker changes, imported approvals or automatic migration. Any permitted cross-reference stays tied to the exact immutable backend identity and hash-bound evidence.
+The assistant selects suitable internal helpers as part of this same workflow; you do not choose another product version or startup route. Records remain bound to the session that created them: no fixture promotion, marker changes, imported approvals or automatic migration. The [architecture guide](docs/ARCHITECTURE.md) describes the record stores for maintainers.

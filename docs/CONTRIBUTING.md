@@ -12,7 +12,7 @@ Use the hosting repository's issue or pull-request facilities when available. Ke
 
 Use fictional data for examples, tests, screenshots, and reviews. Do not attach real inventories, logs, usernames, hostnames, private paths, credentials, approvals, or backup contents. Never open a secret just to redact it. Follow [SECURITY.md](../SECURITY.md) for suspected defects.
 
-All generated fixtures, reports, previews, downloads, and build files belong under the executing source's `work/` directory. Source and site exports use exact positive lists. A `.gitignore` does not establish that an export or reachable Git history is safe.
+All generated fixtures, reports, previews, downloads, and build files belong under the executing source's `work/` directory. The site builder uses an exact list of public files. A `.gitignore` does not establish that published files or reachable Git history are safe.
 
 ## Preserve the workflow contract
 

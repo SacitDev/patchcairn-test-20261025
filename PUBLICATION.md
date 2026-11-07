@@ -10,18 +10,18 @@ Repository names are scoped to an owner's namespace. The person publishing must 
 
 ## What belongs in the public package
 
-- Reusable instructions, skill, scripts/native source, templates and schema/allowlist.
+- Reusable instructions, skills, scripts, templates and documentation.
 - Fictional reusable test fixtures with unmistakable fixture labels.
 - Platform references with source links and accurate capability/test limits.
 - Security/privacy guidance and a version identity that contains no machine facts.
 
-Do not include work/, run ledgers, real inventories, screenshots, local logs, exports of another computer, credentials, editor state, private configuration, recovery copies or .git/ in the portable archive or clean delivery folder. Keep development history out of the delivery. A future authorized publication starts from the reviewed source in a fresh repository with a separately authorized initial UTC commit; do not copy the development repository's Git directory or history.
+Do not include work/, session records, real inventories, screenshots, local logs, copies from another computer, credentials, editor state, private configuration, recovery copies or .git/ in the clean delivery folder. Keep development history out of the delivery. A future authorized publication starts from the reviewed source in a fresh repository with a separately authorized initial UTC commit; do not copy the development repository's Git directory or history.
 
 ## Before any upload
 
 1. Run fixture safety/parity tests and independent security/compatibility reviews. Record precisely which platforms and behaviors were actually tested.
-2. Create the source-only export through the exact allowlist.
-3. Inspect the archive entries and included text. Check for personal names, usernames, account/host identifiers, absolute local paths and secret indicators without echoing suspected values.
+2. Assemble the delivery from the reviewed tracked source files. PatchCairn's earlier source-export tool and its allowlist are retired; nothing exports the source for you.
+3. Inspect the delivery's file list and included text. Check for personal names, usernames, account/host identifiers, absolute local paths and secret indicators without echoing suspected values.
 4. Check that documentation does not claim current CVE coverage, actual-machine testing or universal unattended support that was not performed.
 5. Preserve the owner's selected [MIT License](LICENSE), copyright 2026 Michael, with the source package. The licensing decision is complete and does not authorize uploading, creating a repository, or changing an account. See [GitHub's licensing guidance](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/licensing-a-repository).
 6. Review the final owner/name, file list, visibility and publishing command. Obtain owner authorization before creating a remote/repository or pushing.
@@ -30,7 +30,7 @@ Publishing a public source toolkit does not authorize uploading any person's mai
 
 ## Support expectations
 
-The four workflows use a deterministic session engine, mode skills and a checked adapter service. Python and PowerShell assessment-record helpers are components of this same product. Test evidence must name the actual host, runtime, filesystem and scope. Fixed or mocked macOS contracts do not establish native Mac behavior; a committed CI matrix is not an executed result. Missing elevation, a locked desktop, unavailable tools or unsupported capabilities produce an explained hold. See [platform support](docs/PLATFORM_SUPPORT.md).
+The four workflows use a deterministic session engine, mode skills and a checked adapter service. Test evidence must name the actual host, runtime, filesystem and scope. Fixed or mocked macOS contracts do not establish native Mac behavior; a committed CI matrix is not an executed result. Missing elevation, a locked desktop, unavailable tools or unsupported capabilities produce an explained hold. See [platform support](docs/PLATFORM_SUPPORT.md).
 
 See docs/GITHUB_SETUP.md for the suggested description, topics, repository branding and beginner-facing presentation. The root README is the canonical landing page. The selected wordmark lives in assets/; private design exploration stays under work/. Follow docs/UTC_PUBLICATION.md before creating a publication commit or annotated tag.
 

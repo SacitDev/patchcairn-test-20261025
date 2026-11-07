@@ -507,7 +507,7 @@ console.log('Finite presentation-only motion state checks passed without a brows
         css = (self.output / "styles.css").read_text(encoding="utf-8")
         for command in ("start", "help", "status", "options", "cost", "settings", "pause", "resume", "stop", "resolve"):
             self.assertIn("PatchCairn: " + command, index)
-        for phrase in ("Developed by Michael", "Security updates", "Storage cleanup", "Diagnosis", "Backup", "Claude Code", "OpenCode", "without creating a session or collecting host information", "16 MiB", "48 MiB", "64 MiB", "MSI, PKG, or DEB", "remain held"):
+        for phrase in ("Developed by Michael", "Security updates", "Storage cleanup", "Diagnosis", "Backup", "Claude Code", "OpenCode", "without creating a session or collecting host information", "100,000 files", "32 MiB", "winget, Homebrew, apt or dnf", "remain held"):
             self.assertIn(phrase, index)
         self.assertIn('href="guides/security-updates-workflow.html"', index)
         self.assertIn('href="guides/service-integration.html"', index)

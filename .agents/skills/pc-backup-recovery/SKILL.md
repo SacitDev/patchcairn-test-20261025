@@ -1,6 +1,6 @@
 ---
 name: pc-backup-recovery
-description: Plan and verify exact selected-file backups, restoration probes and reviewed recovery through PatchCairn using private ZIP and manifest artifacts. Use for bounded backup or recovery in this toolkit; excludes secret-store copying, automatic cloud upload and claims of full-system or encrypted backup.
+description: Plan and verify exact selected-file backups, restoration probes and reviewed recovery through PatchCairn using ZIP and manifest artifacts in private work storage or a folder the owner chose on another drive. Use for bounded backup or recovery in this toolkit; excludes secret-store copying, automatic cloud upload and claims of full-system or encrypted backup.
 ---
 
 # Backup and recovery
@@ -15,7 +15,7 @@ Establish the backup/recovery job, exact owner-selected roots, file selection, v
 
 Show the exact intended contents and exclusions, including what could not be read and what cannot be restored. Distinguish required recovery for a proposed change from an optional convenience copy. Ask a clear backup choice for selected unique or sensitive nonsecret data, explain the consequence of exclusion, and never turn “skip backup” into permission to delete. A required recovery condition cannot be waived through a broad automatic setting.
 
-All helper-created plans, ZIPs, manifests, probes and receipts stay in private owned `work/` storage, outside every source root and outside the cleanup target. The owner reviews the exact destination and required free space. An owner-chosen external destination needs separately supported, authorized transfer and verification; do not silently choose it or claim the local helper supports it. No automatic cloud upload. A ZIP compresses data; it does not encrypt it or protect against someone who can read the destination.
+Plans, probes and receipts stay in private owned `work/` storage, outside every source root and outside the cleanup target. The backup itself (ZIP, manifest and README) goes there or to a folder the owner chose on another drive; never choose that folder for the owner. The owner reviews the exact destination and required free space. A destination that a cloud client syncs is refused, and a drive that cannot keep the backup private (for example a removable or FAT/exFAT drive) needs the owner's explicit acknowledgment bound in the approved plan. No automatic cloud upload. A ZIP compresses data; it does not encrypt it or protect against someone who can read the destination.
 
 ## Verify before relying on the copy
 
@@ -25,6 +25,6 @@ One coordinator owns state and changes. Use a matching platform/storage investig
 
 Offer checkpoints after analysis, after selection, before backup, after backup verification, before deletion that depends on it and after restoration verification. Guided/automatic control and now/scheduled timing are independent. Continue unchanged approved steps only within the actual bounded policy; changed contents, exclusions, destination, source state or recovery promise require renewed concrete review and human binding.
 
-For interruption, pause new work and preserve per-operation receipts, partial files and unknown outcomes. Reconcile actual archive/source/destination state before resume; never overwrite evidence or blindly retry a consumed action. Keep required recovery and data-retention exclusions protected. Releasing retention and permanently purging a backup are separate reviewed decisions; purge needs explicit irreversible-loss acknowledgment.
+For interruption, pause new work and preserve per-operation receipts, partial files and unknown outcomes. Reconcile actual archive/source/destination state before resume; never overwrite evidence or blindly retry a consumed action. Keep required recovery and data-retention exclusions protected. Deleting kept backups is its own reviewed plan; the engine shows a warning with the number of backups, and only the owner's typed reply of that exact phrase (for example "delete 2 backups") approves it.
 
 Report what was copied, verified, restored, excluded and still unknown; actual storage use; retention; and the next practical choice. Give benefits, drawbacks, costs, reversibility and a recommendation without claiming full-system, application-consistent or encrypted recovery beyond the evidence.

@@ -28,7 +28,7 @@ If you do not yet have a suitable local assistant, use the [assistant guide](ASS
 
 Codex is the primary workflow. Claude Code, OpenCode, and other hosts need [adapter capability checks](ASSISTANT_COMPATIBILITY.md). The assistant checks actual file access, a suitable shell, web research, permission controls, and any needed independent reviewers or scheduling support. Opening a folder does not establish those capabilities. An ordinary browser chat or remote workspace cannot be assumed to reach this computer.
 
-The portable helpers require an existing supported Python 3.12+; Windows's existing record helpers use PowerShell. A missing prerequisite is explained before dependent work. Nothing should be installed silently to make a check pass. See [platform notes](PLATFORM_SUPPORT.md) for implementation and actual validation limits.
+PatchCairn's helpers require an existing supported Python 3.12+; on Windows, the event and update-history diagnostic checks also use the built-in Windows PowerShell. A missing prerequisite is explained before dependent work. Nothing should be installed silently to make a check pass. See [platform notes](PLATFORM_SUPPORT.md) for implementation and actual validation limits.
 
 ## 3. Open the menu
 
@@ -97,7 +97,7 @@ If assessment answered your question and you choose no changes, ask the assistan
 
 The assistant checks eligibility rather than creating a pretend action. A session with existing action-plan or operation history follows its actual closure rules. You can always ask to stop further work and preserve the findings; unfinished or deferred changes must stay explicit.
 
-Keep the evidence and required recovery material. The current service has no general session-deletion or required-retention-release executor. The assistant checks the exact component contract before proposing housekeeping; a record helper cannot supply missing session-deletion support. If a supported cleanup path is unavailable, retain the files and explain the hold. Any supported deletion needs exact targets, sizes, and an explanation of what would be lost. Removing toolkit files does not undo updates or erase vendor/operating-system logs elsewhere. See [recovery and cleanup](../RECOVERY_AND_CLEANUP.md).
+Keep the evidence and required recovery material. PatchCairn can delete its kept backups and recovery data, for chosen items or for one finished job, through a reviewed plan that you approve by typing the exact phrase it shows; the session records themselves stay. If a supported cleanup path is unavailable, retain the files and explain the hold. Any supported deletion needs exact targets, sizes, and an explanation of what would be lost. Removing toolkit files does not undo updates or erase vendor/operating-system logs elsewhere. See [recovery and cleanup](../RECOVERY_AND_CLEANUP.md).
 
 ## A good first request for each job
 
@@ -113,6 +113,6 @@ See [common questions](FAQ.md), the [official tool catalog](TOOLS.md), [workflow
 
 ## Check the route before approving changes
 
-The job names describe the goal; actual execution depends on the current adapters, available tools, and your exact authorization. The built-in file-content backup is capped at **16 MiB per file, 48 MiB total selected content, and 64 MiB per archive**. Current integrated update handoffs accept one exact reviewed local **MSI, PKG, or DEB** artifact up to **64 MiB**. They prepare a checked handoff for the coordinator's actual official-tool call; creating the handoff does not install anything.
+The job names describe the goal; actual execution depends on the current adapters, available tools, and your exact authorization. A backup holds up to **100,000 files** and goes to PatchCairn's private work folder or to a folder you choose on another drive; PatchCairn's own restore handles archives up to **32 MiB** and files up to **16 MiB**. Updates run through **winget** on Windows, **Homebrew** on macOS, and **apt or dnf** on Linux: after your approval, PatchCairn runs exactly the reviewed step through a one-use ticket and then reads the result itself.
 
-Package-manager updates and OS/application repair routes remain held in the current integration. The assistant can investigate, explain a vendor-supported procedure, and describe a concrete owner-performed step. It cannot claim that guidance supplies a missing adapter, bypass the held route with an arbitrary command, or mark an unobserved change complete. Larger backups need a separately reviewed supported recovery approach. Read [the first-run boundaries](YOUR_FIRST_RUN.md#know-the-current-boundaries-before-committing) before relying on a proposed backup, cleanup, update, or repair.
+Windows Update, macOS system updates, firmware, and Python and Node packages remain held in this version, and PatchCairn does not repair Windows itself. The assistant can investigate, explain a vendor-supported procedure, and describe a concrete owner-performed step. It cannot claim that guidance supplies a missing adapter, bypass the held route with an arbitrary command, or mark an unobserved change complete. Larger backups need a separately reviewed supported recovery approach. Read [the first-run boundaries](YOUR_FIRST_RUN.md#know-the-current-boundaries-before-committing) before relying on a proposed backup, cleanup, update, or repair.

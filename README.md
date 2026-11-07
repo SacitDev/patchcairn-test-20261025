@@ -112,7 +112,7 @@ An interruption, full disk, missing tool or permission, changed file, unverified
 
 Read [your first-run guide](docs/YOUR_FIRST_RUN.md#common-interruptions-and-difficult-cases) for practical choices, costs, and recovery limits in each case. Authentication, OS consent, missing required recovery, stale evidence, and material scope changes never become automatic.
 
-For storage, quarantine on the same volume frees **no disk space**. Permanent removal needs its own reviewed decision and exact verified original recovery coverage; unbacked quarantine can be reviewed for restoration while integrated purge stays held. The selected content-backup route has **16 MiB/file, 48 MiB total content, and 64 MiB archive** caps. Current integrated update handoffs accept exact reviewed local **MSI, PKG, or DEB** artifacts up to **64 MiB**; package-manager updates and OS/application repair routes remain held. The assistant can explain a separately reviewed official procedure, but that explanation does not supply a missing execution adapter or prove a change occurred. [Current scope and alternatives](docs/YOUR_FIRST_RUN.md#know-the-current-boundaries-before-committing).
+For storage, quarantine on the same volume frees **no disk space**. Permanent removal needs its own reviewed decision, an exact phrase that you type yourself, and exact verified original recovery coverage; unbacked quarantine can be reviewed for restoration while integrated purge stays held. A backup holds up to **100,000 files** and goes to PatchCairn's private work folder or to a folder you choose on another drive; PatchCairn's own restore handles archives up to **32 MiB** and files up to **16 MiB**. Updates run through **winget** on Windows, **Homebrew** on macOS, and **apt or dnf** on Linux. Windows Update, macOS system updates, firmware, and Python and Node packages remain held, and PatchCairn does not repair Windows itself. The assistant can explain a separately reviewed official procedure, but that explanation does not supply a missing execution adapter or prove a change occurred. [Current scope and alternatives](docs/YOUR_FIRST_RUN.md#know-the-current-boundaries-before-committing).
 
 ## Your control and privacy
 
@@ -136,11 +136,11 @@ Read the [security contract](SECURITY.md) and [recovery and cleanup guide](RECOV
 | Inspect how reviewed actions reach fixed adapters | [Service integration](docs/SERVICE_INTEGRATION.md) |
 | Understand storage and backup operations | [Storage and backup API](docs/STORAGE_BACKUP_API.md) |
 | Understand bounded diagnostics | [Diagnostic API](docs/DIAGNOSTIC_API.md) and [diagnosis example](docs/DIAGNOSIS_EXAMPLE.md) |
-| Inspect records and architecture | [Architecture](docs/ARCHITECTURE.md) and [helper API](references/HELPER_API.md) |
+| Inspect records and architecture | [Architecture](docs/ARCHITECTURE.md) |
 | Contribute a fix or fictional example | [Contributing](docs/CONTRIBUTING.md) |
 | Prepare GitHub and Pages publication | [GitHub setup](docs/GITHUB_SETUP.md) and [UTC publication guide](docs/UTC_PUBLICATION.md) |
 
-Windows's existing record helpers use PowerShell. The portable conversation and storage helpers require an existing supported Python 3.12+ and use its standard library. The assistant checks actual host capabilities before choosing an adapter. Native platform and hosted CI claims belong to the [documented validation evidence](docs/PLATFORM_SUPPORT.md).
+The conversation, storage and update helpers require an existing supported Python 3.12+ and use its standard library. On Windows, the event and update-history diagnostic recipes also use the built-in Windows PowerShell. The assistant checks actual host capabilities before choosing an adapter. Native platform and hosted CI claims belong to the [documented validation evidence](docs/PLATFORM_SUPPORT.md).
 
 ## Documentation website
 

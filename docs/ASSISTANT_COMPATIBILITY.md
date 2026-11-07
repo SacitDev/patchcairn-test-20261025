@@ -51,8 +51,8 @@ PatchCairn ships no host adapter descriptor, and nothing it saves is a launcher,
 
 | Capability | Required check and fallback |
 | --- | --- |
-| Public instruction access | Confirm the source copy, shared agreement, router, selected job, and current helper API can be read. If not, supply the needed public files through a supported interface and keep operations held. |
-| Local helpers | Verify the executing platform, documented backend, supported PowerShell or Python 3.12+, selected filesystem/native capabilities, and write access to owned `work/`. Missing prerequisites are an owner setup choice; never install them silently. |
+| Public instruction access | Confirm the source copy, shared agreement, router, selected job, and current engine and service documentation can be read. If not, supply the needed public files through a supported interface and keep operations held. |
+| Local helpers | Verify the executing platform, supported Python 3.12+ (on Windows also the built-in Windows PowerShell for the event and update-history recipes), selected filesystem/native capabilities, and write access to owned `work/`. Missing prerequisites are an owner setup choice; never install them silently. |
 | Web research | Use available official-source search/fetch tools for current vendor facts. Without research access, preserve uncertainty and defer source-dependent recommendations or changes. |
 | Independent reviewers | Confirm two distinct independent reviewers can assess the concrete plan's compatibility/data safety and evidence/security correctness. If unavailable, finish useful authorized assessment and hold changes. A host's ability to create a second conversation is not proof of independent review. |
 | Native UI | Use a current host computer-use skill and a supported native UI tool only when necessary and available. Otherwise explain the exact owner-performed step or hold. CLI access alone does not provide a GUI. |
@@ -70,4 +70,4 @@ For an explicitly authorized check, use only a small fixture containing the curr
 
 At most two startup prompts per tested CLI are allowed in this build, with one preferred when sufficient. Preserve the configured model unless the owner requests another. Capture output privately, sanitize accounts, emails, machine paths and credential-like content before reporting, and record exact invocation controls, prompt/context hashes, completion category, reported usage and unknowns. A client spending limit may be an estimate and can overshoot one request; it is not a promise of an exact bill. Claude documents that limitation alongside its [print, tools, persistence, turns and budget controls](https://code.claude.com/docs/en/cli-reference), and documents a process-local output-token cap in its [environment-variable reference](https://code.claude.com/docs/en/env-vars).
 
-The build's actual discovered versions, presence/absence results and sanitized receipts remain private under `work/upgrade_v3/host_compatibility`; this public guide makes no claim that any named host is installed on the reader's computer or that an unexecuted check passed.
+The build's actual discovered versions, presence/absence results and sanitized receipts remain private under that build's own `work/` folder; this public guide makes no claim that any named host is installed on the reader's computer or that an unexecuted check passed.

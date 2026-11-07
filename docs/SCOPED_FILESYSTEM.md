@@ -36,37 +36,18 @@ descriptor-relative paths, `O_NOFOLLOW`, and `O_NONBLOCK`; directories also
 use `O_DIRECTORY`. This requires Python 3.12+ and the native descriptor APIs.
 There is no ordinary-path read/delete fallback when these are unavailable.
 
-On Windows, `scoped_fs` delegates only to the checked
-`windows_scoped`/`windows_worker`/`Windows.Scoped.cs` route. The supported worker
-requires Windows 10+/Server 2016+, 64-bit Python 3.12+ and 64-bit PowerShell 5.1
-or 7 in `FullLanguage`, plus the required job/handle-list and native filesystem
-capabilities. Missing support is a hold. A process-owned serial worker reuses
-its interpreter and compiled C# type; each request runs in a fresh function scope, and selected-file operations
-create fresh C# `Scope` objects and pin current ordinary ancestry and exact
-selected handles. Those selected handles do not remain locked between operations.
-Worker process/source/private-namespace pins are a distinct lifetime boundary,
-not an authority cache or a persistent selected-root OS lock.
-
-Each logical request retains private request/response packets; fixed source
-snapshots and compiler files belong to a separate private worker-generation
-child under `work/windows-scoped/`. Caller serialization has a separate wait
-of up to 120 seconds. After admission, one 120-second cold-startup/exchange
-budget has a separate five-second failure-teardown grace; file preparation
-and response persistence are byte-bounded rather than a hard total-return
-promise. Possible-send ambiguity is never replayed. Replacement waits for
-proved job-empty and completed I/O disposal; unresolved teardown holds with
-required pins retained. Explicit idle `windows_scoped.shutdown_worker()`
-proves only a point-in-time owned-helper drain, deletes no packets and closes
-no user applications. A later native call can create a new generation.
-An embedding process must prove shutdown completed before changing its selected
-PowerShell runtime or toolkit PS/C# sources, then keep toolkit native calls quiet
-throughout that update or an external-installer interval. Later native preflight
-requires another successful drain before proceeding. See the
-[worker lifecycle](WINDOWS_ADAPTER.md#owned-serial-worker-lifecycle) for exact
-limits and shutdown results. POSIX keeps its current in-process descriptor
-adapter. Imports and the bare menu start no worker. The quiet-workspace
-assumption still applies on both platforms; see
-[platform support](PLATFORM_SUPPORT.md) for the wider toolkit limits.
+On Windows, `scoped_fs` delegates to `windows_scoped`, which calls Windows
+through `win32_files` (Python `ctypes`) inside the Python process. It needs
+64-bit Python 3.12+ on Windows; missing support is a hold. Each open root has
+its own I/O thread, which holds the selected root and its ancestors open for
+the root's lifetime and opens each selected file per operation. A native call
+that does not return within its deadline (120 seconds, plus flush time for a
+new file) is cancelled and reported as unresolved, and that root refuses later
+calls; nothing is retried. There is no worker process, request packet or
+compiled helper. See the [I/O thread lifecycle](WINDOWS_ADAPTER.md#io-thread-lifecycle)
+for the exact limits. POSIX keeps its in-process descriptor adapter. Imports and
+the bare menu open no root. The quiet-workspace assumption still applies on both
+platforms; see [platform support](PLATFORM_SUPPORT.md) for the wider toolkit limits.
 
 ## Private artifact namespaces on Linux
 
@@ -121,8 +102,8 @@ primitive causes a hold. See Apple's [ACL declarations](https://github.com/apple
 and [stat/security implementation](https://github.com/apple-oss-distributions/Libc/blob/main/sys/statx_np.c).
 This remains a quiet owner-controlled workspace boundary, with same-user and
 privileged concurrent mutation excluded. Native call/error variants retain mocked
-verification. Hosted macOS ARM64 private-storage and file-operation fixtures
-also passed; see [hosted fixture evidence](PLATFORM_SUPPORT.md#hosted-fixture-evidence).
+verification, and the hosted macOS CI job runs the private-storage and
+file-operation fixtures; see [hosted fixture evidence](PLATFORM_SUPPORT.md#hosted-fixture-evidence).
 That runner context does not certify every filesystem, ABI or ACL state.
 
 ## Public API
@@ -134,20 +115,21 @@ All mutation and content arguments after the relative path are keyword-only.
 capabilities() -> dict
 relative_path(value: str, *, allow_root=False) -> str
 
-ScopedRoot(root, *, quiet_workspace: bool, max_entries=20000)
+ScopedRoot(root, *, quiet_workspace: bool, max_entries=100000)
 scope.inspect(relative, *, hash_file=False, max_bytes=67108864) -> dict
-scope.list_directory(relative="") -> list[dict]
-scope.snapshot(*, hash_files=False, max_file_bytes=67108864,
-               max_total_bytes=268435456) -> list[dict]
+scope.list_directory(relative="", *, excluded=None) -> list[dict]
 scope.read_bytes(relative, *, expected: dict, max_bytes: int) -> bytes
-scope.stream_to(relative, *, expected: dict, writer, max_bytes: int,
-                chunk_size=65536) -> dict
 scope.mkdir(relative) -> dict
 scope.create_file(relative, *, data: bytes, max_bytes: int) -> dict
 scope.move_to(relative, *, destination: ScopedRoot,
               destination_relative: str, expected: dict) -> dict
 scope.remove_file(relative, *, expected: dict) -> None
 ```
+
+Streaming reads, snapshots and the new files that a backup writes go through
+the backends' shared interface instead: `scoped_fs.open_root`, then
+`open_read`, `open_new`, `stream_to` and `snapshot` of `scoped_base.RootBase`. `admit_destination` admits a backup destination
+separately from a source root.
 
 An entry record has exactly these keys:
 
@@ -163,8 +145,10 @@ An entry record has exactly these keys:
 | `sha256` | Lowercase content hash, or `None` for metadata-only records and directories. |
 
 `inspect("")` returns the root record. `list_directory()` returns only immediate
-children and opens no child content. It refuses the listing if an entry is
-unsupported; it does not silently omit a link or an unknown entry.
+children and opens no child content. Without an `excluded` list it refuses the
+listing if an entry is unsupported; with one, each such entry (link, special
+file, online-only placeholder, hard link, non-portable name, path too long or
+case collision) is reported there as not included and never read.
 `snapshot()` includes the root and all ordinary descendants, checks bounded
 membership and freshness, and optionally hashes files. The storage service
 uses `list_directory()` to apply its protected-name policy before descent;
@@ -182,26 +166,23 @@ callers must not treat all errors as an empty destination.
 
 ## Bounds and read outcomes
 
-The POSIX defaults are 20,000 total snapshot entries, 64 path components,
-64 MiB per hashed file and 256 MiB total hashed content. Metadata-only
-snapshots do not reject a large ordinary file merely because its contents
-would exceed the hashing cap. Callers can supply smaller positive bounds.
-The native Windows adapter may impose tighter documented bounds.
+A listing holds at most 100,000 entries and at most 1,000 "not included"
+rows, with one final row counting the rest; paths have at most 64 components
+and 200 UTF-16 units. Metadata-only records do not reject a large ordinary
+file merely because its contents would exceed a hashing cap. Callers can
+supply smaller positive bounds.
 
-In-memory reads and exclusive creation accept at most 64 MiB. POSIX streaming
-accepts an explicit positive cap up to 1 TiB and chunks from 1 byte to 1 MiB.
-The initial size must fit that cap; growth beyond the initial size, truncation,
-changed content/identity and incomplete consumers cause a refusal. The current
-Windows streaming adapter holds above 64 MiB; it does not claim streaming a
-large file through an unbounded memory buffer. A ZIP builder must choose caps
-within its actual adapter and verify the completed archive separately.
+In-memory reads and exclusive creation through `ScopedRoot` accept at most
+64 MiB. Streaming through the backend interface reads 1 MiB pieces, up to
+1 TiB per stream. The initial size must fit the cap; growth beyond the initial
+size, truncation, changed content/identity and incomplete consumers cause a
+refusal. A ZIP builder must choose caps within its actual adapter and verify
+the completed archive separately.
 
-`stream_to()` calls a trusted byte-consumer, such as a ZIP entry writer, and
-returns the verified source record only after the complete read succeeds.
-The consumer may already have received bytes if a later check fails. A writer
-return value must be `None` or the whole chunk length. The caller must keep
-partial output untrusted, retain a failure record, and avoid publishing it as
-a verified backup. A write failure is not permission for an automatic retry.
+A streaming consumer, such as a ZIP entry writer, may already have received
+bytes if a later check fails. The caller must keep partial output untrusted,
+retain a failure record, and avoid publishing it as a verified backup. A
+write failure is not permission for an automatic retry.
 
 ## Quarantine, restore and permanent removal
 
@@ -220,8 +201,8 @@ manual defines an existing destination as `EEXIST` under `RENAME_EXCL`, and
 unsupported filesystem flags as `ENOTSUP`. The adapter passes admitted parent
 descriptors and literal leaf names, preserving the same checked ancestry,
 identity, same-filesystem and quiet-workspace boundary as Linux. This macOS
-binding has both mocked call/error verification and successful native
-no-overwrite move/restoration fixtures on the hosted macOS ARM64 workspace;
+binding has mocked call/error verification, and the hosted macOS CI job runs
+its native no-overwrite move/restoration fixtures;
 see [the hosted fixture evidence](PLATFORM_SUPPORT.md#hosted-fixture-evidence). See Apple's [interface and constant declarations](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/stdio.h)
 and [rename manual source](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/man/man2/rename.2).
 
@@ -249,35 +230,34 @@ rollback. A failed create can leave a partial ordinary file for reconciliation.
 
 ## Larger backup selections
 
-The storage service's content operations currently set narrower compiled
-bounds than the general POSIX streaming primitive: 16 MiB per selected file,
-48 MiB total selected content and a 64 MiB archive. Metadata assessment has
-separate root, entry and depth limits; logical file sizes do not consume its
-content-read budget. This permits a size summary for a larger selected tree
-without authorizing its contents to be opened. The service checks the selected
-content budget before hashing backup/quarantine plans or beginning those
-native operations.
+The storage service sets its own bounds on top of the backends. Metadata
+assessment has separate root, entry and depth limits; logical file sizes do
+not consume a content-read budget, so a size summary of a larger selected
+tree does not authorize opening its contents. Duplicate comparison and
+quarantine read at most 16 MiB per file and 48 MiB in total, checked before
+hashing or moving.
 
-Current ZIP creation and verification use bounded in-memory buffers. A
-multi-gigabyte content selection therefore needs a different reviewed
-workflow; increasing the compiled constants alone would not establish safe
-bounded memory or recovery verification.
+A backup streams each selected file into the archive and holds at most
+100,000 files. It writes to the owned work folder or to a folder on another
+drive that the owner chose, which must have free space for the backup's
+worst-case size plus a 256 MiB margin; a FAT32 drive refuses a backup that
+can reach 4 GiB. The archive keeps a temporary name until every entry has
+been read back from the drive.
 
-Keep the existing bounds until a streaming archive writer, bounded archive
-reader, immutable output protocol and restoration verification have been
-implemented and tested together for each native adapter. For present larger
-content selections, the coordinator can propose an appropriate official
-backup tool, a separately reviewed
-destination and exact contents/exclusions, with actual tool capabilities,
-owner authority, recovery checks and failure handling. The present helper
-must report an unsupported selection size honestly and keep required recovery
-protected. It must not silently trim the selection or treat several partial
-backups as complete recovery coverage.
+PatchCairn's own restore still reads the archive in memory: it accepts an
+archive of at most 32 MiB and files of at most 16 MiB. A larger backup is
+verified but cannot be restored, or used as required recovery, by PatchCairn.
+For such a selection the coordinator can propose an appropriate official
+backup tool, a separately reviewed destination and exact
+contents/exclusions, with actual tool capabilities, owner authority, recovery
+checks and failure handling. The helper must report an unsupported selection
+size honestly and keep required recovery protected. It must not silently trim
+the selection or treat several partial backups as complete recovery coverage.
 
 ## Fixture verification
 
 `tests/test_scoped_fs.py` writes fictional fixtures only under
-`work/upgrade_v3/filesystem`. It covers admission and relative boundaries,
+`work/test-fixtures/`. It covers admission and relative boundaries,
 root replacement, symlink/reparse/hardlink/special-file refusal, read growth,
 same-size mutation, stale identity/hash, caps, exclusive creation, exact purge,
 destination preservation, and move/restore identity checks. It also checks
@@ -286,20 +266,15 @@ Mocked macOS checks verify the exact system-library symbol, C argument types,
 parent descriptors, literal leaf-name bytes, `RENAME_EXCL` flag and refusal
 of existing destinations, unsupported operations and other native errors.
 
-The native WSL Ubuntu checks execute against the owned Windows-mounted work
-directory. That filesystem cannot create a case collision or FIFO in these
-fixtures and rejects atomic `RENAME_NOREPLACE`; those native success cases
-are explicit skips. The safe rename refusal preserves the source, and a
-separate explicitly simulated rename exercises the successful identity
-protocol. Mocked dispatch or a simulated rename is not native-platform
-certification. No fixture scan or write uses a real private source tree,
+A Windows-mounted WSL folder (9p) cannot create a case collision or FIFO,
+rejects atomic `RENAME_NOREPLACE` and is refused for private storage, so the
+tests that need those capabilities do not pass there; the supported Linux
+evidence is a native Linux filesystem. A separate explicitly simulated rename
+exercises the successful identity protocol. Mocked dispatch or a simulated
+rename is not native-platform certification. No fixture scan or write uses a real private source tree,
 `/tmp`, a home directory or a global cleanup target.
 
-`tests/test_windows_worker.py` separates strict codec and fictional
-transport/lifecycle fixtures from actual PowerShell/C# integration. Local
-Windows Python fixture discovery completed with actual skips; focused native
-checks also created, inspected and read 64 MiB under both PowerShell 7 and
-5.1, verified bytes/hashes and completed owned-worker teardown. The
-[Windows evidence](WINDOWS_ADAPTER.md#evidence-and-test-limits) records the
-counts, observed worker lifetime peaks and limits; neither suite completion
-nor these focused checks establish general workload speed.
+`tests/test_windows_io.py` exercises the Windows adapter on fictional NTFS
+folders; the [Windows evidence](WINDOWS_ADAPTER.md#evidence-and-test-limits)
+describes what it covers and its limits. Suite completion does not establish
+general workload speed.
