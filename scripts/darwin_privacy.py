@@ -9,11 +9,12 @@ repair is performed. Same-user/privileged concurrent mutation is excluded.
 from __future__ import annotations
 
 import ctypes
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 import errno
 import os
 import stat
 import sys
+import uuid
 
 import pc_records
 
@@ -29,6 +30,8 @@ _MNT_REMOVABLE = 0x00000200  # set by XNU for external drives and disk images
 _MNT_IGNORE_OWNERSHIP = 0x00200000
 _MNT_EXT_FSKIT = 0x00000002
 _O_EVTONLY = 0x00008000  # Apple bsd/sys/fcntl.h; metadata-only file open.
+# Apple bsd/sys/attr.h: getattrlist's ATTR_BIT_MAP_COUNT, ATTR_VOL_INFO and ATTR_VOL_UUID.
+_ATTR_BIT_MAP_COUNT, _ATTR_VOL_INFO, _ATTR_VOL_UUID = 5, 0x80000000, 0x00040000
 
 
 class _StatFS64(ctypes.Structure):
@@ -41,6 +44,12 @@ class _StatFS64(ctypes.Structure):
                 ("f_fstypename", ctypes.c_char * 16), ("f_mntonname", ctypes.c_char * 1024),
                 ("f_mntfromname", ctypes.c_char * 1024), ("f_flags_ext", ctypes.c_uint32),
                 ("f_reserved", ctypes.c_uint32 * 7)]
+
+
+class _AttrList(ctypes.Structure):
+    _fields_ = [("bitmapcount", ctypes.c_uint16), ("reserved", ctypes.c_uint16), ("commonattr", ctypes.c_uint32),
+                ("volattr", ctypes.c_uint32), ("dirattr", ctypes.c_uint32), ("fileattr", ctypes.c_uint32),
+                ("forkattr", ctypes.c_uint32)]
 
 
 class DarwinPrivacyHold(pc_records.Refusal):
@@ -200,6 +209,67 @@ def volume_kind(descriptor):
     if not result.f_flags & _MNT_LOCAL or result.f_flags & _MNT_RDONLY:
         return "other", removable
     return {b"msdos": "fat", b"exfat": "exfat"}.get(bytes(result.f_fstypename), "other"), removable
+
+
+def disk_space(descriptor, *, query=None):
+    """(total bytes, bytes available to this user) of the volume an open descriptor is on, from the 64-bit fstatfs:
+    f_blocks and f_bavail are 64-bit counts of f_bsize-byte blocks, where os.statvfs on macOS has 32-bit counts that
+    wrap on a large volume. ``query`` stands in for fstatfs in tests. Holds as volume_kind does."""
+    library = None
+    if query is None:
+        library, query = _volume_api()  # Retain the native library for the call lifetime.
+    if type(descriptor) is not int or descriptor < 0:
+        _hold("darwin-fs-path-invalid")
+    result = _statfs(query, descriptor)
+    del library
+    return result.f_blocks * result.f_bsize, result.f_bavail * result.f_bsize
+
+
+def volume_identity(path, *, mount_point=None, getattrlist=None):
+    """The volume UUID (ATTR_VOL_UUID) of the volume holding the folder ``path`` as "macos-volume:<uuid>", which macOS
+    keeps across a restart and a reconnect; None when the volume has none (some FAT drives) or it cannot be read.
+    ``mount_point(path)`` (the folder's fstatfs f_mntonname, as bytes) and ``getattrlist`` stand in for the native calls
+    in tests."""
+    try:
+        library = None
+        if mount_point is None or getattrlist is None:
+            library, query = _volume_api()  # Retain the native library for the call lifetime.
+            getattrlist = library.getattrlist
+            getattrlist.argtypes = (ctypes.c_char_p, ctypes.POINTER(_AttrList), ctypes.c_void_p, ctypes.c_size_t, ctypes.c_ulong)
+            getattrlist.restype = ctypes.c_int
+            mount_point = lambda raw: _mounted_on(query, raw)  # noqa: E731
+        mount = mount_point(os.fspath(path))
+        request, buffer = _AttrList(_ATTR_BIT_MAP_COUNT, 0, 0, _ATTR_VOL_INFO | _ATTR_VOL_UUID, 0, 0, 0), ctypes.create_string_buffer(64)
+        # Volume attributes are returned only for the volume's own mount point.
+        if not isinstance(mount, bytes) or not mount.startswith(b"/") or getattrlist(mount, ctypes.byref(request), buffer, len(buffer), 0) != 0:
+            return None
+        del library
+    except (DarwinPrivacyHold, OSError, TypeError, ValueError, AttributeError, ctypes.ArgumentError):
+        return None
+    data = buffer.raw
+    if int.from_bytes(data[:4], "little") < 20 or data[4:20] == bytes(16):
+        return None
+    return "macos-volume:" + str(uuid.UUID(bytes=data[4:20]))
+
+
+def rename_into_reserved_name(source_fd, source_name, destination_fd, destination_name):
+    """Give a file its new name on a drive that refuses an exclusive rename (renameatx_np RENAME_EXCL gives ENOTSUP on
+    exFAT and FAT, and link(2) is not there either). O_CREAT|O_EXCL takes the name, so an existing entry is never replaced,
+    and rename then replaces exactly that empty file. A failed rename gives the name back; a process killed between the two
+    leaves the empty file, which is never read as a backup. Raises OSError, FileExistsError for a name already taken."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    os.close(os.open(destination_name, flags, 0o600, dir_fd=destination_fd))
+    try:
+        os.rename(source_name, destination_name, src_dir_fd=source_fd, dst_dir_fd=destination_fd)
+    except OSError:
+        with suppress(OSError):
+            os.unlink(destination_name, dir_fd=destination_fd)
+        raise
+
+
+def _mounted_on(query, raw):
+    with _volume_descriptor(raw) as descriptor:
+        return bytes(_statfs(query, descriptor).f_mntonname)
 
 
 class _DarwinACL:

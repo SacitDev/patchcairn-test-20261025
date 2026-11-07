@@ -35,6 +35,7 @@ import scoped_base  # noqa: E402
 from scoped_base import CHUNK_BYTES, CapabilityHold, ScopedFSError  # noqa: E402
 
 if os.name == "nt":
+    import msvcrt  # noqa: E402
     import win32_files  # noqa: E402
     import windows_scoped  # noqa: E402
 
@@ -59,9 +60,11 @@ def remove_fixture(path):
     shutil.rmtree("\\\\?\\" + str(path), onexc=writable_then_retry)
 
 
-def volumes(filesystem, drive_type):
-    """A fake volume-information source: the real folder appears to be on another kind of drive."""
-    return lambda handle, drive: {"filesystem": filesystem, "drive_type": drive_type}
+def volumes(filesystem, drive_type, removable="by drive type"):
+    """A fake volume-information source: the real folder appears to be on another kind of drive (by default a fixed
+    drive is proven built in and any other is removable; None is "Windows cannot tell")."""
+    removable = drive_type != 3 if removable == "by drive type" else removable
+    return lambda handle, drive: {"filesystem": filesystem, "drive_type": drive_type, "removable": removable}
 
 
 class Fixture(unittest.TestCase):
@@ -224,6 +227,34 @@ class WindowsIoTests(Fixture):
         self.assertEqual(self.code(root.remove_file, "doc.txt", expected=same), "stale-content")
         self.assertTrue(self.path("doc.txt").exists())
 
+    def test_dacl_protected_reads_the_same_bit_as_the_full_snapshot(self):
+        root = self.open_root()
+        self.seed(root, "private.txt", b"fictional")
+        inherited = self.path("inherited.txt")
+        inherited.write_bytes(b"fictional")
+        for name, path in (("private", self.path("private.txt")), ("inherited", inherited)):
+            with self.subTest(name), win32_files.open_file("\\\\?\\" + str(path), win32_files.READ_CONTROL, win32_files.FILE_SHARE_READ,
+                                                           win32_files.OPEN_EXISTING, 0) as handle:
+                self.assertIs(win32_files.dacl_protected(str(path)), bool(win32_files.security_snapshot(handle)[1] & 0x1000))
+        self.assertIsNone(win32_files.dacl_protected(str(self.path("absent.txt"))))
+        with self.patched("security_snapshot", mock.Mock(side_effect=AssertionError("the entries are not read"))):
+            self.assertIn(win32_files.dacl_protected(str(inherited)), (True, False))
+
+    def test_final_path_longer_than_the_first_buffer(self):
+        long_path = "C:/" + "x" * 2000
+
+        def answer(raw, buffer, size, flags):
+            if size <= len(long_path):
+                return len(long_path) + 1  # the size it needs, as the API reports it
+            buffer.value = long_path
+            return len(long_path)
+        with self.patched("API", mock.Mock(GetFinalPathNameByHandleW=answer)):
+            self.assertEqual(win32_files.final_path(mock.Mock(value=1)), long_path)
+        too_long = mock.Mock(GetFinalPathNameByHandleW=lambda raw, buffer, size, flags: size + 1)
+        with self.patched("API", too_long), self.assertRaises(OSError) as caught:
+            win32_files.final_path(mock.Mock(value=1))
+        self.assertEqual(caught.exception.winerror, win32_files.ERROR_INSUFFICIENT_BUFFER)
+
     def test_final_path_mismatch_refused(self):
         root = self.open_root()
         record = self.seed(root, "a.txt", b"alpha")
@@ -241,6 +272,8 @@ class WindowsIoTests(Fixture):
         self.assertFalse(win32_files.same_name("x\U0001f600", "x\U0001f601"))
         self.assertFalse(win32_files.same_name("C:\\r\\\U0001f600x", "C:\\r\\\U0001f600y"))
         self.assertTrue(win32_files.same_name("A\U0001f600", "a\U0001f600"))
+        with self.patched("API", None):  # identical text needs no call
+            self.assertTrue(win32_files.same_name("C:\\r\\a.txt", "C:\\r\\a.txt"))
         emoji = self.path("\U0001f600" * 6)
         emoji.mkdir()
         (emoji / "secrets.json").write_bytes(b"{}")
@@ -696,7 +729,7 @@ class WindowsIoTests(Fixture):
             started = time.monotonic()
             self.assertEqual(self.code(root.stream_to, "a.txt", expected=record, writer=len), "io-unresolved")
             self.assertLess(time.monotonic() - started, 0.5 + windows_scoped.CANCEL_SECONDS)
-        self.assertTrue(windows_scoped.shutdown_worker(), "the cancelled call returned, so nothing is stuck")
+        self.assertFalse(root._io.busy(), "the cancelled call returned, so nothing is stuck")
         self.assertEqual(self.code(root.inspect, "a.txt"), "io-unresolved")  # the root takes no more work
         root.close()
         # A call that ignores cancellation keeps its handles until it returns, and is reported meanwhile.
@@ -709,14 +742,15 @@ class WindowsIoTests(Fixture):
         with mock.patch.object(windows_scoped, "IO_SECONDS", 0.3), mock.patch.object(windows_scoped, "CANCEL_SECONDS", 0.3), \
              self.patched("read", ignore_cancel):
             self.assertEqual(self.code(stuck_root.stream_to, "a.txt", expected=record, writer=len), "io-unresolved")
-            self.assertFalse(windows_scoped.shutdown_worker())
+            self.assertTrue(stuck_root._io.busy())
             stuck_root.close()
             with self.assertRaises(PermissionError):
                 os.rename(self.path(), self.case / "root-moved")  # still pinned while the call is stuck
             gate.set()
             stuck_root._io._thread.join(10)
         self.assertFalse(stuck_root._io._thread.is_alive())
-        self.assertTrue(windows_scoped.shutdown_worker())
+        self.assertFalse(stuck_root._io.busy())
+        self.assertFalse(hasattr(windows_scoped, "shutdown_worker"))
         os.rename(self.path(), self.case / "root-moved")  # released once the call returned
         os.rename(self.case / "root-moved", self.path())
 
@@ -767,9 +801,61 @@ class WindowsIoTests(Fixture):
                     self.assertEqual(self.code(call), "offline-encrypted-or-recall-file")
             left_out = []
             self.assertEqual([row["relative_path"] for row in root.list_directory("", excluded=left_out)], ["local.txt"])
-            self.assertEqual(left_out, [{"parent": "", "name": "cloud.txt", "reason": "special"}])
+            self.assertEqual(left_out, [{"parent": "", "name": "cloud.txt", "reason": "online-only"}])
         self.assertFalse([path for path in opened if path.endswith("\\cloud.txt")], "the placeholder was opened")
         self.assertTrue(self.path("cloud.txt").exists())
+
+    def test_only_a_placeholder_is_listed_as_online_only(self):
+        root = self.open_root()
+        for name in ("offline.txt", "cloud.txt", "secret.txt", "mixed.txt"):
+            self.seed(root, name, b"fictional")
+        bits = {"offline.txt": win32_files.ATTRIBUTE_OFFLINE, "cloud.txt": win32_files.ATTRIBUTE_RECALL_ON_DATA_ACCESS,
+                "secret.txt": win32_files.ATTRIBUTE_ENCRYPTED, "mixed.txt": win32_files.ATTRIBUTE_ENCRYPTED | win32_files.ATTRIBUTE_OFFLINE}
+        real_entries = win32_files.directory_entries
+
+        def entries(handle, limit):
+            return [(name, attributes | bits.get(name, 0), file_id) for name, attributes, file_id in real_entries(handle, limit)]
+        with self.patched("directory_entries", entries):
+            left_out = []
+            self.assertEqual(root.list_directory("", excluded=left_out), [])
+        self.assertEqual({row["name"]: row["reason"] for row in left_out},
+                         {"cloud.txt": "online-only", "mixed.txt": "special", "offline.txt": "online-only", "secret.txt": "special"})
+        # An exposed placeholder also shows the reparse point: it is online only, never "a link".
+        linked = {name: value | win32_files.ATTRIBUTE_REPARSE_POINT for name, value in bits.items()}
+
+        def exposed(handle, limit):
+            return [(name, attributes | linked.get(name, 0), file_id) for name, attributes, file_id in real_entries(handle, limit)]
+        with self.patched("directory_entries", exposed):
+            left_out = []
+            self.assertEqual(root.list_directory("", excluded=left_out), [])
+        self.assertEqual({row["name"]: row["reason"] for row in left_out},
+                         {"cloud.txt": "online-only", "mixed.txt": "special", "offline.txt": "online-only", "secret.txt": "special"})
+        real_information = win32_files.file_information
+        for bit, reason in ((win32_files.ATTRIBUTE_RECALL_ON_DATA_ACCESS, "online-only"), (win32_files.ATTRIBUTE_ENCRYPTED, "special"),
+                            (0, "link")):
+            def seen_on_the_handle(handle):
+                info = real_information(handle)
+                if not info.attributes & win32_files.ATTRIBUTE_DIRECTORY:
+                    info.attributes |= bit | win32_files.ATTRIBUTE_REPARSE_POINT
+                return info
+            with self.subTest(handle=reason), self.patched("file_information", seen_on_the_handle):
+                left_out = []
+                self.assertEqual(root.list_directory("", excluded=left_out), [])
+                self.assertEqual({row["reason"] for row in left_out}, {reason})
+        # The same reasons when the bit shows only on the opened handle, and the same refusal code without a left-out list.
+        real_info = win32_files.file_information
+        for bit, reason in ((win32_files.ATTRIBUTE_OFFLINE, "online-only"), (win32_files.ATTRIBUTE_ENCRYPTED, "special")):
+            def information(handle):
+                info = real_info(handle)
+                if not info.attributes & win32_files.ATTRIBUTE_DIRECTORY:
+                    info.attributes |= bit
+                return info
+            with self.subTest(reason=reason), self.patched("file_information", information):
+                left_out = []
+                self.assertEqual(root.list_directory("", excluded=left_out), [])
+                self.assertEqual({row["reason"] for row in left_out}, {reason})
+        with windows_scoped.ScopedRoot(str(self.path()), quiet_workspace=True) as scope, self.patched("directory_entries", entries):
+            self.assertEqual(self.code(scope.list_directory), "offline-encrypted-or-recall-file")
 
     def test_errors_are_scoped_base_classes(self):
         self.assertIs(windows_scoped.ScopedFSError, scoped_base.ScopedFSError)
@@ -1335,6 +1421,44 @@ RETIRED_CODES = {
 
 
 @unittest.skipUnless(os.name == "nt", WINDOWS_ONLY)
+class WindowsLockedRangeTests(Fixture):
+    """A byte range another program locked: the file opens, and the read fails with ERROR_LOCK_VIOLATION."""
+
+    def locked(self, name):
+        """A file ``name`` with its first bytes locked through a second, read-only handle, as another program would."""
+        root = self.open_root()
+        record = self.seed(root, name, b"fictional locked content")
+        holder = open(self.path(name), "rb")
+        self.addCleanup(holder.close)
+        msvcrt.locking(holder.fileno(), msvcrt.LK_NBLCK, 8)
+        self.addCleanup(lambda: (holder.seek(0), msvcrt.locking(holder.fileno(), msvcrt.LK_UNLCK, 8)))
+        return root, record
+
+    def test_a_locked_read_is_a_file_in_use(self):
+        root, record = self.locked("locked.txt")
+        self.assertEqual(self.code(root.inspect, "locked.txt", hash_file=True), "sharing-violation")
+        self.assertEqual(self.code(lambda: root.stream_to("locked.txt", expected=record, writer=lambda data: len(data))), "sharing-violation")
+
+    def test_a_locked_read_past_the_cache_is_a_file_in_use_too(self):
+        root, record = self.locked("uncached.txt")
+
+        def read():
+            with root.open_read("uncached.txt", expected={**record, "sha256": None}, uncached=True) as reader:
+                reader.read(16)
+        self.assertEqual(self.code(read), "sharing-violation")
+
+    def test_any_other_read_error_stays_a_read_failure(self):
+        root, record = self.locked("other.txt")
+        with self.patched("read", mock.Mock(side_effect=OSError(5, "fictional", None, 5))):
+            self.assertEqual(self.code(root.inspect, "other.txt", hash_file=True), "read-failed")
+
+    def test_a_locked_write_stays_a_write_failure(self):
+        with self.assertRaises(ScopedFSError) as caught:
+            windows_scoped._native("write-failed", mock.Mock(side_effect=OSError(33, "fictional", None, 33)))
+        self.assertEqual(caught.exception.code, "write-failed")
+
+
+@unittest.skipUnless(os.name == "nt", WINDOWS_ONLY)
 class WindowsDestinationTests(Fixture):
     """Backup destinations on other drives (plan RR2-4), with a fake volume-information source."""
 
@@ -1437,6 +1561,209 @@ class WindowsDestinationTests(Fixture):
         self.assertEqual(self.path("backup.zip").read_bytes(), b"earlier backup")
         self.assertEqual(self.path("manifest.json").read_bytes(), b"theirs")
         self.assertEqual(sorted(os.listdir(self.path())), ["backup.zip", "manifest.json"])
+
+
+@unittest.skipUnless(os.name == "nt", WINDOWS_ONLY)
+class WindowsBackupFactTests(Fixture):
+    """The drive facts a backup records and the destination rules that use them, with fake native answers."""
+
+    def test_unproven_fixed_drive_is_not_private_and_keeps_no_stable_ids(self):
+        for removable in (None, True):
+            with self.subTest(removable=removable):
+                admit = lambda **options: windows_scoped.admit_destination(  # noqa: E731
+                    str(self.path()), volumes=volumes("NTFS", win32_files.DRIVE_FIXED, removable), **options)
+                self.assertEqual(self.code(admit), "non-private-destination-acknowledgment-required")
+                root = admit(non_private_destination=True)
+                self.assertEqual((root.private, root.identity_keys), (False, scoped_base.UNSTABLE_ID_KEYS))
+                root.close()
+        proven = windows_scoped.admit_destination(str(self.path()), volumes=volumes("NTFS", win32_files.DRIVE_FIXED, False))
+        self.addCleanup(proven.close)
+        self.assertEqual((proven.private, proven.identity_keys), (True, scoped_base.IDENTITY_KEYS))
+
+    def test_default_volume_facts_read_removability(self):
+        with self.patched("drive_removable", lambda drive: None):
+            root = windows_scoped.admit_destination(str(self.path()), non_private_destination=True)
+        self.addCleanup(root.close)
+        self.assertIs(root.private, False)
+        for bus, media, expected in ((17, False, False), (7, False, True), (11, True, True), (14, False, None), (15, False, None), (16, False, None)):
+            with self.subTest(bus=bus, media=media), self.patched("storage_bus", lambda drive, value=(bus, media): value), \
+                    self.patched("drive_hotplug", lambda drive: False):
+                self.assertIs(win32_files.drive_removable("C:\\"), expected)
+        with self.patched("storage_bus", mock.Mock(side_effect=OSError(5, "x", None, 5))):
+            self.assertIsNone(win32_files.drive_removable("C:\\"))
+
+    def test_a_disk_windows_marks_hot_pluggable_is_never_proven_built_in(self):
+        """A portable NVMe or eSATA disk reports a built-in bus type; only the hotplug answer tells it apart."""
+        asked = []
+
+        def hotplug_answer(data):
+            def control(drive, code, query, size):
+                asked.append((drive, code, query, size))
+                return data
+            return control
+        with self.patched("storage_bus", lambda drive: (17, False)):
+            for data, expected in ((bytes([8, 0, 0, 0, 0, 0, 1, 0]), True), (bytes([8, 0, 0, 0, 1, 0, 0, 0]), True),
+                                   (bytes([8, 0, 0, 0, 0, 1, 0, 0]), False), (bytes(8), False)):
+                with self.subTest(data=data), self.patched("_device_control", hotplug_answer(data)):
+                    self.assertIs(win32_files.drive_removable("C:\\"), expected)
+            self.assertEqual(asked[0], ("C:\\", 0x002D0C14, None, 8))
+            with self.patched("_device_control", hotplug_answer(bytes(4))):  # cut short: unknown, which callers treat as removable
+                self.assertIsNone(win32_files.drive_removable("C:\\"))
+            with self.patched("_device_control", mock.Mock(side_effect=OSError(1, "x", None, 1))):
+                self.assertIsNone(win32_files.drive_removable("C:\\"))
+
+    def test_the_hotplug_query_is_a_real_one(self):
+        """Read-only, on the drive of this fixture: the control code and the buffer are what Windows answers."""
+        self.assertIs(type(win32_files.drive_hotplug(str(self.path())[:3])), bool)
+
+    def test_storage_spaces_prove_no_disk_number(self):
+        def extents(drive, code, query, size):
+            return (1).to_bytes(4, "little") + bytes(4) + bytes(24)
+        with self.patched("storage_bus", lambda drive: (16, False)), self.patched("_device_control", extents):
+            self.assertIsNone(win32_files.disk_numbers("C:\\"))
+
+    def test_disk_numbers_and_disk_relation_from_extents(self):
+        def extents(*numbers):
+            data = len(numbers).to_bytes(4, "little") + bytes(4)
+            for number in numbers:
+                data += number.to_bytes(4, "little") + bytes(20)
+            return data
+        with self.patched("storage_bus", lambda drive: (17, False)), \
+                self.patched("_device_control", lambda drive, code, query, size: extents(0, 2)):
+            self.assertEqual(win32_files.disk_numbers("C:\\"), frozenset({0, 2}))
+        with self.patched("storage_bus", lambda drive: (15, False)), \
+                self.patched("_device_control", lambda drive, code, query, size: extents(1)):
+            self.assertIsNone(win32_files.disk_numbers("C:\\"))  # a virtual disk proves nothing
+        with self.patched("storage_bus", lambda drive: (17, False)), self.patched("_device_control", lambda drive, code, query, size: extents()):
+            self.assertIsNone(win32_files.disk_numbers("C:\\"))
+        self.assertIsNone(win32_files.disk_numbers("not a drive"))
+        import scoped_fs
+
+        class Root:
+            def __init__(self, device, drive):
+                self.device, self.root = device, Path(drive + "fictional")
+
+            def inspect(self, relative):
+                return {"device": self.device}
+        disks = {"C:\\": frozenset({0}), "D:\\": frozenset({1}), "E:\\": frozenset({0, 1}), "F:\\": None}
+        with mock.patch.object(win32_files, "disk_numbers", lambda drive: disks[drive]):
+            for first, second, relation in (("C:\\", "D:\\", "different"), ("C:\\", "E:\\", "same"), ("C:\\", "F:\\", "unknown")):
+                with self.subTest(first=first, second=second):
+                    self.assertEqual(scoped_fs.disk_relation(Root(1, first), Root(2, second)), relation)
+            self.assertEqual(scoped_fs.disk_relation(Root(5, "C:\\"), Root(5, "D:\\")), "same")  # one volume
+
+    def test_volume_identity_is_file_system_and_serial(self):
+        identity = win32_files.volume_identity(str(self.path()))
+        self.assertRegex(identity, r"\Awindows:[A-Za-z0-9]+:[0-9a-f]{8}\Z")
+        import scoped_fs
+        self.assertEqual(scoped_fs.volume_identity(self.path()), identity)
+        self.assertIsNone(win32_files.volume_identity(str(self.case / "missing")))
+        self.assertIsNone(win32_files.volume_identity("relative\\folder"))
+
+    def test_disk_space_reports_total_and_free(self):
+        root = self.open_root()
+        total, free = root.disk_space()
+        usage = shutil.disk_usage(self.path())
+        self.assertEqual(total, usage.total)
+        self.assertLess(abs(free - usage.free), 256 * CHUNK_BYTES)
+        self.assertLess(abs(root.free_bytes() - free), 256 * CHUNK_BYTES)
+
+    def test_read_only_file_removed_through_scoped_root_when_the_plan_shows_it(self):
+        root = windows_scoped.ScopedRoot(str(self.path()), quiet_workspace=True)
+        self.addCleanup(root.close)
+        self.path("old.txt").write_bytes(b"read-only original")
+        os.chmod(self.path("old.txt"), stat.S_IREAD)
+        record = root.inspect("old.txt", hash_file=True)
+        self.assertTrue(scoped_base.read_only(record))
+        root.remove_file("old.txt", expected=record)
+        self.assertFalse(self.path("old.txt").exists())
+
+    def test_fat_delete_falls_back_to_the_plain_disposition(self):
+        root = windows_scoped.admit_destination(str(self.path()), non_private_destination=True,
+                                                volumes=volumes("exFAT", win32_files.DRIVE_REMOVABLE))
+        self.addCleanup(root.close)
+        record = self.seed(root, "old.zip", b"old backup")
+        refused = mock.Mock(side_effect=OSError(87, "x", None, 87))
+        with self.patched("set_disposition", refused):
+            root.remove_file("old.zip", expected={**record, "sha256": hashlib.sha256(b"old backup").hexdigest()})
+        refused.assert_called_once()
+        self.assertFalse(self.path("old.zip").exists())
+        ntfs = self.open_root()
+        kept = self.seed(ntfs, "kept.txt", b"kept")
+        with self.patched("set_disposition", refused):
+            self.assertEqual(self.code(ntfs.remove_file, "kept.txt", expected=kept), "delete-refused")
+        self.assertTrue(self.path("kept.txt").exists())
+
+    def test_interrupted_refused_call_leaves_no_cycle(self):
+        root = self.open_root()
+        errors = []
+
+        class Interrupt(BaseException):
+            pass
+        real_wait = threading.Event.wait
+
+        def interrupted_once(event, timeout=None):
+            if not errors:
+                errors.append(1)
+                real_wait(event, 5)
+                raise Interrupt()
+            return real_wait(event, timeout)
+        job_holder = []
+        real_job = windows_scoped._Job
+
+        def keep(*args, **kwargs):
+            job = real_job(*args, **kwargs)
+            job_holder.append(job)
+            return job
+        with mock.patch.object(windows_scoped, "_Job", keep), mock.patch.object(threading.Event, "wait", interrupted_once), \
+                self.assertRaises(Interrupt):
+            root.inspect("missing.txt")
+        self.assertIsNone(job_holder[0].error)  # the refusal raised meanwhile is dropped: no traceback cycle
+
+
+@unittest.skipUnless(os.name == "nt", WINDOWS_ONLY)
+class UserTempFolderTests(Fixture):
+    """win32_files.user_temp_folder(): the path only when GetTempPath2W (or GetTempPathW) and
+    FOLDERID_LocalAppData\\Temp agree, as plain long paths without a reparse point on any component."""
+
+    def temp(self):
+        local = self.path("Local")
+        (local / "Temp").mkdir(parents=True)
+        return local
+
+    def test_user_temp_folder_requires_both_apis_to_agree(self):
+        local = self.temp()
+        (self.path("Elsewhere")).mkdir()
+        with self.patched("local_app_data", lambda: str(local)):
+            for reported, expected in ((str(local / "Temp") + "\\", str(local / "Temp")),
+                                       ("\\\\?\\" + str(local / "Temp"), str(local / "Temp")),
+                                       (str(local / "Temp").upper(), str(local / "Temp").upper())):
+                with self.subTest(reported=reported), self.patched("temp_path_api", lambda value=reported: value):
+                    self.assertTrue(win32_files.same_name(win32_files.user_temp_folder(), expected))
+                    self.assertFalse(win32_files.user_temp_folder().startswith("\\\\?\\"))
+            (local / "Temp" / "2").mkdir()
+            for reported in (str(self.path("Elsewhere")), str(local / "Temp" / "2"), str(local)):
+                with self.subTest(reported=reported), self.patched("temp_path_api", lambda value=reported: value):
+                    self.assertIsNone(win32_files.user_temp_folder())  # another folder, or a per-session Remote Desktop one
+            with self.patched("temp_path_api", mock.Mock(side_effect=OSError(5, "x", None, 5))):
+                self.assertIsNone(win32_files.user_temp_folder())
+        with self.patched("API", None):
+            self.assertIsNone(win32_files.user_temp_folder())
+
+    def test_user_temp_folder_refuses_redirected_or_reparse(self):
+        local = self.temp()
+        self.junction(self.path("Linked"), local)
+        with self.patched("local_app_data", lambda: str(self.path("Linked"))), \
+                self.patched("temp_path_api", lambda: str(self.path("Linked") / "Temp")):
+            self.assertIsNone(win32_files.user_temp_folder())  # a junction on a component of both
+        with self.patched("local_app_data", lambda: str(local)), self.patched("temp_path_api", lambda: str(self.path("Linked") / "Temp")):
+            self.assertIsNone(win32_files.user_temp_folder())  # TMP reaches the folder through a junction
+        with self.patched("local_app_data", lambda: str(local)), self.patched("temp_path_api", lambda: str(local / "Temp")), \
+                self.patched("long_path", lambda path: path.replace("Local", "LOCAL~1")):
+            self.assertIsNone(win32_files.user_temp_folder())  # a name stored differently from the long name is refused
+        with self.patched("local_app_data", lambda: str(local)), self.patched("temp_path_api", lambda: "\\\\server\\share\\Temp"):
+            self.assertIsNone(win32_files.user_temp_folder())
+        os.rmdir(self.path("Linked"))
 
 
 if __name__ == "__main__":

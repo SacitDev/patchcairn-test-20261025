@@ -3,26 +3,28 @@
 Windows uses the current process token and native protected security descriptors;
 POSIX requires actual effective-user ownership and 0700/0600 modes, plus a native
 filesystem gate on Linux and absent/empty extended-ACL admission on Darwin. No SID, ACL,
-account name, native error text or supplied path is included in refusal messages.
+account name, native error text or supplied path is included in refusal messages, apart
+from the one folder name a person must change.
 This cooperative boundary excludes the same user and privileged administrators.
 """
 from __future__ import annotations
 
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, suppress
 import os
 from pathlib import Path
 import re
 import stat
 import sys
+import time
+import uuid
 
 import pc_paths
+import pc_records
 import win32_files as w32
 
 
-class PrivateWorkspaceError(ValueError):
-    def __init__(self, code, message=None):
-        self.code = code
-        super().__init__(code if message is None else message)
+class PrivateWorkspaceError(pc_records.Refusal):
+    """A private folder or file that cannot be created or admitted; ``code`` says why, the message adds what to fix."""
 
 
 def _hold(code, message=None):
@@ -36,11 +38,16 @@ def relative_parts(path, root):
     already refused. A relative path or a ".." part is None (outside). On Windows the root's parts are compared with the
     path's leading parts by the file system's own rule (win32_files.same_name), so a look-alike part such as one with
     U+212A (Kelvin sign) is not "k"; a part ending in a dot or a space, which Windows would trim, and a missing Windows
-    API are None too. Elsewhere pathlib compares the parts exactly.
+    API are None too. On macOS, whose default APFS ignores case and NFC/NFD form, the parts are compared by
+    pc_paths.casefold_key; a case-sensitive volume then counts two different folders as one, so "apart" refuses too much.
+    Elsewhere pathlib compares the parts exactly.
     """
     path, root = Path(path), Path(root)
     if not (path.is_absolute() and root.is_absolute()) or ".." in path.parts or ".." in root.parts:
         return None
+    if sys.platform == "darwin":
+        keys = [pc_paths.casefold_key(part) for part in root.parts]
+        return path.parts[len(keys):] if [pc_paths.casefold_key(part) for part in path.parts[:len(keys)]] == keys else None
     if os.name != "nt":
         try:
             return path.relative_to(root).parts
@@ -67,9 +74,10 @@ def _absolute(path, boundary=None):
             _hold("private-local-path-required")
         # pc_paths' one name rule: no empty, dot or trailing-dot-or-space name, no control, separator, stream or wildcard
         # character, and no reserved device name (CONIN$, CONOUT$ and COM/LPT with a superscript digit included).
-        if not all(map(pc_paths.portable, value.parts[1:])):
-            _hold("private-path-invalid", "a folder name on this path is one PatchCairn does not accept (a reserved Windows name, too long, or an "
-                                          "unsupported character)")
+        refused = next((part for part in value.parts[1:] if not pc_paths.portable(part)), None)
+        if refused is not None:
+            _hold("private-path-invalid", f'the folder name "{pc_paths.display(refused)[:64]}" is one PatchCairn does not accept (a reserved '
+                                          "Windows name, too long, or an unsupported character)")
     value = value.absolute()
     if value == value.parent:
         _hold("private-root-refused")
@@ -385,3 +393,117 @@ def write_private_new(path, data):
                 _hold("private-file-write-unresolved")
             finally:
                 os.close(handle)
+
+
+# A program that has a file open (a virus scanner, the search indexer, a reader) refuses a rename on Windows for a short
+# while: the tries, and the wait between them (about a second in all).
+RENAME_TRIES, RENAME_WAIT_SECONDS = 20, 0.05
+
+
+def retried(rename, source, target):
+    """``rename(source, target)`` (os.replace or os.rename), tried again for a bounded time while it raises PermissionError,
+    since on Windows such a hold is short. A refusal that outlasts the tries stays a refusal; any other error is not retried."""
+    for attempt in range(1, RENAME_TRIES + 1):
+        try:
+            return rename(source, target)
+        except PermissionError:
+            if attempt == RENAME_TRIES:
+                raise
+            time.sleep(RENAME_WAIT_SECONDS)
+
+
+def _synced(path):
+    """fsync ``path``: on POSIX the folder, so its new entry lasts; on Windows the renamed file itself."""
+    descriptor = os.open(path, (os.O_RDWR | os.O_BINARY) if os.name == "nt" else (os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def publish_private_new(path, data):
+    """write_private_new, whole or not at all: the bytes go to a new private temporary file in the same folder, are synced,
+    and that file then takes the name ``path``, which is synced too. A process killed on the way leaves at most the temporary
+    file, never part of a file under ``path``. Its name (".w" and 7 random hex digits) is no longer than any service record's,
+    so a path within the length limit keeps it within too; a name already taken, by a file an earlier kill left, refuses
+    ("private-file-create-refused") and that file is left alone. A file already at ``path`` is never replaced
+    ("private-file-create-refused"): POSIX links the new name, which link(2) refuses for a name in use, then removes the
+    temporary one; Windows renames, which it refuses for a name in use, tried again while another program briefly holds the
+    file (retried). Any other failure of those steps refuses "private-file-publish-unresolved". A refusal leaves no temporary
+    file this call made (a killed process does: nothing can remove it then)."""
+    path = _absolute(path)
+    temp = path.with_name(".w" + uuid.uuid4().hex[:7])
+    if os.path.lexists(temp):
+        _hold("private-file-create-refused")
+    try:
+        write_private_new(temp, data)
+    except PrivateWorkspaceError as error:
+        if error.code != "private-file-create-refused":  # the name was free just before, so what is there now is this call's
+            with suppress(OSError):
+                os.unlink(temp)
+        raise
+    try:
+        with private_directory(path.parent):
+            try:
+                if os.name == "nt":
+                    retried(os.rename, temp, path)
+                else:
+                    os.link(temp, path)
+                    os.unlink(temp)
+            except FileExistsError:
+                _hold("private-file-create-refused")
+            except OSError:
+                _hold("private-file-publish-unresolved")
+            try:
+                _synced(path if os.name == "nt" else path.parent)
+            except OSError:
+                _hold("private-file-publish-unresolved")
+    except Exception:
+        with suppress(OSError):
+            os.unlink(temp)
+        raise
+    ensure_private_file(path)
+
+
+@contextmanager
+def held_lock(path):
+    """Hold the exclusive lock on the private file ``path`` for the with block, taken once with no waiting: msvcrt.locking
+    on Windows, fcntl.flock elsewhere, so a second opening of the file is refused, in this process too. The operating
+    system frees the lock when the process dies, however it dies, so nothing stale stays behind, and Python's descriptors
+    are not inheritable, so a child never keeps it. The file is created when missing and is left in place afterwards:
+    removing it could let two holders lock two different files. Refuses "private-lock-held" while a holder lives and
+    "private-lock-unavailable" for any other operating system failure; the block never runs without the lock."""
+    path = _absolute(path)
+    if not os.path.lexists(path):
+        try:
+            write_private_new(path, b"")
+        except PrivateWorkspaceError as error:
+            if error.code != "private-file-create-refused":  # another process may have just made it; the admission decides
+                raise
+    ensure_private_file(path)
+    try:
+        descriptor = os.open(path, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0))
+    except OSError:
+        _hold("private-lock-unavailable")
+    try:
+        try:
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (BlockingIOError, PermissionError):
+            _hold("private-lock-held")
+        except OSError:
+            _hold("private-lock-unavailable")
+        try:
+            yield path
+        finally:
+            if os.name == "nt":
+                try:
+                    msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass  # closing the descriptor below frees it as well
+    finally:
+        os.close(descriptor)

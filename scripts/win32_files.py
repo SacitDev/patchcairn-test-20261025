@@ -1,6 +1,7 @@
-"""Win32 file, directory, token and security calls through ctypes (layer L1, standard library only).
+"""Win32 file, directory, volume, token and security calls through ctypes (layer L1: the standard library and
+pc_records).
 
-Bindings, not policy: windows_scoped (selected roots) and private_workspace (owned work folders)
+Bindings, not policy: windows_scoped (selected roots), private_workspace (owned work folders) and the storage code
 decide what is allowed. Every bound function has argtypes and restype, and a failed call raises
 OSError carrying the Windows error code in ``winerror``. 64-bit Python on Windows is required; the
 structure layouts are asserted for it. On any other platform nothing is bound and ``API`` is None.
@@ -10,7 +11,10 @@ from __future__ import annotations
 from contextlib import contextmanager
 import ctypes
 import os
+import re
 import threading
+
+import pc_records
 
 DWORD, BOOL, WORD, HANDLE, LPCWSTR = ctypes.c_uint32, ctypes.c_int, ctypes.c_uint16, ctypes.c_void_p, ctypes.c_wchar_p
 INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
@@ -43,6 +47,13 @@ ERROR_NO_MORE_FILES, ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION = 18, 32, 33
 ERROR_HANDLE_EOF, ERROR_FILE_EXISTS, ERROR_ALREADY_EXISTS = 38, 80, 183
 ERROR_DISK_FULL, ERROR_INSUFFICIENT_BUFFER, ERROR_OPERATION_ABORTED = 112, 122, 995
 ERROR_NO_TOKEN, ERROR_NOT_FOUND = 1008, 1168
+# DeviceIoControl codes (winioctl.h): the disks a volume lies on, the bus and media of the volume's disk, and whether it
+# can be pulled while running.
+IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, IOCTL_STORAGE_QUERY_PROPERTY = 0x00560000, 0x002D1400
+IOCTL_STORAGE_GET_HOTPLUG_INFO = 0x002D0C14
+# STORAGE_BUS_TYPE values of disks built into a computer (SCSI, ATA, RAID, SAS, SATA, NVMe), and of virtual disks
+# (virtual, file-backed virtual, Storage Spaces). A RAID volume's disk numbers hide its members in the same way.
+FIXED_BUS_TYPES, VIRTUAL_BUS_TYPES = frozenset({1, 3, 8, 10, 11, 17}), frozenset({14, 15, 16})
 SYSTEM_SID, ADMINISTRATORS_SID = "S-1-5-18", "S-1-5-32-544"
 
 _TOKEN_QUERY, _THREAD_TERMINATE = 0x8, 0x1
@@ -110,7 +121,7 @@ class _ACE(ctypes.Structure):
 
 
 # 64-bit layouts. FILE_RENAME_INFO and SECURITY_ATTRIBUTES were measured on AMD64 with Python 3.14 and 3.15
-# (knowledge/research/windows-inprocess.md); the others follow from the Windows SDK declarations.
+# (and checked by the layout test); the others follow from the Windows SDK declarations.
 LAYOUT = {"BY_HANDLE_FILE_INFORMATION": ctypes.sizeof(BY_HANDLE_FILE_INFORMATION),
           "FILE_RENAME_INFO": ctypes.sizeof(FILE_RENAME_INFO), "FILE_RENAME_INFO.name": FILE_RENAME_INFO.name.offset,
           "FILE_ID_BOTH_DIR_INFO.name": FILE_ID_BOTH_DIR_INFO.name.offset,
@@ -119,11 +130,10 @@ EXPECTED_LAYOUT = {"BY_HANDLE_FILE_INFORMATION": 52, "FILE_RENAME_INFO": 24, "FI
                    "FILE_ID_BOTH_DIR_INFO.name": 104, "WIN32_FIND_DATAW": 592, "SECURITY_ATTRIBUTES": 24}
 
 
-class PrivacyRefusal(ValueError):
+class PrivacyRefusal(pc_records.Refusal):
     """An object's owner or DACL is not the private shape; ``code`` names the first difference found."""
 
     def __init__(self, code):
-        self.code = code
         super().__init__(code)
 
 
@@ -177,11 +187,21 @@ class _Api:
     """The bound kernel32 and advapi32 functions."""
 
 
+class _GUID(ctypes.Structure):
+    _fields_ = [("data1", DWORD), ("data2", WORD), ("data3", WORD), ("data4", ctypes.c_ubyte * 8)]
+
+
+# KNOWNFOLDERID FOLDERID_LocalAppData {F1B32785-6FBA-4FCF-9D55-7B8E7F157091}.
+_FOLDERID_LOCAL_APP_DATA = _GUID(0xF1B32785, 0x6FBA, 0x4FCF, (ctypes.c_ubyte * 8)(0x9D, 0x55, 0x7B, 0x8E, 0x7F, 0x15, 0x70, 0x91))
+
+
 def _load():
     if os.name != "nt" or ctypes.sizeof(ctypes.c_void_p) != 8 or LAYOUT != EXPECTED_LAYOUT:
         return None
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
     advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+    shell = ctypes.WinDLL("shell32", use_last_error=True)
+    ole = ctypes.WinDLL("ole32", use_last_error=True)
     pointer, dword_out, handle_out = ctypes.c_void_p, ctypes.POINTER(DWORD), ctypes.POINTER(HANDLE)
     api = _Api()
     for library, name, restype, argtypes in (
@@ -223,10 +243,20 @@ def _load():
         (advapi, "GetAce", BOOL, (pointer, DWORD, ctypes.POINTER(pointer))),
         (advapi, "IsValidSid", BOOL, (pointer,)),
         (advapi, "GetLengthSid", DWORD, (pointer,)),
+        (kernel, "GetTempPathW", DWORD, (DWORD, ctypes.c_wchar_p)),
+        (kernel, "GetLongPathNameW", DWORD, (LPCWSTR, ctypes.c_wchar_p, DWORD)),
+        (kernel, "DeviceIoControl", BOOL, (HANDLE, DWORD, pointer, DWORD, pointer, DWORD, dword_out, pointer)),
+        (shell, "SHGetKnownFolderPath", ctypes.c_long, (ctypes.POINTER(_GUID), DWORD, HANDLE, ctypes.POINTER(ctypes.c_wchar_p))),
+        (ole, "CoTaskMemFree", None, (pointer,)),
     ):
         function = getattr(library, name)
         function.restype, function.argtypes = restype, argtypes
         setattr(api, name, function)
+    try:  # Windows 11 and Server 2022: a SYSTEM process gets its own folder instead of the shared system Temp
+        api.GetTempPath2W = kernel.GetTempPath2W
+        api.GetTempPath2W.restype, api.GetTempPath2W.argtypes = DWORD, (DWORD, ctypes.c_wchar_p)
+    except AttributeError:
+        api.GetTempPath2W = None
     return api
 
 
@@ -261,14 +291,15 @@ def file_type(handle):
 
 
 def final_path(handle):
-    """GetFinalPathNameByHandleW, normalized DOS form (flags 0)."""
-    buffer = ctypes.create_unicode_buffer(32768)
-    count = API.GetFinalPathNameByHandleW(handle.value, buffer, len(buffer), 0)
-    if not count:
-        raise _error()
-    if count >= len(buffer):
-        raise _error(ERROR_INSUFFICIENT_BUFFER)
-    return buffer.value
+    """GetFinalPathNameByHandleW, normalized DOS form (flags 0). Runs for every file opened, so the buffer starts small."""
+    for size in (1024, 32768):
+        buffer = ctypes.create_unicode_buffer(size)
+        count = API.GetFinalPathNameByHandleW(handle.value, buffer, size, 0)
+        if not count:
+            raise _error()
+        if count < size:
+            return buffer.value
+    raise _error(ERROR_INSUFFICIENT_BUFFER)
 
 
 def volume_information(handle):
@@ -288,10 +319,161 @@ def drive_type(root):
 
 def free_bytes(directory):
     """GetDiskFreeSpaceExW lpFreeBytesAvailableToCaller: free space this user may use (quotas included)."""
-    available = ctypes.c_uint64()
-    if not API.GetDiskFreeSpaceExW(directory, ctypes.byref(available), None, None):
+    return disk_space(directory)[1]
+
+
+def disk_space(directory):
+    """(total bytes, bytes this user may use) of the volume holding ``directory``, from GetDiskFreeSpaceExW."""
+    available, total = ctypes.c_uint64(), ctypes.c_uint64()
+    if not API.GetDiskFreeSpaceExW(directory, ctypes.byref(available), ctypes.byref(total), None):
         raise _error()
-    return available.value
+    return total.value, available.value
+
+
+def volume_identity(path):
+    """Text naming the volume that holds the folder ``path``: its file system name and volume serial number, which the
+    file system keeps across a restart and a reconnect; None when the folder or its volume cannot be read."""
+    if API is None or not isinstance(path, str) or not re.match(r"[A-Za-z]:\\", path):
+        return None
+    try:
+        with open_file("\\\\?\\" + path, FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                       OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT) as handle:
+            serial, filesystem, _flags = volume_information(handle)
+    except (OSError, ValueError):
+        return None
+    return f"windows:{filesystem}:{serial:08x}" if filesystem and serial else None
+
+
+def _device_control(drive, code, query, size):
+    """DeviceIoControl ``code`` on the volume of ``drive`` ('C:\\'), opened for no data access; the output bytes."""
+    if not isinstance(drive, str) or not re.fullmatch(r"[A-Za-z]:\\?", drive):
+        raise _error(ERROR_PATH_NOT_FOUND)
+    output, returned = ctypes.create_string_buffer(size), DWORD()
+    with open_file("\\\\.\\" + drive[:2], 0, FILE_SHARE_READ | FILE_SHARE_WRITE, OPEN_EXISTING, 0) as handle:
+        if not API.DeviceIoControl(handle.value, code, query, 0 if query is None else len(query), output, size,
+                                   ctypes.byref(returned), None):
+            raise _error()
+    return output.raw[:returned.value]
+
+
+def storage_bus(drive):
+    """(STORAGE_BUS_TYPE, removable media) of the disk under the volume of ``drive``, from IOCTL_STORAGE_QUERY_PROPERTY."""
+    # STORAGE_PROPERTY_QUERY {StorageDeviceProperty, PropertyStandardQuery}; STORAGE_DEVICE_DESCRIPTOR keeps
+    # RemovableMedia at offset 10 and BusType at offset 28.
+    data = _device_control(drive, IOCTL_STORAGE_QUERY_PROPERTY, ctypes.create_string_buffer(12), 1024)
+    if len(data) < 32:
+        raise _error(ERROR_INSUFFICIENT_BUFFER)
+    return int.from_bytes(data[28:32], "little"), bool(data[10])
+
+
+def drive_hotplug(drive):
+    """True when Windows marks the disk under the volume of ``drive`` as pluggable while running, which a portable NVMe or
+    eSATA disk on a built-in bus type shows: STORAGE_HOTPLUG_INFO (a DWORD size, then MediaRemovable, MediaHotplug,
+    DeviceHotplug) from IOCTL_STORAGE_GET_HOTPLUG_INFO."""
+    data = _device_control(drive, IOCTL_STORAGE_GET_HOTPLUG_INFO, None, 8)
+    if len(data) < 7:
+        raise _error(ERROR_INSUFFICIENT_BUFFER)
+    return bool(data[4] or data[6])
+
+
+def drive_removable(drive):
+    """False only when the volume's disk is proven built in (a fixed bus type, no removable media, not hot-pluggable); True
+    for a USB, SD, FireWire, removable-media or hot-pluggable disk; None when Windows cannot tell (a virtual disk, an
+    error). Callers treat None as removable."""
+    try:
+        bus, removable = storage_bus(drive)
+        if bus in VIRTUAL_BUS_TYPES:
+            return None
+        return removable or bus not in FIXED_BUS_TYPES or drive_hotplug(drive)
+    except OSError:
+        return None
+
+
+def disk_numbers(drive):
+    """The disk numbers the volume of ``drive`` lies on (IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS), or None when they cannot
+    be read or the volume is on a virtual disk, which may share a physical disk with anything."""
+    try:
+        bus, _removable = storage_bus(drive)
+        # VOLUME_DISK_EXTENTS: a DWORD count, then 24-byte DISK_EXTENT entries from offset 8, DiskNumber first.
+        data = _device_control(drive, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, None, 8 + 24 * 64)
+    except OSError:
+        return None
+    count = int.from_bytes(data[:4], "little") if len(data) >= 4 else 0
+    if bus in VIRTUAL_BUS_TYPES or not 1 <= count <= 64 or len(data) < 8 + 24 * count:
+        return None
+    return frozenset(int.from_bytes(data[8 + 24 * index:12 + 24 * index], "little") for index in range(count))
+
+
+def temp_path_api():
+    """This user's temporary folder as Windows reports it: GetTempPath2W where it exists, else GetTempPathW."""
+    function = API.GetTempPath2W or API.GetTempPathW
+    buffer = ctypes.create_unicode_buffer(32768)
+    count = function(len(buffer), buffer)
+    if not count or count >= len(buffer):
+        raise _error()
+    return buffer.value
+
+
+def local_app_data():
+    """FOLDERID_LocalAppData from SHGetKnownFolderPath, without creating or checking it."""
+    path = ctypes.c_wchar_p()
+    result = API.SHGetKnownFolderPath(ctypes.byref(_FOLDERID_LOCAL_APP_DATA), 0, None, ctypes.byref(path))
+    try:
+        if result != 0 or not path.value:
+            raise _error(ERROR_PATH_NOT_FOUND)
+        return path.value
+    finally:
+        API.CoTaskMemFree(path)
+
+
+def long_path(path):
+    """GetLongPathNameW: ``path`` with every 8.3 short name replaced by the long name (the path must exist)."""
+    buffer = ctypes.create_unicode_buffer(32768)
+    count = API.GetLongPathNameW(path, buffer, len(buffer))
+    if not count or count >= len(buffer):
+        raise _error()
+    return buffer.value
+
+
+def plain_folder(path):
+    """``path`` as a plain long drive path ('C:\\...', no \\\\?\\ prefix, no trailing backslash) when it is an existing
+    folder whose every component is a folder stored under exactly that name and none is a reparse point; else None."""
+    if not isinstance(path, str):
+        return None
+    path = (path[4:] if path.startswith("\\\\?\\") else path).rstrip("\\")
+    if not re.fullmatch(r"[A-Za-z]:\\[^/]+", path):
+        return None
+    try:
+        path = long_path(path)
+        current = path[:2]
+        for part in path[3:].split("\\"):
+            current += "\\" + part
+            found = find_entry("\\\\?\\" + current)
+            if (found is None or found[1] & ATTRIBUTE_REPARSE_POINT or not found[1] & ATTRIBUTE_DIRECTORY
+                    or not same_name(found[0], part)):
+                return None
+    except (OSError, ValueError):
+        return None
+    return path
+
+
+def user_temp_folder():
+    """This user's own temporary folder, or None.
+
+    The path GetTempPath2W (GetTempPathW where it is missing) reports and FOLDERID_LocalAppData\\Temp are each made a
+    plain long path (an 8.3 TMP is resolved) with no reparse point on any component, then compared with
+    CompareStringOrdinal ignoring case. Only when they name the same folder is it returned: a TMP pointing elsewhere, a
+    per-session Remote Desktop folder (...\\Temp\\<n>), a link and any API failure give None.
+    """
+    if API is None:
+        return None
+    try:
+        reported, expected = plain_folder(temp_path_api()), plain_folder(local_app_data() + "\\Temp")
+        if reported is None or expected is None or not same_name(reported, expected):
+            return None
+    except OSError:
+        return None
+    return reported
 
 
 def read(handle, address, count):
@@ -410,8 +592,10 @@ def same_name(left, right):
     """CompareStringOrdinal ignoring case (the file system's own rule, not Unicode case folding).
 
     The lengths are UTF-16 units: a character above U+FFFF is two of them, and counting it as one would leave the
-    end of the string uncompared.
+    end of the string uncompared. Identical text needs no call (most comparisons are a path against itself).
     """
+    if left == right:
+        return True
     result = API.CompareStringOrdinal(left, utf16_units(left), right, utf16_units(right), True)
     if not result:
         raise _error()
@@ -549,6 +733,29 @@ def security_snapshot(handle):
                 raise PrivacyRefusal("private-dacl-invalid")
             aces.append((ace.kind, ace.flags, ace.mask, _sid_text(sid)))
         return owner_sid, control.value, aces
+    finally:
+        API.LocalFree(descriptor)
+
+
+def dacl_protected(path):
+    """True when the file ``path``'s DACL is protected (it inherits nothing from its folder), False when it inherits,
+    None when it cannot be read. A fact recorded for restoring, never a privacy decision. Runs for every backed-up file,
+    so it reads the descriptor's control bits and not its entries."""
+    if API is None or not isinstance(path, str):
+        return None
+    owner, dacl, descriptor, control, revision = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p(), WORD(), DWORD()
+    try:
+        with open_file("\\\\?\\" + path, READ_CONTROL, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, OPEN_EXISTING,
+                       FILE_FLAG_OPEN_REPARSE_POINT) as handle:
+            if API.GetSecurityInfo(handle.value, _SE_FILE_OBJECT, _OWNER_AND_DACL, ctypes.byref(owner), None,
+                                   ctypes.byref(dacl), None, ctypes.byref(descriptor)):
+                return None
+    except (OSError, ValueError):
+        return None
+    try:
+        if not dacl.value or not API.GetSecurityDescriptorControl(descriptor, ctypes.byref(control), ctypes.byref(revision)):
+            return None
+        return bool(control.value & _SE_DACL_PROTECTED)
     finally:
         API.LocalFree(descriptor)
 

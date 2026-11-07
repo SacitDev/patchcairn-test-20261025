@@ -19,6 +19,7 @@ import linux_privacy
 import pc_paths
 import pc_records
 import scoped_base
+import win32_files
 # The one error hierarchy of the selected-root backends, re-exported for existing callers.
 from scoped_base import CapabilityHold, ScopedFSError, relative_path
 from scoped_base import cap as _cap, expected_record as _expected, refuse as _refuse, same_identity as _same
@@ -75,7 +76,7 @@ def _left_out(info):
     if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
         return "link"
     if getattr(info, "st_flags", 0) & _SF_DATALESS:
-        return "special"  # a macOS cloud placeholder (F-206): opening it downloads it, so it is never opened
+        return "online-only"  # a macOS cloud placeholder: opening it downloads it, so it is never opened
     if stat.S_ISDIR(info.st_mode):
         return None
     if not stat.S_ISREG(info.st_mode):
@@ -131,8 +132,9 @@ def _rename_function():
         return None
 
 
-def _call_rename(function, source_fd, source_name, destination_fd, destination_name):
-    """Call only the current native platform's descriptor-relative exclusive rename."""
+def _call_rename(function, source_fd, source_name, destination_fd, destination_name, *, reserve=False):
+    """Call only the current native platform's descriptor-relative exclusive rename. ``reserve`` (a new file on a drive
+    that keeps nothing private): where macOS refuses the exclusive flag, on exFAT and FAT, the name is taken first."""
     if os.name != "posix" or function is None:
         raise CapabilityHold("no-replace-unavailable", "Native atomic no-overwrite rename is unavailable")
     if sys.platform.startswith("linux"):
@@ -144,6 +146,11 @@ def _call_rename(function, source_fd, source_name, destination_fd, destination_n
     result = function(source_fd, os.fsencode(source_name), destination_fd, os.fsencode(destination_name), flags)
     if result != 0:
         error = ctypes.get_errno()
+        if reserve and error == errno.ENOTSUP and sys.platform == "darwin":
+            try:
+                return darwin_privacy.rename_into_reserved_name(source_fd, source_name, destination_fd, destination_name)
+            except OSError as failure:
+                error = errno.EEXIST if isinstance(failure, FileExistsError) else errno.EIO
         if error in (errno.EEXIST, errno.ENOTEMPTY):
             raise ScopedFSError("destination-exists", "Destination or case-equivalent entry already exists")
         if error == errno.EXDEV:  # another mount, also a bind mount of the same file system: nothing was renamed
@@ -260,7 +267,7 @@ def _volume_facts(fd):
 
 def _destination_volume(facts):
     """(scoped_base volume kind, stable file ids) for a volume source's facts: only a native file system on a drive
-    proven fixed (macOS: not marked external or virtual) is private with stable inode numbers (D-069, D-072)."""
+    proven fixed (macOS: not marked external or virtual) is private with stable inode numbers."""
     if (not isinstance(facts, dict) or facts.get("filesystem") not in ("native", "fat", "exfat", "other")
             or type(facts.get("removable")) is not bool):
         _refuse("filesystem-capability-unavailable", "The drive's file system could not be read")
@@ -327,8 +334,9 @@ class _NewFile(_File):
 
     def commit(self) -> dict:
         """Sync the file and its folder (F_FULLFSYNC on macOS), re-check privacy, hash this descriptor, rename without
-        replacing (renameat2 RENAME_NOREPLACE, renameatx_np RENAME_EXCL, else CapabilityHold no-replace-unavailable),
-        check that the name leads to this file, sync both again; ``durable`` only if every sync succeeded."""
+        replacing (renameat2 RENAME_NOREPLACE, renameatx_np RENAME_EXCL, on a not private drive the reserved name of
+        _call_rename, else CapabilityHold no-replace-unavailable), check that the name leads to this file, sync both
+        again; ``durable`` only if every sync succeeded."""
         self._checkClosed()
         if self.committed:
             _refuse("commit-state", "The file is already committed")
@@ -340,7 +348,7 @@ class _NewFile(_File):
         self.seek(0)
         sha256 = scoped_base.hash_stream(self, before["size"])
         root._unchanged(self._fd, self._parent, self._partial, self._relative, before, root.identity_keys)
-        _call_rename(_rename_function(), self._parent, self._partial, self._parent, name)
+        _call_rename(_rename_function(), self._parent, self._partial, self._parent, name, reserve=not root.private)
         self.committed = True
         try:
             root._unchanged(self._fd, self._parent, name, self._relative, before, root.identity_keys & _RENAMED_KEYS)
@@ -357,9 +365,14 @@ class PosixRoot(scoped_base.RootBase):
     looked up with fstatat without following it, then opened with O_NOFOLLOW from its parent's descriptor. The
     constructor admits a source; admit_destination() a backup destination. One caller thread uses a root at a time.
     A mount of another file system and a macOS cloud placeholder (SF_DATALESS) are listed as not included ("link",
-    "special"); naming one is refused. A bind mount of the same file system is not detected (making one needs an
+    "online-only"); naming one is refused. A bind mount of the same file system is not detected (making one needs an
     administrator). No path is asked from the system (no F_GETPATH) or built from the selected root.
     """
+
+    # A device number does not last across a restart, so a persisted record is not compared on it; each live lookup
+    # (_lookup, the pinned ancestors) still compares st_dev.
+    identity_keys = scoped_base.IDENTITY_KEYS - {"device"}
+    created_keys = frozenset()  # an inode number is used again once its file is deleted (scoped_base.CREATED_KEYS)
 
     def __init__(self, root, *, max_entries=MAX_ENTRIES, volumes=None, _destination=None):
         self._fds, self._anchors, self._closed = [], [], True
@@ -411,8 +424,8 @@ class PosixRoot(scoped_base.RootBase):
             except (OSError, linux_privacy.LinuxPrivacyHold, darwin_privacy.DarwinPrivacyHold):
                 _refuse("filesystem-capability-unavailable", "The drive's file system could not be read")
             volume, stable_ids = _destination_volume(facts)
-            vars(self).update(scoped_base.destination_facts(volume, non_private_destination=destination,
-                                                           stable_ids=stable_ids))
+            facts = scoped_base.destination_facts(volume, non_private_destination=destination, stable_ids=stable_ids)
+            vars(self).update(facts, identity_keys=facts["identity_keys"] - {"device"})
 
     def close(self) -> None:
         fds, self._fds, self._closed = self._fds, [], True
@@ -515,7 +528,7 @@ class PosixRoot(scoped_base.RootBase):
             try:
                 darwin_privacy.assert_no_extended_acl_fd(handle)
             except darwin_privacy.DarwinPrivacyHold:
-                _refuse(code, "The entry has an access control list")
+                _refuse(code, "The entry has, or may have, an access control list")
 
     def _discard(self, parent, partial, handle):
         """Remove an uncommitted temporary file while its name leads to it, else it stays under its recorded name."""
@@ -681,7 +694,7 @@ class PosixRoot(scoped_base.RootBase):
 
     def remove_file(self, relative, *, expected, sha256=None, allow_read_only=False) -> dict:
         """As RootBase.remove_file, hashed with scoped_base.hash_stream on the open descriptor. POSIX deletes by name
-        (#51): just before unlinkat the name's fstatat identity must equal the descriptor's, but a file renamed onto
+        (a known limit): just before unlinkat the name's fstatat identity must equal the descriptor's, but a file renamed onto
         the name after that check would be deleted; the quiet workspace excludes that, and remove_original() first
         moves the file into a private folder. A read-only file (no owner write bit, or an immutable or append-only
         flag: Linux FS_IOC_GETFLAGS, macOS st_flags) is refused unless allowed; no mode or flag is ever changed."""
@@ -710,10 +723,16 @@ class PosixRoot(scoped_base.RootBase):
             _refuse("post-purge-verification-unresolved", "The name is still present after removal")
 
     def free_bytes(self) -> int:
+        return self.disk_space()[1]
+
+    def disk_space(self):
+        """(total bytes, bytes this user may use) of the root's volume; macOS reads the 64-bit fstatfs counts."""
         if self._closed:
             _refuse("closed-root", "The selected root is closed")
+        if sys.platform == "darwin":
+            return darwin_privacy.disk_space(self._fd)
         info = _os("free-space-unavailable", os.fstatvfs, self._fd)
-        return info.f_bavail * info.f_frsize
+        return info.f_blocks * info.f_frsize, info.f_bavail * info.f_frsize
 
 
 def _windows():
@@ -724,12 +743,24 @@ def _windows():
     return windows_scoped
 
 
+def open_root(root, *, max_entries=MAX_ENTRIES):
+    """A selected source root on this platform: windows_scoped.WindowsRoot on Windows, else PosixRoot."""
+    return (_windows().WindowsRoot if os.name == "nt" else PosixRoot)(root, max_entries=max_entries)
+
+
+def volume_identity(path):
+    """Text naming the volume that holds the folder ``path``, kept across a restart and a reconnect (Windows: the file
+    system and volume serial; Linux: the file system UUID; macOS: the volume UUID), or None; never the device number."""
+    module = win32_files if os.name == "nt" else darwin_privacy if sys.platform == "darwin" else linux_privacy
+    return module.volume_identity(os.fspath(path))
+
+
 def admit_destination(root, *, non_private_destination=False, volumes=None, max_entries=MAX_ENTRIES):
-    """Admit a backup destination (separate from source admission, plan RR2-4); on Windows windows_scoped's.
+    """Admit a backup destination (separate from source admission); on Windows windows_scoped's.
 
     On POSIX ``volumes(fd)`` (default _volume_facts; Windows' takes (handle, drive)) decides: only a native file system
     on a drive proven fixed (macOS: not marked external or virtual) is private, with stable inode numbers; FAT holds
-    files below 4 GiB; FAT, exFAT and other native drives need ``non_private_destination`` (D-069, D-072); anything else
+    files below 4 GiB; FAT, exFAT and other native drives need ``non_private_destination``; anything else
     (tmpfs, ramfs, read-only, network, FUSE, 9p, DrvFS) is refused. Admission writes and removes one empty file in the
     folder (after a failure, by identity), so a file system without a no-replace rename holds before any backup."""
     if os.name == "nt":
@@ -778,19 +809,21 @@ def _removal_name(removal, name):
 
 
 def remove_original(root, relative, *, expected, sha256=None, allow_read_only=False, removal=None, removal_name=None,
-                    in_place=False):
-    """Delete an original after a verified backup with the removal-folder rule (D-016, D-022, plan RR2-8).
+                    in_place=False, in_place_fallback=True):
+    """Delete an original after a verified backup with the removal-folder rule.
 
     ``removal`` is a root on the caller's work/removals/<id>/ folder (mode 0700, owned by this user, outside every
     selected root) and ``removal_name`` a new_removal_name() the caller recorded first. On POSIX, when that folder has
     the original's device, the verified original is renamed into it without replacing anything, then hashed again and
     deleted there by removal.remove_file. A refusal after the rename is removal-incomplete: the original is at
     ``removal_name`` and the caller runs reconcile_removal(). Otherwise (another device, a bind mount refusing the
-    rename, and on Windows, whose delete handle closes the window) root.remove_file deletes it in place (#51). Without a
-    removal folder the caller says ``in_place=True``; neither, or both, is refused.
+    rename, and on Windows, whose delete handle closes the window) root.remove_file deletes it in place. Without a
+    removal folder the caller says ``in_place=True``; neither, or both, is refused. With ``in_place_fallback=False``
+    every route to that in-place delete (Windows, another device or kind of root, EXDEV) refuses same-volume-required.
     """
-    if type(in_place) is not bool or in_place == (removal is not None):
-        _refuse("invalid-option", "Give either a removal folder or in_place=True")
+    if (type(in_place) is not bool or in_place == (removal is not None) or type(in_place_fallback) is not bool
+            or in_place and not in_place_fallback):
+        _refuse("invalid-option", "Give either a removal folder or in_place=True (which needs the in-place fallback)")
     if os.name != "nt" and removal is not None:
         name = _removal_name(removal, removal_name)
         if isinstance(root, PosixRoot) and removal._device == root._device:
@@ -801,7 +834,7 @@ def remove_original(root, relative, *, expected, sha256=None, allow_read_only=Fa
             try:
                 moved = root._move(relative, removal, name, target, allow_read_only=allow_read_only)
             except ScopedFSError as error:
-                if error.code == "same-volume-required":  # EXDEV at the rename (a bind mount): nothing moved
+                if error.code == "same-volume-required" and in_place_fallback:  # EXDEV (a bind mount): nothing moved
                     return root.remove_file(relative, expected=expected, sha256=sha256, allow_read_only=allow_read_only)
                 try:  # the name is fresh: if it exists in the removal folder, the original was moved
                     os.stat(name, dir_fd=removal._fd, follow_symlinks=False)
@@ -815,6 +848,8 @@ def remove_original(root, relative, *, expected, sha256=None, allow_read_only=Fa
             except ScopedFSError as error:
                 raise ScopedFSError(*_INCOMPLETE) from error
             return {**expected, "sha256": removed["sha256"]}
+    if not in_place_fallback:
+        _refuse("same-volume-required", "Without the in-place fallback a removal folder on the original's drive is needed")
     return root.remove_file(relative, expected=expected, sha256=sha256, allow_read_only=allow_read_only)
 
 
@@ -834,7 +869,7 @@ def reconcile_removal(removal, *, expected, removal_name, sha256=None, allow_rea
         if error.code == "missing-entry":
             return "absent"
         raise
-    if current["kind"] != "file" or not _same(current, expected, removal.identity_keys & _RENAMED_KEYS - {"device"}):
+    if current["kind"] != "file" or not _same(current, expected, removal.identity_keys & _RENAMED_KEYS):
         return "kept"
     try:
         removal.remove_file(name, expected={**current, "sha256": target}, allow_read_only=allow_read_only)
@@ -846,22 +881,22 @@ def reconcile_removal(removal, *, expected, removal_name, sha256=None, allow_rea
 
 
 def disk_relation(first, second, *, sysfs=None):
-    """Whether two admitted roots share a disk (D-043 item 3, F-205): "same" for one device or one parent disk,
-    "different" only when Linux sysfs proves the parent disks differ, otherwise "unknown" (always on macOS, and on
-    Windows until disk extents are wired in). ``sysfs(root)``: an identity of the root's physical disk or None (default
-    linux_privacy.physical_disk on the root's descriptor, which never proves a disk of a virtual machine)."""
-    if os.name == "nt":
-        return "unknown"
-    devices = first.inspect("")["device"], second.inspect("")["device"]
-    if devices[0] == devices[1]:
+    """Whether two admitted roots share a disk: "same" for one volume or a shared disk, "different" only when proven
+    (Windows: the volumes' disk extents name disjoint disks; Linux: sysfs shows other parent disks), else "unknown"
+    (always on macOS), worded "may be the same disk". ``sysfs(root)``: the root's physical disk identity, a frozenset of
+    disk numbers or None (default: win32_files.disk_numbers of the root's drive, or linux_privacy.physical_disk on its
+    descriptor; neither proves the disk of a virtual disk or virtual machine)."""
+    if first.inspect("")["device"] == second.inspect("")["device"]:
         return "same"
-    if not sys.platform.startswith("linux"):
+    if os.name != "nt" and not sys.platform.startswith("linux"):
         return "unknown"
-    disks = [sysfs(root) if sysfs else linux_privacy.physical_disk(root._fd) if isinstance(root, PosixRoot) else None
-             for root in (first, second)]
+    default = ((lambda root: win32_files.disk_numbers(str(root.root)[:3])) if os.name == "nt" else
+               lambda root: linux_privacy.physical_disk(root._fd) if isinstance(root, PosixRoot) else None)
+    disks = [(sysfs or default)(root) for root in (first, second)]
     if None in disks:
         return "unknown"
-    return "same" if disks[0] == disks[1] else "different"
+    disks = [disk if isinstance(disk, frozenset) else frozenset({disk}) for disk in disks]
+    return "same" if disks[0] & disks[1] else "different"
 
 
 class ScopedRoot:
@@ -926,41 +961,13 @@ class ScopedRoot:
             _refuse(left_out[0]["reason"], "The folder holds an entry that cannot be admitted")
         return rows
 
-    def snapshot(self, *, hash_files=False, max_file_bytes=DEFAULT_MAX_FILE_BYTES, max_total_bytes=None, excluded=None):
-        """As PosixRoot.snapshot, but without ``excluded`` the first entry left out refuses, as list_directory does;
-        before anything is hashed no file may exceed ``max_file_bytes`` nor all files ``max_total_bytes``."""
-        _cap(max_file_bytes, scoped_base.MAX_STREAM_BYTES, "max_file_bytes")
-        if max_total_bytes is not None:
-            _cap(max_total_bytes, scoped_base.MAX_STREAM_BYTES, "max_total_bytes")
-        if type(hash_files) is not bool:
-            _refuse("invalid-option", "hash_files must be boolean")
-        left_out = [] if excluded is None else excluded
-        rows = self._root.snapshot(excluded=left_out)
-        if excluded is None and left_out:
-            _refuse(left_out[0]["reason"], "The tree holds an entry that cannot be admitted")
-        sizes = [row["size"] for row in rows if row["kind"] == "file"] if hash_files else []
-        if any(size > max_file_bytes for size in sizes):
-            _refuse("file-byte-cap", "File exceeds its explicit byte cap")
-        if max_total_bytes is not None and sum(sizes) > max_total_bytes:
-            _refuse("total-byte-cap", "Snapshot hashing exceeds its total byte cap")
-        hashed = self._root.snapshot(hash_files=True) if hash_files else rows
-        if [{**row, "sha256": None} for row in hashed] != rows:
-            _refuse("snapshot-drift", "Entries changed during snapshot")
-        return hashed
-
-    def stream_to(self, relative, *, expected, writer, max_bytes, chunk_size=65536):
-        """As PosixRoot.stream_to, which passes CHUNK_BYTES pieces; ``chunk_size`` is still validated."""
-        _cap(max_bytes, scoped_base.MAX_STREAM_BYTES, "max_bytes")
-        _cap(chunk_size, scoped_base.CHUNK_BYTES, "chunk_size")
+    def read_bytes(self, relative, *, expected, max_bytes):
+        _cap(max_bytes, DEFAULT_MAX_FILE_BYTES, "max_bytes for in-memory read")
         expected = _expected(expected, self._explicit(relative))
         if expected["size"] > max_bytes:
             _refuse("file-byte-cap", "File exceeds its explicit byte cap")
-        return self._root.stream_to(relative, expected=expected, writer=writer)
-
-    def read_bytes(self, relative, *, expected, max_bytes):
-        _cap(max_bytes, DEFAULT_MAX_FILE_BYTES, "max_bytes for in-memory read")
         chunks = []
-        self.stream_to(relative, expected=expected, writer=chunks.append, max_bytes=max_bytes)
+        self._root.stream_to(relative, expected=expected, writer=chunks.append)
         return b"".join(chunks)
 
     def mkdir(self, relative):
@@ -985,6 +992,6 @@ class ScopedRoot:
                                   destination_relative=destination_relative, expected=expected)
 
     def remove_file(self, relative, *, expected):
-        """As before: a file the expected (approved) record shows as read-only is removed too (PD-10)."""
+        """As before: a file the expected (approved) record shows as read-only is removed too."""
         expected = _expected(expected, self._explicit(relative))
         self._root.remove_file(relative, expected=expected, allow_read_only=scoped_base.read_only(expected))

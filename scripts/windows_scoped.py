@@ -1,4 +1,4 @@
-"""Windows selected-root backend: WindowsRoot over win32_files, in this process (decision D-008).
+"""Windows selected-root backend: WindowsRoot over win32_files, in this process.
 
 Every native call of a root runs on the root's own I/O thread, on handles held for the whole
 operation. The selected root and its ancestors stay open for the root's lifetime without delete
@@ -6,7 +6,7 @@ sharing, so none of them can be renamed or removed; each component below the roo
 its parent's index before it is opened (reparse points and cloud placeholders are refused unopened)
 and then opened with FILE_FLAG_OPEN_REPARSE_POINT; a file being read is shared for reading only.
 Each call has a deadline: a call that does not return is cancelled with CancelSynchronousIo and the
-operation is reported as unresolved; the bound is best effort (decision D-018). This is a cooperative
+operation is reported as unresolved; the bound is best effort. This is a cooperative
 boundary for a quiet workspace, not an OS sandbox.
 """
 from __future__ import annotations
@@ -30,8 +30,7 @@ import win32_files as w32
 
 ADAPTER = "windows-handles"
 MAX_ENTRIES = scoped_base.MAX_ENTRIES
-# The retired helper's bound on every absolute path, in UTF-16 units: what is selected or created stays within
-# MAX_PATH, so ordinary programs can open it.
+# The bound on every absolute path, in UTF-16 units: what is selected or created stays within MAX_PATH for ordinary programs.
 MAX_PATH_CHARS = 240
 # Seconds one native call may take, and the wait after CancelSynchronousIo before it counts as stuck. Flushing a
 # new file also gets time per byte, at the speed of a slow USB drive.
@@ -48,7 +47,7 @@ _ANCESTOR_SHARE = w32.FILE_SHARE_READ | w32.FILE_SHARE_WRITE
 _ANY_SHARE = _ANCESTOR_SHARE | w32.FILE_SHARE_DELETE
 _FOLDER_ACCESS = w32.FILE_READ_ATTRIBUTES | w32.FILE_LIST_DIRECTORY
 _READ_ACCESS = w32.FILE_READ_DATA | w32.FILE_READ_ATTRIBUTES
-# Handle metadata; 0x40000 is not here because there it means "has extended attributes" (decision D-022).
+# Handle metadata; 0x40000 is not here because there it means "has extended attributes".
 _UNSUPPORTED = w32.ATTRIBUTE_OFFLINE | w32.ATTRIBUTE_ENCRYPTED | w32.ATTRIBUTE_RECALL_ON_DATA_ACCESS
 _UNSUPPORTED_ENTRY = _UNSUPPORTED | w32.ATTRIBUTE_RECALL_ON_OPEN
 # Compared before and after a rename. Not ctime_ns: NTFS tunneling gives a name freed less than 15 s earlier the
@@ -57,7 +56,6 @@ _RENAMED_KEYS = frozenset({"kind", "device", "inode", "size", "mtime_ns", "nlink
 # Left out of records: Windows sets the archive bit when it renames a file (visible once the handle closes), and
 # NORMAL only means that no other attribute is set.
 _VOLATILE_ATTRIBUTES = w32.ATTRIBUTE_ARCHIVE | w32.FILE_ATTRIBUTE_NORMAL
-_STUCK = []
 
 
 def _platform_problem():
@@ -84,24 +82,19 @@ def capabilities() -> dict:
     available = problem is None
     return {"available": available, "platform": "windows", "adapter": ADAPTER, "reason": problem,
             "pinning": available, "pinning_scope": "selected-root-ancestry-for-the-root-lifetime-and-file-per-operation",
-            "filesystem": "ntfs-sources", "move_noreplace": available, "remove_exact_file": available,
-            "remove_file": available, "mkdir": available, "create_file": available, "read_bytes": available,
-            "stream_to": available, "stream_max_bytes": MAX_STREAM_BYTES if available else 0,
+            "filesystem": "ntfs-sources", "move_noreplace": available, "remove_exact_file": available, "remove_file": available,
+            "mkdir": available, "create_file": available, "read_bytes": available, "stream_to": available,
+            "stream_max_bytes": MAX_STREAM_BYTES if available else 0,
             "max_read_bytes": LEGACY_MAX_BYTES if available else 0, "quiet_workspace_required": True}
 
 
 def process_is_elevated() -> bool:
-    """True when this process runs elevated (assessment #49; the plan's RET leaf wires the refusal of changes)."""
+    """True when this process runs elevated (the service refuses changes then)."""
     _require_platform()
     try:
         return w32.token_elevated()
     except OSError:
         raise CapabilityHold("native-security-context-unavailable", "The process token could not be read") from None
-
-
-def shutdown_worker() -> bool:
-    """True when no file call of any root is still running past its deadline (the handoff asks before it runs)."""
-    return not any(thread.busy() for thread in _STUCK)
 
 
 def _ns(filetime):
@@ -114,12 +107,14 @@ def _sorted_names(names):
 
 
 def _native(code, function, *args):
-    """Call a win32_files function; an OSError becomes a categorical refusal (a full disk keeps its own code)."""
+    """Call a win32_files function; an OSError becomes a categorical refusal (a full disk and a locked read keep their own)."""
     try:
         return function(*args)
     except OSError as error:
         if error.winerror == w32.ERROR_DISK_FULL:
             raise ScopedFSError("disk-full", "The drive is full") from None
+        if error.winerror == w32.ERROR_LOCK_VIOLATION and code == "read-failed":  # a byte range another program locked
+            raise _open_refusal(error) from None
         raise ScopedFSError(code, f"Windows error {error.winerror}") from None
 
 
@@ -137,9 +132,9 @@ def _open_refusal(error):
 
 
 def _volume_facts(handle, drive):
-    """Default volume-information source: file system name and drive type of the root's volume."""
+    """Default volume-information source: file system name, drive type and whether the disk is removable (None: unknown)."""
     _serial, filesystem, _flags = w32.volume_information(handle)
-    return {"filesystem": filesystem, "drive_type": w32.drive_type(drive)}
+    return {"filesystem": filesystem, "drive_type": w32.drive_type(drive), "removable": w32.drive_removable(drive)}
 
 
 def _root_path(root):
@@ -229,17 +224,15 @@ class _IoThread:
         try:
             finished = job.done.wait(seconds)
         except BaseException:
-            # Let the call hand its new handles to their owner before the caller unwinds (M2).
+            # Let the call hand its new handles to their owner before the caller unwinds (M2); drop its refusal (no cycle).
             job.done.wait(seconds)
+            job.error = None
             raise
         if not finished:
             self.poisoned = True
-            try:
+            with suppress(OSError):
                 w32.cancel_synchronous_io(self._handle)
-            except OSError:
-                pass
-            if not job.done.wait(CANCEL_SECONDS):
-                _STUCK.append(self)
+            job.done.wait(CANCEL_SECONDS)  # a call that ignores the cancellation keeps busy() True until it returns
             raise CapabilityHold("io-unresolved", "A file operation did not finish before its deadline; its outcome is unknown")
         # Only a call that outlived its deadline keeps its arguments (and the caller's buffers) alive.
         job.args = job.kwargs = None
@@ -405,7 +398,7 @@ class WindowsRoot(scoped_base.RootBase):
         _refuse_impersonation()
         self.max_entries = scoped_base.cap(max_entries, MAX_ENTRIES, "max_entries")
         self._dos = _root_path(root)
-        self._drive = self._dos[:3]
+        self.root, self._drive = Path(self._dos), self._dos[:3]
         self._volumes = _volume_facts if volumes is None else volumes
         self._closed = True
         self._pins = ExitStack()
@@ -443,11 +436,12 @@ class WindowsRoot(scoped_base.RootBase):
             if filesystem != "NTFS":
                 refuse("ntfs-required", "Sources must be on an NTFS drive")
         else:
+            # Private, with stable ids, only on NTFS on a disk proven built in: unknown removability is not private.
             usable = kind in (w32.DRIVE_FIXED, w32.DRIVE_REMOVABLE) and filesystem in ("NTFS", "exFAT", "FAT32")
-            volume = ("unsupported" if not usable else "fat32" if filesystem == "FAT32"
-                      else "private" if kind == w32.DRIVE_FIXED and filesystem == "NTFS" else "non-private")
+            volume = ("unsupported" if not usable else "fat32" if filesystem == "FAT32" else "private"
+                      if kind == w32.DRIVE_FIXED and facts.get("removable") is False and filesystem == "NTFS" else "non-private")
             vars(self).update(scoped_base.destination_facts(volume, non_private_destination=destination,
-                                                           stable_ids=filesystem == "NTFS"))
+                                                           stable_ids=volume == "private"))
         self._filesystem = filesystem
         path, handle = self._drive.rstrip("\\"), drive
         for part in self._dos[3:].split("\\"):
@@ -638,10 +632,10 @@ class WindowsRoot(scoped_base.RootBase):
                 reason = scoped_base.name_reason(relative, name)
                 if reason is None and w32.utf16_units(path) + 1 + w32.utf16_units(name) > MAX_PATH_CHARS:
                     reason = "path-too-long"
+                elif reason is None and attributes[name][0] & _UNSUPPORTED_ENTRY:  # first: a placeholder is also a reparse point
+                    reason = "special" if attributes[name][0] & w32.ATTRIBUTE_ENCRYPTED else "online-only"
                 elif reason is None and attributes[name][0] & w32.ATTRIBUTE_REPARSE_POINT:
                     reason = "link"
-                elif reason is None and attributes[name][0] & _UNSUPPORTED_ENTRY:
-                    reason = "special"
                 elif reason is None and len(keys[pc_paths.casefold_key(name)]) > 1:
                     reason = "case-collision"
                 if reason is None:
@@ -691,10 +685,10 @@ class WindowsRoot(scoped_base.RootBase):
                 refuse("directory-membership-changed", "A listed entry was replaced before it was opened")
             if w32.file_type(handle) != w32.FILE_TYPE_DISK:
                 return "special"
+            if info.attributes & _UNSUPPORTED:
+                return "special" if info.attributes & w32.ATTRIBUTE_ENCRYPTED else "online-only"
             if info.attributes & w32.ATTRIBUTE_REPARSE_POINT:
                 return "link"
-            if info.attributes & _UNSUPPORTED:
-                return "special"
             if not info.attributes & w32.ATTRIBUTE_DIRECTORY and info.links != 1:
                 return "hard-link"
             return self._record(relative, info)
@@ -894,20 +888,25 @@ class WindowsRoot(scoped_base.RootBase):
         return {**expected, "sha256": observed}
 
     def _dispose(self, handle, allow_read_only):
-        try:
+        # POSIX semantics drop the name when this handle closes (S2); FAT and exFAT refuse them: delete at last close then.
+        flags = w32.DISPOSITION_DELETE | w32.DISPOSITION_POSIX_SEMANTICS | (w32.DISPOSITION_IGNORE_READONLY if allow_read_only else 0)
+        for dispose in (lambda: w32.set_disposition(handle, flags), lambda: w32.delete_on_close(handle)):
+            with suppress(OSError):
+                return dispose()
             if self._filesystem == "NTFS":
-                # POSIX semantics: the name goes when this handle closes, even if others hold attribute handles (S2).
-                flags = w32.DISPOSITION_DELETE | w32.DISPOSITION_POSIX_SEMANTICS
-                w32.set_disposition(handle, flags | (w32.DISPOSITION_IGNORE_READONLY if allow_read_only else 0))
-            else:
-                w32.delete_on_close(handle)
-        except OSError:
-            refuse("delete-refused", "The file could not be deleted")
+                break
+        refuse("delete-refused", "The file could not be deleted")
 
     def free_bytes(self) -> int:
         if self._closed:
             refuse("closed-root", "The selected root is closed")
         return self._io.call(_native, "free-space-unavailable", w32.free_bytes, self._drive)
+
+    def disk_space(self):
+        """(total bytes, bytes this user may use) of the root's volume."""
+        if self._closed:
+            refuse("closed-root", "The selected root is closed")
+        return self._io.call(_native, "free-space-unavailable", w32.disk_space, self._drive)
 
     def admit_new(self, relative, expected_bytes):
         super().admit_new(relative, expected_bytes)
@@ -915,25 +914,24 @@ class WindowsRoot(scoped_base.RootBase):
 
 
 def admit_destination(root, *, non_private_destination=False, volumes=None, max_entries=MAX_ENTRIES) -> WindowsRoot:
-    """Admit a backup destination (separate from source admission, plan RR2-4).
+    """Admit a backup destination (separate from source admission).
 
-    A fixed NTFS drive is admitted as private. A removable drive, or an exFAT or FAT32 drive, cannot keep
-    a backup private and is admitted only with ``non_private_destination=True`` (the owner's typed
-    acknowledgment of scoped_base.NON_PRIVATE_NOTE). Files on exFAT and FAT32 are bound by size and SHA-256 because
-    their ids are not stable, and FAT32 refuses files of 4 GiB or more (admit_new). Other drives are refused.
+    A fixed NTFS drive is admitted as private. A removable, exFAT or FAT32 drive cannot keep a backup private and needs
+    ``non_private_destination=True``, the acknowledgment of scoped_base.NON_PRIVATE_NOTE bound in the approved plan. Files
+    on exFAT and FAT32 are bound by size and SHA-256 (no stable ids); FAT32 refuses 4 GiB or more (admit_new). Others hold.
     """
     if type(non_private_destination) is not bool:
         refuse("invalid-option", "non_private_destination must be boolean")
     return WindowsRoot(root, max_entries=max_entries, volumes=volumes, _destination=non_private_destination)
 
 
-_LEGACY_REASONS = {"link": "reparse-point", "special": "offline-encrypted-or-recall-file", "hard-link": "hard-link",
-                   "not-portable": "invalid-path-component", "path-too-long": "path-too-long", "case-collision": "case-collision"}
+_LEGACY_REASONS = {"link": "reparse-point", "special": "offline-encrypted-or-recall-file", "online-only": "offline-encrypted-or-recall-file",
+                   "hard-link": "hard-link", "not-portable": "invalid-path-component", "path-too-long": "path-too-long", "case-collision": "case-collision"}
 
 
 class ScopedRoot:
-    """The selected-root calls scoped_fs and storage_ops make today, served by WindowsRoot until storage streams
-    through RootBase; in-memory reads and writes keep their 64 MiB bound."""
+    """The selected-root calls scoped_fs and storage_ops still make, served by WindowsRoot until their callers stream
+    through RootBase; in-memory reads and writes keep their LEGACY_MAX_BYTES bound."""
 
     def __init__(self, root, *, quiet_workspace, max_entries=MAX_ENTRIES):
         if quiet_workspace is not True:
@@ -996,4 +994,5 @@ class ScopedRoot:
         return self._root.move_to(relative, destination=destination._root, destination_relative=destination_relative, expected=expected)
 
     def remove_file(self, relative, *, expected):
-        self._root.remove_file(relative, expected=expected)
+        """As before: a file the expected (approved) record shows as read-only is removed too."""
+        self._root.remove_file(relative, expected=expected, allow_read_only=scoped_base.read_only(expected))

@@ -18,7 +18,9 @@ OUTPUT = str(ROOT / "work" / "test-fixtures" / "storage-contract" / "output")
 # Where each built permanent deletion's plan lists what it deletes: two items of 3 and 4 bytes.
 ROWS = {pc_records.ADAPTER_STORAGE_PURGE: {"receipt": {"records": [{"original": {"size": 3}}, {"original": {"size": 4}}]}},
         pc_records.ADAPTER_STORAGE_REMOVE_ORIGINALS: {"files": [{"size": 3}, {"size": 4}]},
-        pc_records.ADAPTER_STORAGE_DELETE_SELECTED: {"rows_file": {"row_count": 2, "row_bytes": 7}}}
+        pc_records.ADAPTER_STORAGE_DELETE_SELECTED: {"rows_file": {"row_count": 2, "row_bytes": 7}},
+        pc_records.ADAPTER_STORAGE_RETENTION_RELEASE: {"rows": [{"size": 3}, {"size": 4}]},
+        pc_records.ADAPTER_STORAGE_SESSION_RELEASE: {"rows": [{"size": 3}, {"size": 4}]}}
 
 
 def payload(adapter_id=pc_records.ADAPTER_STORAGE_BACKUP_CREATE, rows=None, **changes):
@@ -48,7 +50,7 @@ class StorageContractTests(unittest.TestCase):
         self.assertEqual(set(storage_contract.PLAN_KINDS), storage_ids)
         for adapter_id in storage_ids:
             self.assertEqual(storage_contract.plan_kind(adapter_id), storage_contract.PLAN_KINDS[adapter_id])
-        for other in ("package.upgrade", "system.reviewed_external", "storage.unknown", None, 3):
+        for other in ("package.upgrade", "system.repair", "storage.unknown", None, 3):
             with self.subTest(adapter_id=other):
                 self.refused(lambda: storage_contract.plan_kind(other), "unknown-adapter")
 
@@ -126,7 +128,7 @@ class ContractTests(unittest.TestCase):
     def test_permanent_loss_kinds_require_count_and_bytes(self):
         loss = {adapter_id for adapter_id in storage_contract.PLAN_KINDS
                 if "permanent_data_loss" in pc_records.ADAPTERS[adapter_id]["acknowledgments"]}
-        self.assertEqual(loss, set(ROWS) | {pc_records.ADAPTER_STORAGE_RETENTION_RELEASE, pc_records.ADAPTER_STORAGE_SESSION_RELEASE})
+        self.assertEqual(loss, set(ROWS))
         self.assertEqual(set(storage_contract.DELETION_SOURCES), set(ROWS))
         for adapter_id in sorted(ROWS):
             base = {key: value for key, value in payload(adapter_id).items() if key not in storage_contract.DELETION_FIELDS}
@@ -140,11 +142,10 @@ class ContractTests(unittest.TestCase):
                                 {"delete_count": 2, "delete_bytes": None}):
                     with self.subTest(adapter_id=adapter_id, changes=changes):
                         self.refused(dict(base, **changes))
-        # Retention and session release are refused until their family is built, whatever they carry.
+        # A release reads its own rows: another deletion's list counts for nothing.
         for adapter_id in (pc_records.ADAPTER_STORAGE_RETENTION_RELEASE, pc_records.ADAPTER_STORAGE_SESSION_RELEASE):
-            for value in (payload(adapter_id), payload(adapter_id, rows={"files": [{"size": 3}]}, delete_count=1, delete_bytes=3)):
-                with self.subTest(not_built=adapter_id):
-                    self.refused(value)
+            with self.subTest(other_list=adapter_id):
+                self.refused(payload(adapter_id, rows={"files": [{"size": 3}]}, delete_count=1, delete_bytes=3))
         # Every other storage kind carries neither field.
         for adapter_id in sorted(set(storage_contract.PLAN_KINDS) - loss):
             value = payload(adapter_id)
@@ -166,14 +167,23 @@ class ContractTests(unittest.TestCase):
         for adapter_id, extra in ((pc_records.ADAPTER_STORAGE_PURGE, {"rows_file": {"row_count": 1, "row_bytes": 0}}),
                                   (pc_records.ADAPTER_STORAGE_PURGE, {"files": [{"size": 0}]}),
                                   (pc_records.ADAPTER_STORAGE_DELETE_SELECTED, {"files": [{"size": 3}, {"size": 4}]}),
-                                  (pc_records.ADAPTER_STORAGE_REMOVE_ORIGINALS, {"rows_file": {"row_count": 2, "row_bytes": 7}})):
+                                  (pc_records.ADAPTER_STORAGE_REMOVE_ORIGINALS, {"rows_file": {"row_count": 2, "row_bytes": 7}}),
+                                  (pc_records.ADAPTER_STORAGE_RETENTION_RELEASE, {"files": [{"size": 3}, {"size": 4}]})):
             with self.subTest(adapter_id=adapter_id, extra=sorted(extra)):
                 self.refused(payload(adapter_id, rows={**ROWS[adapter_id], **extra}))
 
     def test_row_sizes_are_integers_of_zero_or_more(self):
-        for size in (-1, True, False, 1.5, "3", None):
+        # Sizes whose sum still equals the payload's bytes: only the per-row check can refuse them.
+        for adapter_id, rows, total in ((pc_records.ADAPTER_STORAGE_PURGE, {"receipt": {"records": [{"original": {"size": 8}}, {"original": {"size": -1}}]}}, 7),
+                                        (pc_records.ADAPTER_STORAGE_REMOVE_ORIGINALS, {"files": [{"size": 8}, {"size": -1}]}, 7),
+                                        (pc_records.ADAPTER_STORAGE_RETENTION_RELEASE, {"rows": [{"size": 8}, {"size": -1}]}, 7),
+                                        (pc_records.ADAPTER_STORAGE_DELETE_SELECTED, {"rows_file": {"row_count": 2, "row_bytes": -1}}, -1)):
+            with self.subTest(adapter_id=adapter_id, sizes="8 and -1"):
+                self.refused(payload(adapter_id, rows=rows, delete_count=2, delete_bytes=total))
+        for size in (True, False, 1.5, "3", None):
             for adapter_id, rows in ((pc_records.ADAPTER_STORAGE_PURGE, {"receipt": {"records": [{"original": {"size": 7}}, {"original": {"size": size}}]}}),
                                      (pc_records.ADAPTER_STORAGE_REMOVE_ORIGINALS, {"files": [{"size": 7}, {"size": size}]}),
+                                     (pc_records.ADAPTER_STORAGE_SESSION_RELEASE, {"rows": [{"size": 7}, {"size": size}]}),
                                      (pc_records.ADAPTER_STORAGE_DELETE_SELECTED, {"rows_file": {"row_count": 2, "row_bytes": size}})):
                 with self.subTest(adapter_id=adapter_id, size=size):
                     self.refused(payload(adapter_id, rows=rows, delete_count=2, delete_bytes=7))
@@ -182,6 +192,39 @@ class ContractTests(unittest.TestCase):
         for rows in ({"files": []}, {"files": {"size": 3}}, {}):
             with self.subTest(rows=rows):
                 self.refused(payload(pc_records.ADAPTER_STORAGE_REMOVE_ORIGINALS, rows=rows, delete_count=1, delete_bytes=0))
+
+
+
+class BackupPayloadTests(unittest.TestCase):
+    """The backup payload fields: an optional folder on another drive, only for a backup, exactly the plan's own."""
+
+    def check(self, value):
+        return storage_contract.validate_payload(value, adapter_id=value["operation"], mode="fixture",
+                                                 plan_sha256=pc_records.digest(value["storage_plan"]))
+
+    def test_backup_destination_is_there_exactly_when_the_plan_is_external(self):
+        elsewhere = str(ROOT / "work" / "test-fixtures" / "storage-contract" / "elsewhere")
+        rows = {"external": True, "destination": elsewhere}
+        value = payload(rows=rows, backup_destination=elsewhere)
+        self.assertIs(self.check(value), value)
+        # A backup in the owned output folder carries none; a plan without the fact is such a backup.
+        for plain in (payload(), payload(rows={"external": False, "destination": OUTPUT})):
+            self.assertIs(self.check(plain), plain)
+        self.assertLessEqual({"backup_destination", "restore_probe_destination"}, storage_contract.PAYLOAD_OPTIONAL)
+        self.assertNotIn("backup_destination", storage_contract.PAYLOAD_REQUIRED)
+        for changed in (payload(rows=rows),  # external, so its folder would be written without being reserved
+                        payload(rows={**rows, "external": 1}), payload(rows={**rows, "external": "true"}),
+                        payload(rows={**rows, "external": None}),
+                        payload(rows={**rows, "external": 1}, backup_destination=elsewhere),
+                        payload(rows={"external": False, "destination": elsewhere}, backup_destination=elsewhere),
+                        payload(backup_destination=elsewhere),
+                        payload(rows=rows, backup_destination=elsewhere + "-other"),
+                        payload(rows=rows, backup_destination="relative/folder"),
+                        payload(pc_records.ADAPTER_STORAGE_RESTORE, backup_destination=elsewhere),
+                        payload(pc_records.ADAPTER_STORAGE_PURGE, backup_destination=elsewhere)):
+            with self.subTest(changed=changed), self.assertRaises(pc_records.Refusal) as caught:
+                self.check(changed)
+            self.assertEqual(caught.exception.code, "storage-payload")
 
 
 if __name__ == "__main__":

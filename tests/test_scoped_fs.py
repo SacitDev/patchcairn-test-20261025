@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import shutil
 import stat
+import subprocess
 import sys
 import types
 import unittest
@@ -177,11 +178,11 @@ class InjectedPlatformTests(unittest.TestCase):
             with self.subTest(errno=number):
                 self.assertEqual(fs._refusal(OSError(number, "fictional"), "read-failed").code, code)
 
-    def test_macos_dataless_placeholder_is_left_out_as_special(self):
+    def test_macos_dataless_placeholder_is_left_out_as_online_only(self):
         def entry(mode, flags, nlink=1):
             return types.SimpleNamespace(st_mode=mode, st_nlink=nlink, st_flags=flags)
-        self.assertEqual(fs._left_out(entry(stat.S_IFREG | 0o600, 0x40000000)), "special")
-        self.assertEqual(fs._left_out(entry(stat.S_IFDIR | 0o700, 0x40000000, 2)), "special")
+        self.assertEqual(fs._left_out(entry(stat.S_IFREG | 0o600, 0x40000000)), "online-only")
+        self.assertEqual(fs._left_out(entry(stat.S_IFDIR | 0o700, 0x40000000, 2)), "online-only")
         self.assertIsNone(fs._left_out(entry(stat.S_IFREG | 0o600, stat.UF_HIDDEN)))
         self.assertEqual(fs._left_out(entry(stat.S_IFLNK | 0o777, 0x40000000)), "link")
 
@@ -308,7 +309,15 @@ class InjectedPlatformTests(unittest.TestCase):
             self.assertEqual(fs.disk_relation(Root(1), Root(3), sysfs=sysfs), "unknown")
             self.assertEqual(fs.disk_relation(Root(3), Root(3)), "same")
         with mock.patch.object(fs.os, "name", "nt"):
-            self.assertEqual(fs.disk_relation(Root(1), Root(1)), "unknown")
+            self.assertEqual(fs.disk_relation(Root(1), Root(1), sysfs=mock.Mock(side_effect=AssertionError)), "same")
+            numbers = {1: frozenset({0}), 2: frozenset({1}), 3: frozenset({0, 1}), 4: None}
+            for first, second, relation in ((1, 2, "different"), (1, 3, "same"), (1, 4, "unknown")):
+                with self.subTest(windows=(first, second)):
+                    self.assertEqual(fs.disk_relation(Root(first), Root(second), sysfs=lambda root: numbers[root.device]), relation)
+            with mock.patch.object(fs.win32_files, "disk_numbers", side_effect=lambda drive: frozenset({0}) if drive == "C:\\" else frozenset({1})):
+                first, second = Root(1), Root(2)
+                first.root, second.root = Path("C:\\work"), Path("D:\\backups")
+                self.assertEqual(fs.disk_relation(first, second), "different")  # the default: each root's drive
 
     def test_windows_entry_points_delegate_to_windows_scoped(self):
         adapter, root, removal = mock.Mock(), mock.Mock(), mock.Mock()
@@ -323,6 +332,13 @@ class InjectedPlatformTests(unittest.TestCase):
                                              removal=removal, removal_name="unused"), root.remove_file.return_value)
             root.remove_file.assert_called_once_with("a.txt", expected={"fictional": 1}, sha256="b" * 64, allow_read_only=True)
             self.assertEqual(removal.method_calls, [])
+            # Without the in-place fallback Windows refuses: the caller deletes on the handle itself.
+            with self.assertRaises(fs.ScopedFSError) as caught:
+                fs.remove_original(root, "a.txt", expected={"fictional": 1}, removal=removal, removal_name="unused", in_place_fallback=False)
+            self.assertEqual(caught.exception.code, "same-volume-required")
+            root.remove_file.assert_called_once()
+            self.assertIs(fs.open_root("C:\\fictional", max_entries=5), adapter.WindowsRoot.return_value)
+            adapter.WindowsRoot.assert_called_once_with("C:\\fictional", max_entries=5)
         with mock.patch.object(fs.os, "name", "nt"), mock.patch.dict(sys.modules, {"windows_scoped": None}):
             for call in (lambda: fs.admit_destination("C:\\fictional"), fs.process_is_elevated):
                 with self.assertRaises(fs.CapabilityHold) as caught:
@@ -348,12 +364,51 @@ class InjectedPlatformTests(unittest.TestCase):
             self.assertIs(fs.remove_original(root, "a.txt", expected={"fictional": 1}, in_place=True),
                           root.remove_file.return_value)
             root.remove_file.assert_called_once_with("a.txt", expected={"fictional": 1}, sha256=None, allow_read_only=False)
+            for options in ({"in_place": True, "in_place_fallback": False}, {"in_place": True, "in_place_fallback": 0}):
+                with self.subTest(options=options), self.assertRaises(fs.ScopedFSError) as caught:
+                    fs.remove_original(root, "a.txt", expected={"fictional": 1}, **options)
+                self.assertEqual(caught.exception.code, "invalid-option")
+            root.remove_file.assert_called_once()
             for removal in (object(), root):
                 with self.subTest(removal=removal):
                     with self.assertRaises(fs.ScopedFSError) as caught:
                         fs.remove_original(root, "a.txt", expected={"fictional": 1}, removal=removal,
                                            removal_name=fs.new_removal_name())
                     self.assertEqual(caught.exception.code, "removal-folder")
+
+    def test_without_fallback_a_root_that_is_not_posix_refuses_on_every_system(self):
+        root, removal = mock.Mock(), mock.Mock()
+        for os_name in ("posix", "nt"):
+            with self.subTest(os_name=os_name), mock.patch.object(fs.os, "name", os_name), \
+                    mock.patch.object(fs, "_removal_name", side_effect=lambda folder, name: name):
+                with self.assertRaises(fs.ScopedFSError) as caught:
+                    fs.remove_original(root, "a.txt", expected={"fictional": 1}, removal=removal, removal_name=fs.new_removal_name(),
+                                       in_place_fallback=False)
+                self.assertEqual(caught.exception.code, "same-volume-required")
+        root.remove_file.assert_not_called()
+        self.assertEqual(removal.method_calls, [])
+
+    def test_reconcile_removal_holds_typed_without_a_posix_removal_folder(self):
+        # Windows deletes each original on its own handle and never uses a removal folder: nothing to reconcile.
+        for os_name in ("posix", "nt"):
+            with self.subTest(os_name=os_name), mock.patch.object(fs.os, "name", os_name), self.assertRaises(fs.ScopedFSError) as caught:
+                fs.reconcile_removal(mock.Mock(), expected={"fictional": 1}, removal_name=fs.new_removal_name())
+            self.assertEqual(caught.exception.code, "removal-folder")
+
+    def test_volume_identity_and_open_root_dispatch(self):
+        with mock.patch.object(fs.os, "name", "posix"), mock.patch.object(fs.sys, "platform", "linux"), \
+                mock.patch.object(fs.linux_privacy, "volume_identity", return_value="linux-volume:ABCD") as linux:
+            self.assertEqual(fs.volume_identity(Path("/fictional")), "linux-volume:ABCD")
+            linux.assert_called_once_with(str(Path("/fictional")))
+        with mock.patch.object(fs.os, "name", "posix"), mock.patch.object(fs.sys, "platform", "darwin"), \
+                mock.patch.object(fs.darwin_privacy, "volume_identity", return_value=None):
+            self.assertIsNone(fs.volume_identity("/fictional"))
+        with mock.patch.object(fs.os, "name", "nt"), mock.patch.object(fs.win32_files, "volume_identity", return_value="windows:NTFS:1") as win:
+            self.assertEqual(fs.volume_identity("C:\\fictional"), "windows:NTFS:1")
+            win.assert_called_once_with("C:\\fictional")
+        with mock.patch.object(fs.os, "name", "posix"), mock.patch.object(fs, "PosixRoot") as posix:
+            self.assertIs(fs.open_root("/fictional"), posix.return_value)
+            posix.assert_called_once_with("/fictional", max_entries=fs.MAX_ENTRIES)
 
 
 @unittest.skipUnless(fs._posix_capable(), "only on posix: native POSIX no-follow/dir-fd support is required")
@@ -369,6 +424,8 @@ class PosixTests(unittest.TestCase):
         (self.source / "a.txt").write_bytes(b"Fictional bounded content\n")
         self.fs = fs.ScopedRoot(self.source, quiet_workspace=True)
         self.addCleanup(self.fs.close)
+        self.root = fs.PosixRoot(str(self.source))
+        self.addCleanup(self.root.close)
 
     def hashed(self, relative="a.txt"):
         return self.fs.inspect(relative, hash_file=True, max_bytes=1024)
@@ -389,20 +446,17 @@ class PosixTests(unittest.TestCase):
         with mock.patch.object(fs.os, "readv", side_effect=AssertionError("content read")):
             rows = self.fs.list_directory()
             self.assertEqual([r["relative_path"] for r in rows], ["a.txt", "protected"])
-            rows = self.fs.snapshot()
+            rows = self.root.snapshot()
             self.assertEqual([r["relative_path"] for r in rows], ["", "a.txt", "protected", "protected/unopened.txt"])
 
-    def test_hash_snapshot_file_and_total_caps(self):
-        with self.assertRaises(fs.ScopedFSError):
-            self.fs.snapshot(hash_files=True, max_file_bytes=2)
+    def test_hash_snapshot_hashes_every_file(self):
         (self.source / "b.txt").write_bytes(b"more fictional bytes")
-        with self.assertRaises(fs.ScopedFSError):
-            self.fs.snapshot(hash_files=True, max_total_bytes=30)
-        self.assertTrue(all(r["sha256"] for r in self.fs.snapshot(hash_files=True) if r["kind"] == "file"))
+        self.assertTrue(all(r["sha256"] for r in self.root.snapshot(hash_files=True) if r["kind"] == "file"))
+        self.assertFalse(hasattr(fs.ScopedRoot, "snapshot") or hasattr(fs.ScopedRoot, "stream_to"))
 
     def test_entry_and_depth_caps(self):
         (self.source / "b.txt").write_bytes(b"second fictional entry")  # the cap counts entries, not the root
-        with fs.ScopedRoot(self.source, quiet_workspace=True, max_entries=1) as tiny:
+        with fs.PosixRoot(str(self.source), max_entries=1) as tiny:
             with self.assertRaises(fs.ScopedFSError):
                 tiny.snapshot()
         with self.assertRaises(fs.ScopedFSError):
@@ -421,11 +475,11 @@ class PosixTests(unittest.TestCase):
     def test_stream_uses_chunks_and_checks_consumer(self):
         row = self.hashed()
         sink = io.BytesIO()
-        actual = self.fs.stream_to("a.txt", expected=row, writer=sink.write, max_bytes=1024, chunk_size=4)
+        actual = self.root.stream_to("a.txt", expected=row, writer=sink.write)
         self.assertEqual(actual, row)
         self.assertEqual(sink.getvalue(), b"Fictional bounded content\n")
         with self.assertRaises(fs.ScopedFSError) as caught:
-            self.fs.stream_to("a.txt", expected=row, writer=lambda _: 0, max_bytes=1024)
+            self.root.stream_to("a.txt", expected=row, writer=lambda _: 0)
         self.assertEqual(caught.exception.code, "short-write")
 
     def test_growth_during_read_refuses_even_if_cap_remains(self):
@@ -438,7 +492,7 @@ class PosixTests(unittest.TestCase):
                 with (self.source / "a.txt").open("ab") as out:
                     out.write(b"fictional growth")
         with self.assertRaises(fs.ScopedFSError) as caught:
-            self.fs.stream_to("a.txt", expected=row, writer=append, max_bytes=1024, chunk_size=4)
+            self.root.stream_to("a.txt", expected=row, writer=append)
         self.assertIn(caught.exception.code, {"read-growth", "read-drift"})
 
     def test_same_size_content_change_during_read_refuses(self):
@@ -454,7 +508,7 @@ class PosixTests(unittest.TestCase):
                 # An explicit time, never the clock (D-056): a write in the same clock tick keeps the old one.
                 os.utime(self.source / "a.txt", ns=(info.st_atime_ns, info.st_mtime_ns + 10 ** 9))
         with self.assertRaises(fs.ScopedFSError):
-            self.fs.stream_to("a.txt", expected=row, writer=modify, max_bytes=1024, chunk_size=4)
+            self.root.stream_to("a.txt", expected=row, writer=modify)
 
     def test_stale_replaced_identity_refuses_read_move_and_remove(self):
         row = self.hashed()
@@ -591,14 +645,12 @@ class PosixTests(unittest.TestCase):
         excluded = []
         self.assertEqual([row["relative_path"] for row in self.fs.list_directory(excluded=excluded)], ["a.txt"])
         self.assertEqual(excluded, [{"parent": "", "name": "alias", "reason": "link"}])
-        # Without ``excluded`` (a folder PatchCairn owns) the unknown entry refuses the listing and the snapshot.
-        for call in (self.fs.list_directory, self.fs.snapshot):
-            with self.subTest(call=call.__name__):
-                with self.assertRaises(fs.ScopedFSError) as caught:
-                    call()
-                self.assertEqual(caught.exception.code, "link")
+        # Without ``excluded`` (a folder PatchCairn owns) the unknown entry refuses the listing.
+        with self.assertRaises(fs.ScopedFSError) as caught:
+            self.fs.list_directory()
+        self.assertEqual(caught.exception.code, "link")
         snapped = []
-        self.assertEqual([row["relative_path"] for row in self.fs.snapshot(excluded=snapped)], ["", "a.txt"])
+        self.assertEqual([row["relative_path"] for row in self.fs._root.snapshot(excluded=snapped)], ["", "a.txt"])
         self.assertEqual(snapped, [{"parent": "", "name": "alias", "reason": "link"}])
         for relative in ("alias", "alias/escape.txt"):
             with self.subTest(relative=relative), self.assertRaises(fs.ScopedFSError):
@@ -654,7 +706,7 @@ class PosixTests(unittest.TestCase):
             with self.subTest(name=name), self.assertRaises(fs.ScopedFSError):
                 self.fs.inspect(name)
         snapshot_excluded = []
-        self.assertEqual([row["relative_path"] for row in self.fs.snapshot(excluded=snapshot_excluded)], ["", "a.txt", "ok.txt"])
+        self.assertEqual([row["relative_path"] for row in self.fs._root.snapshot(excluded=snapshot_excluded)], ["", "a.txt", "ok.txt"])
         self.assertEqual(sorted(row["name"] for row in snapshot_excluded), ["What now?.txt", "lpt0.log"])
 
     def test_path_beyond_portable_limit_is_left_out_and_never_admitted(self):
@@ -669,7 +721,7 @@ class PosixTests(unittest.TestCase):
             self.fs.inspect(long_path)
         self.assertEqual(caught.exception.code, "path-too-long")
         excluded = []
-        rows = self.fs.snapshot(excluded=excluded)
+        rows = self.fs._root.snapshot(excluded=excluded)
         self.assertNotIn(long_path, [row["relative_path"] for row in rows])
         self.assertEqual(excluded, [{"parent": "d" * 120, "name": "e" * 90, "reason": "path-too-long"}])
 
@@ -744,7 +796,7 @@ class PosixRootTests(unittest.TestCase):
                         self.root.inspect(relative)
                     self.assertEqual(caught.exception.code, "filesystem-boundary")
 
-    def test_macos_placeholder_is_listed_as_special_and_never_opened(self):
+    def test_macos_placeholder_is_listed_as_online_only_and_never_opened(self):
         (self.base / "selected" / "placeholder.txt").write_bytes(b"fictional")
         record = self.root.inspect("placeholder.txt", hash_file=True)
         real_open = os.open
@@ -755,7 +807,7 @@ class PosixRootTests(unittest.TestCase):
         with self.patched_stat("placeholder.txt", st_flags=lambda info: 0x40000000), mock.patch.object(fs.os, "open", opener):
             excluded = []
             self.assertEqual(self.root.list_directory(excluded=excluded), [])
-            self.assertEqual(excluded, [{"parent": "", "name": "placeholder.txt", "reason": "special"}])
+            self.assertEqual(excluded, [{"parent": "", "name": "placeholder.txt", "reason": "online-only"}])
             for call in (lambda: self.root.inspect("placeholder.txt", hash_file=True),
                          lambda: self.root.open_read("placeholder.txt", expected=record).__enter__(),
                          lambda: self.root.remove_file("placeholder.txt", expected=record)):
@@ -817,6 +869,7 @@ class PosixRootTests(unittest.TestCase):
                 with self.assertRaises(fs.ScopedFSError) as caught:
                     call()
                 self.assertEqual(caught.exception.code, code)
+                self.assertIn("has, or may have, an access control list", str(caught.exception))
             self.assertEqual(self.names(), [])
             self.assertEqual(held, [(int, False, 0o600), (int, True, 0o700)])
             checker.side_effect = None
@@ -934,9 +987,188 @@ class PosixRootTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(record["mode"]) & 0o777, 0o700)
 
     def test_free_bytes_come_from_fstatvfs_on_the_root(self):
-        with mock.patch.object(fs.os, "fstatvfs", return_value=types.SimpleNamespace(f_bavail=3, f_frsize=4096)) as query:
+        with mock.patch.object(fs.sys, "platform", "linux"), \
+                mock.patch.object(fs.os, "fstatvfs", return_value=types.SimpleNamespace(f_blocks=9, f_bavail=3, f_frsize=4096)) as query:
             self.assertEqual(self.root.free_bytes(), 3 * 4096)
-        query.assert_called_once_with(self.root._fd)
+            self.assertEqual(self.root.disk_space(), (9 * 4096, 3 * 4096))
+        query.assert_called_with(self.root._fd)
+        # macOS reads the 64-bit fstatfs counts, which statvfs there truncates to 32 bits.
+        with mock.patch.object(fs.sys, "platform", "darwin"), \
+                mock.patch.object(fs.darwin_privacy, "disk_space", return_value=(1 << 45, 1 << 44)) as darwin:
+            self.assertEqual(self.root.disk_space(), (1 << 45, 1 << 44))
+            self.assertEqual(self.root.free_bytes(), 1 << 44)
+        darwin.assert_called_with(self.root._fd)
+
+    @unittest.skipUnless(sys.platform == "darwin", "only on macos: an extended ACL can only be made with chmod +a there")
+    def test_macos_acl_on_a_work_folder_holds(self):
+        """An ACL entry added with chmod +a makes the descriptor check hold darwin-acl-not-empty and the owner-only check
+        say why (its evidence is the macos-latest CI legs)."""
+        folder = self.base / "selected" / "acl-folder"
+        folder.mkdir(mode=0o700)
+        # Runs before the fixture's rmtree (cleanups run last added first): the entry denies delete to the owner too.
+        self.addCleanup(subprocess.run, ["chmod", "-N", str(folder)], check=True, capture_output=True)
+        subprocess.run(["chmod", "+a", "everyone deny delete", str(folder)], check=True, capture_output=True, encoding="utf-8")
+        descriptor = os.open(folder, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            with self.assertRaises(fs.darwin_privacy.DarwinPrivacyHold) as caught:
+                fs.darwin_privacy.assert_no_extended_acl_fd(descriptor)
+            self.assertEqual(caught.exception.code, "darwin-acl-not-empty")
+            with self.assertRaises(fs.ScopedFSError) as caught:
+                fs.PosixRoot._owner_only(descriptor, 0o700, "new-private-directory-security-unresolved")
+            self.assertIn("has, or may have, an access control list", str(caught.exception))
+        finally:
+            os.close(descriptor)
+
+
+class ReservedNameFallbackTests(unittest.TestCase):
+    """_call_rename on a drive that refuses the exclusive rename, with the system calls replaced so that it runs everywhere:
+    only a new file on a drive that keeps nothing private, and only macOS's ENOTSUP, takes the name first."""
+
+    def setUp(self):
+        self.names, self.calls = {"source": b"written"}, []
+
+    def fake_os(self, *, rename_error=None):
+        names, calls = self.names, self.calls
+
+        def create(name, flags, mode, *, dir_fd):
+            calls.append(("open", name, flags, mode, dir_fd))
+            if name in names:
+                raise FileExistsError(errno.EEXIST, "fictional")
+            names[name] = b""
+            return 7
+
+        def rename(source, target, *, src_dir_fd, dst_dir_fd):
+            calls.append(("rename", source, target, src_dir_fd, dst_dir_fd))
+            if rename_error is not None:
+                raise rename_error
+            names[target] = names.pop(source)
+
+        def unlink(name, *, dir_fd):
+            calls.append(("unlink", name, dir_fd))
+            del names[name]
+        return types.SimpleNamespace(name="posix", fsencode=os.fsencode, open=create, close=lambda fd: calls.append(("close", fd)),
+                                     rename=rename, unlink=unlink, O_WRONLY=1, O_CREAT=2, O_EXCL=4, O_NOFOLLOW=8)
+
+    def call(self, *, reserve=True, platform="darwin", error=errno.ENOTSUP, rename_error=None):
+        fake = self.fake_os(rename_error=rename_error)
+        with mock.patch.object(fs, "os", fake), mock.patch.object(fs.darwin_privacy, "os", fake), \
+                mock.patch.object(fs, "sys", types.SimpleNamespace(platform=platform)), \
+                mock.patch.object(fs.ctypes, "get_errno", return_value=error):
+            return fs._call_rename(lambda *args: -1, 3, "source", 3, "target", reserve=reserve)
+
+    def test_the_name_is_taken_exclusively_then_replaced(self):
+        self.call()
+        self.assertEqual(self.names, {"target": b"written"})
+        self.assertEqual(self.calls, [("open", "target", 1 | 2 | 4 | 8, 0o600, 3), ("close", 7),
+                                      ("rename", "source", "target", 3, 3)])
+
+    def test_an_existing_name_is_never_replaced(self):
+        self.names["target"] = b"what was there"
+        with self.assertRaises(fs.ScopedFSError) as caught:
+            self.call()
+        self.assertEqual(caught.exception.code, "destination-exists")
+        self.assertEqual(self.names, {"source": b"written", "target": b"what was there"})
+        self.assertFalse([call for call in self.calls if call[0] == "rename"])
+
+    def test_a_failed_rename_gives_the_name_back(self):
+        with self.assertRaises(fs.ScopedFSError) as caught:
+            self.call(rename_error=OSError(errno.EIO, "fictional"))
+        self.assertEqual(caught.exception.code, "rename-refused-no-overwrite")
+        self.assertEqual(self.names, {"source": b"written"})
+
+    def test_the_fallback_is_only_for_a_not_private_drive_on_macos_enotsup(self):
+        for options in ({"reserve": False}, {"platform": "linux"}, {"error": errno.EINVAL}, {"error": errno.ENOSYS}):
+            with self.subTest(options=options), self.assertRaises(fs.CapabilityHold) as caught:
+                self.call(**options)
+            self.assertEqual(caught.exception.code, "no-replace-unavailable")
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.names, {"source": b"written"})
+
+    def test_a_rename_that_works_takes_no_name_first(self):
+        fake = self.fake_os()
+        with mock.patch.object(fs, "os", fake), mock.patch.object(fs, "sys", types.SimpleNamespace(platform="darwin")):
+            fs._call_rename(lambda *args: 0, 3, "source", 3, "target", reserve=True)
+        self.assertEqual(self.calls, [])
+
+
+@unittest.skipUnless(os.name == "posix", "only on posix: PosixRoot runs on POSIX descriptors")
+class ReservedNameOnRealFoldersTests(unittest.TestCase):
+    """The whole commit on a real folder, as macOS does it on exFAT: renameatx_np is faked to refuse, everything else is real."""
+
+    def setUp(self):
+        self.base = ROOT / "work" / "test-fixtures" / "filesystem" / ("reserved-" + uuid.uuid4().hex)
+        self.base.mkdir(parents=True)
+        self.addCleanup(shutil.rmtree, self.base)
+        patches = (mock.patch.object(fs.sys, "platform", "darwin"), mock.patch.object(fs, "_rename_function", lambda: refusing_rename(errno.ENOTSUP)),
+                   mock.patch.object(fs.darwin_privacy, "assert_no_extended_acl_fd"))
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def admitted(self, filesystem, removable):
+        return fs.admit_destination(str(self.base), non_private_destination=True,
+                                    volumes=lambda fd: {"filesystem": filesystem, "removable": removable})
+
+    def test_a_drive_that_keeps_nothing_private_admits_and_commits(self):
+        with self.admitted("exfat", True) as root:
+            self.assertIs(root.private, False)
+            with root.open_new("kept.txt") as out:
+                out.write(b"fictional")
+                record = out.commit()
+            self.assertEqual(record["size"], 9)
+            self.assertEqual(sorted(os.listdir(self.base)), ["kept.txt"])
+            self.assertEqual((self.base / "kept.txt").read_bytes(), b"fictional")
+            (self.base / "other.txt").write_bytes(b"what was there")
+            with self.assertRaises(fs.ScopedFSError) as caught, root.open_new("other.txt"):
+                pass
+            self.assertEqual(caught.exception.code, "destination-exists")
+        self.assertEqual((self.base / "other.txt").read_bytes(), b"what was there")
+
+    def test_a_private_drive_never_falls_back(self):
+        with self.assertRaises(fs.CapabilityHold) as caught:
+            self.admitted("native", False)
+        self.assertEqual(caught.exception.code, "no-replace-unavailable")
+        self.assertEqual(os.listdir(self.base), [])
+
+    def test_a_move_never_falls_back(self):
+        with self.admitted("exfat", True) as root:
+            with root.open_new("kept.txt") as out:
+                out.write(b"fictional")
+                out.commit()
+            with self.assertRaises(fs.CapabilityHold) as caught:
+                root.move_to("kept.txt", destination=root, destination_relative="moved.txt", expected=root.inspect("kept.txt", hash_file=True))
+        self.assertEqual(caught.exception.code, "no-replace-unavailable")
+        self.assertEqual(sorted(os.listdir(self.base)), ["kept.txt"])
+
+
+class ExfatImageTests(unittest.TestCase):
+    """A real exFAT volume. This test first runs on the macos-latest CI legs: nothing here has been observed on a Mac yet."""
+
+    def attach(self, filesystem):
+        """A small ``filesystem`` image under this test's own work folder, attached with no Finder window; its mount point."""
+        base = ROOT / "work" / "test-fixtures" / "filesystem" / ("image-" + uuid.uuid4().hex)
+        (base / "mounted").mkdir(parents=True)
+        self.addCleanup(shutil.rmtree, base)
+        image = base / "fictional.dmg"
+        subprocess.run(["/usr/bin/hdiutil", "create", "-size", "16m", "-fs", filesystem, "-volname", "PATCHCAIRN", str(image)],
+                       check=True, capture_output=True, timeout=120)
+        subprocess.run(["/usr/bin/hdiutil", "attach", str(image), "-nobrowse", "-mountpoint", str(base / "mounted")],
+                       check=True, capture_output=True, timeout=120)
+        self.addCleanup(subprocess.run, ["/usr/bin/hdiutil", "detach", str(base / "mounted"), "-force"], check=True, capture_output=True, timeout=120)
+        return base / "mounted"
+
+    @unittest.skipUnless(sys.platform == "darwin", "only on macos: hdiutil attaches disk images only there")
+    def test_macos_exfat_and_fat_images_admit_and_commit(self):
+        for filesystem in ("ExFAT", "MS-DOS"):
+            with self.subTest(filesystem=filesystem):
+                mounted = self.attach(filesystem)
+                with fs.admit_destination(str(mounted), non_private_destination=True) as root:
+                    self.assertIs(root.private, False)
+                    with root.open_new("kept.txt") as out:
+                        out.write(b"fictional")
+                        out.commit()
+                    self.assertEqual(root.inspect("kept.txt", hash_file=True)["size"], 9)
+                self.assertEqual((mounted / "kept.txt").read_bytes(), b"fictional")
 
 
 class Stopped(Exception):
@@ -1037,6 +1269,33 @@ class PosixRemovalTests(unittest.TestCase):
         with mock.patch.object(fs, "_rename_function", return_value=refusing):
             self.assertEqual(self.removed("kept.txt", kept, removal_name=fs.new_removal_name()), kept)
         refusing.assert_called_once()
+        self.assertEqual((os.listdir(self.base / "selected"), os.listdir(self.folder)), ([], []))
+
+    def test_remove_original_without_fallback_refuses_instead_of_deleting(self):
+        """Every route to the in-place delete refuses same-volume-required and deletes nothing."""
+        record = self.original("report.txt", b"fictional report")
+        # Another device.
+        self.removal._device = self.root._device + 1
+        with mock.patch.object(self.root, "remove_file", side_effect=AssertionError("deleted in place")):
+            with self.assertRaises(fs.ScopedFSError) as caught:
+                self.remove("report.txt", record, removal_name=fs.new_removal_name(), in_place_fallback=False)
+            self.assertEqual(caught.exception.code, "same-volume-required")
+            # EXDEV at the rename (a bind mount): nothing moved, nothing deleted.
+            self.removal._device = self.root._device
+            refusing = refusing_rename(errno.EXDEV)
+            with mock.patch.object(fs, "_rename_function", return_value=refusing):
+                with self.assertRaises(fs.ScopedFSError) as caught:
+                    self.remove("report.txt", record, removal_name=fs.new_removal_name(), in_place_fallback=False)
+            self.assertEqual(caught.exception.code, "same-volume-required")
+            refusing.assert_called_once()
+            # A root that is not a PosixRoot.
+            with self.assertRaises(fs.ScopedFSError) as caught:
+                fs.remove_original(mock.Mock(), "report.txt", expected=record, removal=self.removal,
+                                   removal_name=fs.new_removal_name(), in_place_fallback=False)
+            self.assertEqual(caught.exception.code, "same-volume-required")
+        self.assertEqual((os.listdir(self.base / "selected"), os.listdir(self.folder)), (["report.txt"], []))
+        # With the same device and a working rename the original goes through the removal folder as always.
+        self.assertEqual(self.removed("report.txt", record, removal_name=fs.new_removal_name(), in_place_fallback=False), record)
         self.assertEqual((os.listdir(self.base / "selected"), os.listdir(self.folder)), ([], []))
 
     def test_interrupted_removal_is_reconciled(self):

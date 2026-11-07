@@ -1,26 +1,34 @@
 """Mocked Apple ACL admission; no real ACL/permission mutation or Mac claim.
 
 Run: python -I -S -B tests/test_darwin_privacy.py
-The APIs and paths are mocked. Native macOS validation remains separate.
+The APIs and paths are mocked, apart from the tests marked "only on macos", whose first run is CI.
 """
 from __future__ import annotations
 
 from contextlib import ExitStack, contextmanager
 import ctypes
 import errno
+import os
 from pathlib import Path, PurePosixPath
+import plistlib
+import shutil
 import stat
+import subprocess
 import sys
 import traceback
 import types
 import unittest
 from unittest import mock
+import uuid
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).absolute().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
+import collect_macos
 import darwin_privacy as privacy
 import private_workspace as private
+import scoped_fs
+import storage_policy
 
 
 def info(**changes):
@@ -519,6 +527,92 @@ class DarwinFilesystemTests(unittest.TestCase):
 
     native_api = staticmethod(privacy._volume_api)
     native_descriptor = staticmethod(privacy._volume_descriptor)
+
+
+
+class DiskSpaceTests(unittest.TestCase):
+    """The drive line's total and free bytes come from the 64-bit fstatfs counts (os.statvfs on macOS has 32-bit ones)."""
+
+    def test_disk_space_uses_64bit_statfs_beyond_2_32_blocks(self):
+        def query(descriptor, pointer):
+            result = pointer._obj
+            result.f_bsize, result.f_blocks, result.f_bavail = 4096, (1 << 33) + 5, (1 << 32) + 7
+            return 0
+        total, free = privacy.disk_space(3, query=query)
+        self.assertEqual((total, free), (((1 << 33) + 5) * 4096, ((1 << 32) + 7) * 4096))
+        self.assertGreater(free, (1 << 32) * 4096)  # beyond what 32-bit block counts can say
+        for descriptor in (-1, "3", True):
+            with self.subTest(descriptor=descriptor), self.assertRaises(privacy.DarwinPrivacyHold):
+                privacy.disk_space(descriptor, query=query)
+        with self.assertRaises(privacy.DarwinPrivacyHold) as caught:
+            privacy.disk_space(3, query=lambda descriptor, pointer: -1)
+        self.assertEqual(caught.exception.code, "darwin-fs-query-unavailable")
+
+    def test_volume_identity_is_the_volume_uuid_of_the_mount_point(self):
+        value = bytes(range(1, 17))
+        asked = []
+
+        def getattrlist(path, request, buffer, size, options):
+            asked.append((path, request._obj.volattr))
+            ctypes.memmove(buffer, (20).to_bytes(4, "little") + value, 20)
+            return 0
+        identity = privacy.volume_identity("/Volumes/Fictional/backups", mount_point=lambda raw: b"/Volumes/Fictional", getattrlist=getattrlist)
+        self.assertEqual(identity, "macos-volume:01020304-0506-0708-090a-0b0c0d0e0f10")
+        self.assertEqual(asked, [(b"/Volumes/Fictional", 0x80000000 | 0x00040000)])
+        empty = lambda path, request, buffer, size, options: ctypes.memmove(buffer, (20).to_bytes(4, "little") + bytes(16), 20) and 0  # noqa: E731
+        self.assertIsNone(privacy.volume_identity("/Volumes/FAT", mount_point=lambda raw: b"/Volumes/FAT", getattrlist=empty))
+        self.assertIsNone(privacy.volume_identity("/Volumes/X", mount_point=lambda raw: b"/Volumes/X", getattrlist=lambda *a: -1))
+        self.assertIsNone(privacy.volume_identity("/x", mount_point=lambda raw: (_ for _ in ()).throw(OSError(5, "x")), getattrlist=getattrlist))
+
+
+@unittest.skipUnless(os.name == "posix", "only on posix: these are POSIX paths; macOS's rule is switched on by name")
+class CaseInsensitivePathTests(unittest.TestCase):
+    """Default APFS ignores case and NFC/NFD form, so "apart from" and "inside" must too."""
+
+    def darwin(self):
+        return mock.patch.object(private.sys, "platform", "darwin")
+
+    def test_a_folder_named_in_another_case_is_the_same_folder(self):
+        with self.darwin():
+            self.assertEqual(private.relative_parts("/Volumes/Fictional/shared/Docs/backups", "/Volumes/Fictional/shared/docs"), ("backups",))
+            self.assertEqual(private.relative_parts("/Volumes/Fictional/shared/DOCS", "/volumes/fictional/shared/docs"), ())
+            self.assertEqual(private.relative_parts("/Volumes/Fictional/shared/caf\u00e9/x", "/Volumes/Fictional/shared/cafe\u0301"), ("x",))
+            self.assertIsNone(private.relative_parts("/Volumes/Fictional/shared/other", "/Volumes/Fictional/shared/docs"))
+            self.assertIsNone(private.relative_parts("/Volumes/Fictional/shared", "/Volumes/Fictional/shared/docs"))
+            self.assertIsNone(private.relative_parts("relative/docs", "/Volumes/Fictional/shared/docs"))
+            self.assertIsNone(private.relative_parts("/Volumes/Fictional/shared/docs/../secret", "/Volumes/Fictional/shared/docs"))
+            self.assertTrue(storage_policy.within(Path("/Volumes/Fictional/shared/Docs/backups"), Path("/Volumes/Fictional/shared/docs")))
+        self.assertIsNone(private.relative_parts("/Volumes/Fictional/shared/Docs/backups", "/Volumes/Fictional/shared/docs"))  # Linux stays exact
+
+    def test_cloud_storage_is_recognised_in_any_case(self):
+        with self.darwin():
+            self.assertEqual(storage_policy.synced_folder("/volumes/fictional/shared/library/cloudstorage/OneDrive-Fictional/x", probe={
+                "platform": "darwin", "home": "/Volumes/Fictional/shared", "environ": {}, "stat": mock.Mock(side_effect=OSError)}), "OneDrive")
+
+    @unittest.skipUnless(sys.platform == "darwin", "only on macos: the rule runs there without being switched on")
+    def test_macos_compares_without_case(self):
+        self.assertEqual(private.relative_parts("/Volumes/Fictional/shared/Docs", "/VOLUMES/FICTIONAL/shared/docs"), ())
+
+
+@unittest.skipUnless(sys.platform == "darwin", "only on macos: real volume and system calls; these first run on the macos-latest CI legs")
+class NativeMacTests(unittest.TestCase):
+    """The native lines every fake skips. Nothing here has been observed on a Mac yet: CI is its first run."""
+
+    def test_macos_volume_identity_is_the_uuid_diskutil_reports(self):
+        folder = ROOT / "work" / "test-fixtures" / ("volume-" + uuid.uuid4().hex)
+        folder.mkdir(parents=True)
+        self.addCleanup(shutil.rmtree, folder)
+        identity = scoped_fs.volume_identity(str(folder))
+        self.assertRegex(identity, r"\Amacos-volume:[0-9a-f-]{36}\Z")
+        listing = subprocess.run(["/usr/sbin/diskutil", "info", "-plist", str(folder)], check=True, capture_output=True, timeout=120)
+        self.assertEqual(identity, "macos-volume:" + plistlib.loads(listing.stdout)["VolumeUUID"].lower())
+
+    def test_macos_collection_runs_for_real(self):
+        facts = collect_macos.collect()
+        self.assertEqual(facts["collection_mode"], "real")
+        commands = facts["coverage"]["commands"]
+        self.assertEqual(commands["/usr/bin/sw_vers"], "completed")
+        self.assertEqual(commands["/usr/bin/uname -m"], "completed")
 
 
 if __name__ == "__main__":

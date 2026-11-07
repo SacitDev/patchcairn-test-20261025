@@ -1,16 +1,20 @@
 """Recovery checks: the backup, restore and quarantine receipts that a dependent action needs, with their bytes
 re-read from disk by the verifier the service injects.
 Functions that need the engine take it as ``engine`` (workflow_core.WorkflowEngine), the context described there.
+Containment is decided part by part by private_workspace.relative_parts; a pair it cannot decide is refused. The
+evidence bounds are read from engine_journal when they are used, so one change reaches every reader.
 """
 from __future__ import annotations
 
 import copy
 from pathlib import Path
 
-from engine_journal import (EVIDENCE_MAX_BYTES, EVIDENCE_MAX_NODES, QUARANTINE_RECOVERY, RECOVERY_BINDING, RECOVERY_RETENTION, SHA, WorkflowRefusal,
+import engine_journal
+from engine_journal import (QUARANTINE_RECOVERY, RECOVERY_BINDING, RECOVERY_RETENTION, SHA, WorkflowRefusal,
                             bounded_text, checked, decode_record, no_links, private_directory, read_record_bytes, typed_record)
 import pc_records
 from pc_records import digest
+from private_workspace import relative_parts
 import storage_contract
 
 
@@ -25,7 +29,7 @@ def _storage_record(value, kind, message):
 
 
 def reverify(engine, binding):
-    """Re-read recovery or artifact bytes from disk through the injected verifier (D-018, PD-3)."""
+    """Re-read recovery or artifact bytes from disk through the injected verifier."""
     if engine.verify_artifact is None:
         raise WorkflowRefusal("Recovery and artifact bytes cannot be re-checked without the service's storage verifier; the action is held",
                               code="verifier-missing")
@@ -44,10 +48,8 @@ def _owned_output(engine, value):
     if not root.is_absolute():
         raise WorkflowRefusal("Recovery output root must be an exact absolute owned work path")
     root = no_links(root)
-    try:
-        root.relative_to(engine.root / "work")
-    except ValueError as error:
-        raise WorkflowRefusal("Recovery artifacts must remain in the exact owned work output root") from error
+    if relative_parts(root, engine.root / "work") is None:
+        raise WorkflowRefusal("Recovery artifacts must remain in the exact owned work output root")
     return root
 
 
@@ -57,12 +59,11 @@ def work_artifact(engine, path, expected_sha256, *, output_root, max_bytes=SERVI
     if not value.is_absolute() or output_root is None or not Path(output_root).is_absolute():
         raise WorkflowRefusal("Owned records need exact absolute owned work paths")
     value, output_root = no_links(value), _owned_output(engine, str(output_root))
-    try:
-        relative = value.relative_to(output_root)
-    except ValueError as error:
-        raise WorkflowRefusal("Owned records must remain in the exact owned work root") from error
+    parts = relative_parts(value, output_root)
+    if parts is None:
+        raise WorkflowRefusal("Owned records must remain in the exact owned work root")
     current = private_directory(output_root)
-    for part in relative.parts[:-1]:
+    for part in parts[:-1]:
         current = private_directory(current / part)
     data = read_record_bytes(value, max_bytes, private=True)
     if not isinstance(expected_sha256, str) or digest(data) != expected_sha256:
@@ -72,8 +73,9 @@ def work_artifact(engine, path, expected_sha256, *, output_root, max_bytes=SERVI
 
 def _retention(engine, state, evidence_id):
     row = engine.evidence_rows(state, [evidence_id], kinds={"retention"})[0]
-    data = engine.journal.read_owned(engine.journal.directory(state["session_id"]) / row["path"], EVIDENCE_MAX_BYTES)
-    retention = typed_record(decode_record(data, max_bytes=EVIDENCE_MAX_BYTES, max_nodes=EVIDENCE_MAX_NODES), RECOVERY_RETENTION)
+    limit, nodes = engine_journal.EVIDENCE_MAX_BYTES, engine_journal.EVIDENCE_MAX_NODES
+    data = engine.journal.read_owned(engine.journal.directory(state["session_id"]) / row["path"], limit)
+    retention = typed_record(decode_record(data, max_bytes=limit, max_nodes=nodes), RECOVERY_RETENTION)
     if retention["session_id"] != state["session_id"] or retention["required"] is not True or not isinstance(retention["artifacts"], dict):
         raise WorkflowRefusal("A current exact retention record must protect every actual required recovery artifact")
     return retention["artifacts"]
@@ -115,8 +117,9 @@ def verify_recovery(engine, state, evidence_ids, *, action=None):
                 or not isinstance(original.get("recovery_verification"), dict)):
             raise WorkflowRefusal("Integrated purge of originally unbacked quarantine is held; an unrelated backup cannot supply its recovery proof")
     for row in engine.evidence_rows(state, evidence_ids, kinds={"recovery"}):
-        binding = decode_record(engine.journal.read_owned(engine.journal.directory(state["session_id"]) / row["path"], EVIDENCE_MAX_BYTES),
-                                max_bytes=EVIDENCE_MAX_BYTES, max_nodes=EVIDENCE_MAX_NODES)
+        limit, nodes = engine_journal.EVIDENCE_MAX_BYTES, engine_journal.EVIDENCE_MAX_NODES
+        binding = decode_record(engine.journal.read_owned(engine.journal.directory(state["session_id"]) / row["path"], limit),
+                                max_bytes=limit, max_nodes=nodes)
         if isinstance(binding, dict) and binding.get("schema") == QUARANTINE_RECOVERY:
             _quarantine_recovery(engine, state, binding, action)
             continue
@@ -143,13 +146,15 @@ def verify_recovery(engine, state, evidence_ids, *, action=None):
         for file in files:
             try:
                 expected = Path(restore["destination"]) / file["root_id"] / file["relative_path"]
-                expected.relative_to(output_root)
-            except (KeyError, TypeError, ValueError) as error:
+            except (KeyError, TypeError) as error:
                 raise WorkflowRefusal("Restoration probe escapes its owned work output root") from error
+            if relative_parts(expected, output_root) is None:
+                raise WorkflowRefusal("Restoration probe escapes its owned work output root")
             retained[str(expected)] = file.get("sha256")
         if _retention(engine, state, binding["retention_evidence_id"]) != retained:
             raise WorkflowRefusal("A current exact retention record must protect every actual required recovery artifact")
         # The archive, manifest, restored files and outcome receipt are re-read from disk by the verifier,
         # which also checks that the backup covers every quarantined original of a purge.
         reverify(engine, {"kind": "backup_recovery", "output_root": str(output_root), "backup_receipt": backup,
-                      "restore_receipt": restore, "purge_receipt": original})
+                      "restore_receipt": restore, "purge_receipt": original,
+                      **({"remove_originals": True} if action and action["adapter_id"] == pc_records.ADAPTER_STORAGE_REMOVE_ORIGINALS else {})})

@@ -27,9 +27,14 @@ class StorageService(StoragePolicy, StorageAssessment, StorageBackup, StorageVer
     """Pure plans plus checked native primitives, with no standalone consent API.
 
     `output_root` must be an existing, positively owned and owner-private
-    directory below this executing repository's work/. The coordinator creates
-    its dedicated private namespace; existing permissions are never repaired.
-    No external output destination or broad filesystem discovery is supported.
+    directory below this executing repository's work/; it holds the control
+    records. The coordinator creates its dedicated private namespace; existing
+    permissions are never repaired. A backup may go to a folder on another
+    drive: `backup_destination` is that folder admitted as a backup destination
+    (scoped_fs.admit_destination). Writing there needs it, and closing the
+    service closes it; without it, verification and reconciliation admit the
+    destination named by the hash-bound plan themselves. No broad filesystem
+    discovery is supported.
     """
 
 

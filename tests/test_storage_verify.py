@@ -14,76 +14,77 @@ from pathlib import Path
 # Imported first: test_storage_policy puts scripts/ on sys.path for the product imports below.
 from test_storage_policy import NativeStorageFixture
 from scoped_fs import ScopedFSError
-from storage_ops import StorageRefusal, StorageService
+import storage_backup
+import storage_verify
+from storage_ops import StorageRefusal, StorageService, canonical
 from storage_policy import SCHEMA, sha256
 
 
 class PureStorageTests(unittest.TestCase):
-    def _archive(self, *, name="payload/000001", content=b"fictional", external_attr=None):
+    """verify_archive and the manifest reader on archives built in memory."""
+
+    def _archive(self, *, name="r001/fictional.txt", content=b"fictional", external_attr=None):
+        row = {"entry": name, "root_id": name.split("/", 1)[0], "relative_path": name.split("/", 1)[-1], "size": len(content),
+               "sha256": sha256(content), "changed": False}
         stream = io.BytesIO()
-        with zipfile.ZipFile(stream, "w") as archive:
-            info = zipfile.ZipInfo(name)
-            info.create_system = 3
-            info.external_attr = ((stat.S_IFREG | 0o600) << 16) if external_attr is None else external_attr
-            archive.writestr(info, content)
-        data = stream.getvalue()
-        manifest = {"schema": SCHEMA, "schema_version": 1, "kind": "backup_manifest", "archive_sha256": sha256(data),
-                    "archive_bytes": len(data), "files": [{"entry": name, "root_id": "r001", "relative_path": "fictional.txt",
-                                                              "size": len(content), "sha256": sha256(content)}],
-                    "limits": {"max_entries": 100, "max_depth": 10, "max_file_bytes": 1000, "max_total_bytes": 1000}}
-        return data, manifest
+        with zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            info = storage_backup.entry_info(name, 0)
+            if external_attr is not None:
+                info.external_attr = external_attr
+            with archive.open(info, "w", force_zip64=True) as member:
+                member.write(content)
+        return stream.getvalue(), row
 
     def test_zip_verification_rejects_traversal_link_and_hash_mismatch(self):
-        data, manifest = self._archive()
-        self.assertTrue(StorageService._verify_zip(data, manifest))
-        bad = copy.deepcopy(manifest)
-        bad["files"][0]["relative_path"] = "../../escape.txt"
+        data, row = self._archive()
+        self.assertEqual(storage_verify.verify_archive(io.BytesIO(data), [row]), 1)
         with self.assertRaises(StorageRefusal):
-            StorageService._verify_zip(data, bad)
-        data2, manifest2 = self._archive(name="../escape.txt")
-        with self.assertRaisesRegex(StorageRefusal, "Unsafe ZIP"):
-            StorageService._verify_zip(data2, manifest2)
-        data3, manifest3 = self._archive(external_attr=(stat.S_IFLNK | 0o777) << 16)
+            storage_verify.verify_archive(io.BytesIO(data), [{**row, "relative_path": "../../escape.txt"}])
+        link, link_row = self._archive(external_attr=(stat.S_IFLNK | 0o777) << 16)
         with self.assertRaisesRegex(StorageRefusal, "nonordinary ZIP"):
-            StorageService._verify_zip(data3, manifest3)
-        bad = copy.deepcopy(manifest)
-        bad["files"][0]["sha256"] = "0" * 64
+            storage_verify.verify_archive(io.BytesIO(link), [link_row])
         with self.assertRaisesRegex(StorageRefusal, "hash mismatch"):
-            StorageService._verify_zip(data, bad)
+            storage_verify.verify_archive(io.BytesIO(data), [{**row, "sha256": "0" * 64}])
 
     def test_zip_crc_corruption_and_extra_members_are_rejected(self):
-        data, manifest = self._archive()
+        data, row = self._archive(content=b"fictional content that deflate stores")
         damaged = bytearray(data)
-        offset = data.index(b"fictional")
+        offset = len(b"PK\x03\x04") + 26 + len(row["entry"]) + 20 + 2  # a byte inside the member's data
         damaged[offset] ^= 1
-        damaged = bytes(damaged)
-        manifest["archive_sha256"] = sha256(damaged)
-        with self.assertRaisesRegex(StorageRefusal, "CRC"):
-            StorageService._verify_zip(damaged, manifest)
-        data, manifest = self._archive()
+        with self.assertRaises(StorageRefusal) as caught:
+            storage_verify.verify_archive(io.BytesIO(bytes(damaged)), [row])
+        self.assertEqual(caught.exception.code, "archive-verification-failed")
         stream = io.BytesIO(data)
         with zipfile.ZipFile(stream, "a") as archive:
-            archive.writestr("unknown", b"fictional")
-        changed = stream.getvalue()
-        manifest["archive_sha256"] = sha256(changed)
-        manifest["archive_bytes"] = len(changed)
+            archive.writestr("r001/unknown", b"fictional")
         with self.assertRaisesRegex(StorageRefusal, "exact reviewed list"):
-            StorageService._verify_zip(changed, manifest)
+            storage_verify.verify_archive(io.BytesIO(stream.getvalue()), [row])
 
     def test_case_ambiguous_restore_and_protected_payload_are_rejected(self):
-        data, manifest = self._archive()
-        bad = copy.deepcopy(manifest)
-        second = {**bad["files"][0], "entry": "payload/000002", "relative_path": "FICTIONAL.TXT"}
-        bad["files"].append(second)
+        data, row = self._archive()
         with self.assertRaisesRegex(StorageRefusal, "Case-ambiguous"):
-            StorageService._verify_zip(data, bad)
-        bad = copy.deepcopy(manifest)
-        bad["files"][0]["relative_path"] = ".ssh/id_ed25519"
-        with self.assertRaisesRegex(StorageRefusal, "Protected"):
-            StorageService._verify_zip(data, bad)
-        bad["files"][0]["relative_path"] = ".local/share/keyrings/login.keyring"
-        with self.assertRaisesRegex(StorageRefusal, "Protected"):
-            StorageService._verify_zip(data, bad)
+            storage_verify.verify_archive(io.BytesIO(data), [row, {**row, "relative_path": "FICTIONAL.TXT", "entry": "r001/FICTIONAL.TXT"}])
+        for relative in (".ssh/id_ed25519", ".local/share/keyrings/login.keyring"):
+            with self.subTest(relative=relative), self.assertRaisesRegex(StorageRefusal, "Protected"):
+                storage_verify.verify_archive(io.BytesIO(data), [{**row, "relative_path": relative, "entry": "r001/" + relative}])
+
+    def test_manifest_lines_are_strict(self):
+        header = {"schema": SCHEMA, "schema_version": 1, "kind": "backup_manifest", "format": "json-lines", "entry_count": 1,
+                  "changed_count": 0, "skipped_count": 1}
+        good = [header, {"entry": "r001/a", "changed": False}, {"skipped": {"key": "r001/b"}}]
+
+        def read(lines, tail=b"\n"):
+            reader = storage_verify.ManifestLines()
+            reader(b"\n".join(canonical(line) if isinstance(line, dict) else line for line in lines) + tail)
+            return reader.manifest()
+        self.assertEqual(read(good)["files"], [{"entry": "r001/a", "changed": False}])
+        for lines, tail in (([*good[:2], {"skipped": {"key": "x"}}, {"entry": "r001/c"}], b"\n"),  # an entry after a skipped line
+                            ([{**header, "entry_count": 2}, *good[1:]], b"\n"),                   # counts differ from the lines
+                            ([{**header, "kind": "backup_receipt"}, *good[1:]], b"\n"),
+                            ([header, b'{"entry":"r001/a","entry":"r001/b"}', good[2]], b"\n"),   # a duplicate key
+                            (good, b""), ([{**header, "format": "json"}, *good[1:]], b"\n")):
+            with self.subTest(lines=lines, tail=tail), self.assertRaises(StorageRefusal):
+                read(lines, tail)
 
 
 class NativeStorageTests(NativeStorageFixture, unittest.TestCase):

@@ -5,6 +5,7 @@ records. This module also holds the helpers and the NativeStorageTests fixture t
 """
 from __future__ import annotations
 
+from contextlib import ExitStack
 import copy
 import os
 import sys
@@ -21,6 +22,12 @@ import storage_contract
 import storage_policy
 from storage_ops import StorageRefusal, StorageService, canonical, plan_sha256, storage_capabilities
 from storage_policy import SCHEMA, sha256
+import ast
+import pc_records
+import scoped_base
+import scoped_fs
+import storage_backup
+import win32_files
 
 FIXTURES = ROOT / "work" / "test-fixtures" / "storage"
 
@@ -136,7 +143,7 @@ class StoragePrivacyAdmissionTests(unittest.TestCase):
             output.chmod(0o755)  # Attack fixture only (a host umask of 077 would create it private).
         expected = "private-owner-or-mode-refused" if os.name == "posix" else "private-dacl-unprotected"
         with mock.patch.object(StorageService, "_scope", side_effect=AssertionError("Selected scope must stay unopened")):
-            with self.assertRaisesRegex(StorageRefusal, "Owner-private") as caught:
+            with self.assertRaisesRegex(StorageRefusal, "cannot use its work folder here") as caught:
                 StorageService(output_root=output, quiet_workspace=True)
         self.assertEqual(caught.exception.code, expected)
         self.assertEqual(list(output.iterdir()), [])
@@ -152,7 +159,7 @@ class StoragePrivacyAdmissionTests(unittest.TestCase):
         except PrivateWorkspaceError:
             # /mnt/c can report 0777 after a requested 0700 creation. A real
             # refusal is the required result; do not chmod, remount or move it.
-            with self.assertRaisesRegex(StorageRefusal, "Owner-private"):
+            with self.assertRaisesRegex(StorageRefusal, "cannot use its work folder here"):
                 StorageService(output_root=output, quiet_workspace=True)
             if output.exists():
                 self.assertEqual(list(output.iterdir()), [])
@@ -167,10 +174,42 @@ class StoragePrivacyAdmissionTests(unittest.TestCase):
         service = StorageService(output_root=output, quiet_workspace=True)
         with mock.patch("storage_policy.ensure_private_directory", side_effect=PrivateWorkspaceError("private-owner-or-mode-refused")):
             with mock.patch("storage_policy.ScopedRoot", side_effect=AssertionError("No selected source should be opened")) as admission:
-                with self.assertRaisesRegex(StorageRefusal, "Owner-private"):
+                with self.assertRaisesRegex(StorageRefusal, "another account can reach this folder"):
                     service.assess_storage(roots=[base / "unopened-source"])
                 admission.assert_not_called()
         self.assertEqual(list(output.iterdir()), [])
+
+
+class PlainWordsTests(unittest.TestCase):
+    def test_sizes_read_as_people_read_them(self):
+        for size, text in ((0, "0 bytes"), (1, "1 byte"), (999, "999 bytes"), (1000, "about 1.0 KB"), (949_400, "about 949.4 KB"),
+                           (999_950, "about 1.0 MB"), (1_000_000, "about 1.0 MB"), (52_400_000_000, "about 52.4 GB"),
+                           (2_500_000_000_000, "about 2.5 TB")):
+            with self.subTest(size=size):
+                self.assertEqual(storage_policy.about_size(size), text)
+
+    def test_a_refused_work_folder_says_why_and_what_to_do(self):
+        for error, reason in ((PrivateWorkspaceError("private-owner-or-mode-refused"), "another account can reach this folder"),
+                              (PrivateWorkspaceError("private-dacl-unprotected"), "another account can reach this folder"),
+                              (PrivateWorkspaceError("private-link-or-type-refused"), "a folder on this path is a link"),
+                              (PrivateWorkspaceError("private-local-path-required"),
+                               "it is on a network path or the path is longer than 240 characters"),
+                              (PrivateWorkspaceError("private-path-invalid", "the folder name \"CON\" is not accepted"),
+                               "the folder name \"CON\" is not accepted"),
+                              (PrivateWorkspaceError("private-file-metadata-unavailable"), "its permissions could not be confirmed")):
+            with self.subTest(code=error.code):
+                hold = StorageService._work_hold(error)
+                self.assertEqual(hold.code, error.code)
+                self.assertEqual(str(hold), f"PatchCairn cannot use its work folder here: {reason}. Nothing was changed. Move the PatchCairn "
+                                            "folder to a plain local folder that only you use, then start again.")
+
+    def test_a_refused_folder_name_is_named(self):
+        if os.name != "nt":
+            self.skipTest("only on windows: the rule for reserved folder names runs on Windows paths")
+        with self.assertRaises(StorageRefusal) as caught:
+            StorageService(output_root=FIXTURES / "CON" / "output", quiet_workspace=True)
+        self.assertEqual(caught.exception.code, "private-path-invalid")
+        self.assertIn('the folder name "CON" is one PatchCairn does not accept', str(caught.exception))
 
 
 class PureStorageTests(unittest.TestCase):
@@ -279,6 +318,418 @@ class NativeStorageTests(NativeStorageFixture, unittest.TestCase):
                 self.assertGreater(data.count(b"["), 1_000_000)
                 self.assertLessEqual(len(data), storage_policy.MAX_ARCHIVE_BYTES)
                 self.assertEqual(storage_policy.decode_storage(data, "Fictional unreadable record"), record)
+
+
+
+# The selected-root class this platform's open_root returns, whose free_bytes the preflight tests replace.
+if os.name == "nt":
+    import windows_scoped
+    ROOT_CLASS = windows_scoped.WindowsRoot
+else:
+    ROOT_CLASS = scoped_fs.PosixRoot
+TEMP = "C:\\" + "Users" + "\\example\\AppData\\Local\\Temp"
+
+
+class BackupPolicyTests(NativeStorageFixture, unittest.TestCase):
+    """The free-space preflight, the size budget, the entry bound, destinations on other drives and cloud-synced folders."""
+
+    def plan(self, selected=None, **options):
+        inventory = self.inventory()
+        selected = selected or [row["key"] for row in inventory["entries"] if row["kind"] == "file"]
+        options.setdefault("destination", self.output)
+        return self.service.plan_backup(inventory=inventory, selected=selected, content_read_authorized=True, **options)
+
+    def test_free_space_preflight_refuses_before_any_write(self):
+        plan = self.plan()
+        before = sorted(os.listdir(self.output))
+        need = plan["cost"]["archive_bytes_at_most"] + storage_policy.FREE_SPACE_MARGIN_BYTES
+        with mock.patch.object(ROOT_CLASS, "free_bytes", return_value=need - 1):
+            for call in (self.service.check_preconditions, self.service.create_backup):
+                with self.subTest(call=call.__name__), self.assertRaises(StorageRefusal) as caught:
+                    call(plan=plan, expected_plan_sha256=plan_sha256(plan))
+                self.assertEqual(caught.exception.code, "disk-full")
+                self.assertRegex(str(caught.exception), r"^Not enough free space on the backup drive: about \d+\.\d MB needed, "
+                                                        r"about \d+\.\d MB free\. Free some space or choose another drive\.$")
+        self.assertEqual(sorted(os.listdir(self.output)), before)  # no attempt record, no folder, nothing
+        with mock.patch.object(ROOT_CLASS, "free_bytes", return_value=need + plan["cost"]["manifest_bytes_at_most"]
+                               + plan["cost"]["control_record_bytes"] + 1):
+            self.service.check_preconditions(plan=plan, expected_plan_sha256=plan_sha256(plan))
+
+    def test_control_record_figure_counts_its_own_digits(self):
+        def attempt(plan):
+            return len(canonical(storage_policy.attempt_record("backup", "0" * 64, f"plan-backup-{'0' * 64}.json", plan,
+                                                               **storage_backup._names(plan["label"]))))
+        first = self.plan()["cost"]["control_record_bytes"]
+        for gap in range(8):  # around a figure that gains a digit from its own digits
+            with self.subTest(gap=gap):
+                receipt = storage_backup._RECEIPT_BYTES_AT_MOST + 100_000 - gap - (first - len(str(first)))
+                with mock.patch.object(storage_backup, "_RECEIPT_BYTES_AT_MOST", receipt):
+                    plan = self.plan()
+                self.assertEqual(plan["cost"]["control_record_bytes"],
+                                 len(canonical(plan)) + attempt(plan) + 3 * storage_backup._PARTIAL_RECORD_BYTES + receipt
+                                 + 4 * len(plan["destination"]))
+
+    def test_backup_preconditions_read_no_file_content(self):
+        # The backup re-hashes every file as it streams it, so the checks before begin read metadata only.
+        plan = self.plan()
+        with mock.patch.object(scoped_base, "hash_stream", side_effect=AssertionError("file content read before begin")):
+            evidence = self.service.check_preconditions(plan=plan, expected_plan_sha256=plan_sha256(plan))
+        self.assertFalse(evidence["mutation_performed"])
+        self.assertEqual(evidence["inventory_sha256"], plan["inventory"]["inventory_sha256"])
+
+    def test_owner_size_budget_refuses(self):
+        total = sum(row["size"] for row in self.inventory()["entries"] if row["kind"] == "file")
+        with self.assertRaises(StorageRefusal) as caught:
+            self.plan(size_budget_bytes=total - 1)
+        self.assertEqual(caught.exception.code, "size-budget")
+        self.assertIn(storage_policy.about_size(total), str(caught.exception))
+        self.assertNotIn(str(total), str(caught.exception))
+        self.assertEqual(self.plan(size_budget_bytes=total)["size_budget_bytes"], total)
+        for budget in (-1, True, 1.5):
+            with self.subTest(budget=budget), self.assertRaises(StorageRefusal):
+                self.plan(size_budget_bytes=budget)
+
+    def test_entry_count_bound(self):
+        self.assertIs(storage_policy.MAX_ENTRIES, pc_records.MAX_BACKUP_ENTRIES)
+        self.assertGreaterEqual(pc_records.MAX_BACKUP_ENTRIES, 70_000)
+        with mock.patch.object(pc_records, "MAX_BACKUP_ENTRIES", 3):  # the bound is read from pc_records itself
+            with self.assertRaises(StorageRefusal) as caught:
+                self.plan()
+            self.assertEqual(caught.exception.code, "entry-cap")
+            plan = self.plan(["r001/copy.txt", "r001/readme.txt", "r001/large.bin"])
+        self.assertEqual(len(plan["files"]), 3)
+        with mock.patch.object(pc_records, "MAX_BACKUP_ENTRIES", 2), self.assertRaises(StorageRefusal) as caught:
+            self.service.check_preconditions(plan=plan, expected_plan_sha256=plan_sha256(plan))
+        self.assertEqual(caught.exception.code, "entry-cap")
+
+    def destination(self):
+        """A folder outside this service's output root: a destination "on another drive"."""
+        return private_child(self.base, "elsewhere")
+
+    @staticmethod
+    def drive(*, private):
+        """Backup destinations admitted from now on appear to be on a fixed private drive, or a removable exFAT one."""
+        if os.name == "nt":
+            facts = {"filesystem": "NTFS" if private else "exFAT", "removable": not private,
+                     "drive_type": win32_files.DRIVE_FIXED if private else win32_files.DRIVE_REMOVABLE}
+            volumes = lambda handle, drive: facts  # noqa: E731
+        else:
+            facts = {"filesystem": "native" if private else "exfat", "removable": not private}
+            volumes = lambda fd: facts  # noqa: E731
+        real = scoped_fs.admit_destination
+        return mock.patch.object(scoped_fs, "admit_destination", lambda root, **options: real(root, volumes=volumes, **options))
+
+    def test_other_drive_destination_needs_non_private_acknowledgment(self):
+        destination = self.destination()
+        with self.drive(private=False):
+            with self.assertRaises(scoped_base.CapabilityHold) as caught:
+                self.plan(destination=destination)
+            self.assertEqual(caught.exception.code, "non-private-destination-acknowledgment-required")
+            self.assertEqual(str(caught.exception).split(": ", 1)[1], scoped_base.NON_PRIVATE_NOTE)
+            plan = self.plan(destination=destination, non_private_destination=True)
+        self.assertEqual((plan["external"], plan["private"], plan["non_private_destination"]), (True, False, True))
+        self.assertEqual(plan["privacy_note"], scoped_base.NON_PRIVATE_NOTE)
+        if os.name == "nt":
+            self.assertIsNone(plan["destination_check_note"])  # the Windows backend writes nothing to check a drive
+        else:
+            self.assertIn("one empty temporary file", plan["destination_check_note"])
+        self.assertEqual(os.listdir(destination), [])
+        # A fixed private drive needs no acknowledgment.
+        with self.drive(private=True):
+            private = self.plan(destination=destination)
+        self.assertEqual((private["external"], private["private"], private["privacy_note"]), (True, True, None))
+
+    def test_external_backup_needs_its_folder_admitted_by_the_caller(self):
+        destination = self.destination()
+        with self.drive(private=True):
+            plan = self.plan(destination=destination)
+            digest = plan_sha256(plan)
+            for call in (lambda: self.service.check_preconditions(plan=plan, expected_plan_sha256=digest),
+                         lambda: self.service.create_backup(plan=plan, expected_plan_sha256=digest)):
+                with self.assertRaises(StorageRefusal) as caught:
+                    call()
+                self.assertEqual(caught.exception.code, "destination-not-admitted")
+            self.assertEqual((os.listdir(destination), [name for name in os.listdir(self.output) if name.startswith("attempt-")]), ([], []))
+            admitted = StorageService(output_root=str(self.output), quiet_workspace=True,
+                                      backup_destination=scoped_fs.admit_destination(str(destination)))
+            with admitted:
+                self.assertEqual(admitted.check_preconditions(plan=plan, expected_plan_sha256=digest)["inventory_sha256"], plan["inventory"]["inventory_sha256"])
+                receipt = admitted.create_backup(plan=plan, expected_plan_sha256=digest)
+            self.assertEqual(receipt["location"], str(Path(destination) / receipt["folder"]))
+        self.assertTrue(admitted.backup_destination._closed)
+        admitted.close()  # closing twice changes nothing
+
+    def test_a_folder_that_is_not_there_is_named_in_plain_words(self):
+        missing = self.base / "unplugged-drive" / "backups"
+        with self.assertRaises(StorageRefusal) as caught:
+            self.plan(destination=missing)
+        self.assertEqual(caught.exception.code, "destination-not-found")
+        self.assertEqual(str(caught.exception), f"The backup drive or folder cannot be found: {missing}. Plug the drive in, check that it "
+                                                "shows in File Explorer or Finder, then ask me to try again. Nothing was changed.")
+        for code in ("missing-entry", "access-sharing-or-missing", "admission"):
+            with self.subTest(code=code), self.assertRaises(StorageRefusal) as caught, \
+                    mock.patch.object(scoped_fs, "admit_destination", side_effect=ScopedFSError(code, "Windows error 3")):
+                storage_policy.admitted_destination(missing, False)
+            self.assertEqual(caught.exception.code, "destination-not-found")
+            self.assertNotIn("Windows error", str(caught.exception))
+        with mock.patch.object(scoped_fs, "admit_destination", side_effect=ScopedFSError("destination-volume-unsupported", "fictional")), \
+                self.assertRaises(ScopedFSError) as caught:  # any other refusal keeps its own code and reason
+            storage_policy.admitted_destination(missing, False)
+        self.assertEqual(caught.exception.code, "destination-volume-unsupported")
+
+    def test_a_backup_too_big_for_the_drive_says_what_to_do(self):
+        chosen = self.destination()
+        facts = ({"filesystem": "FAT32", "removable": True, "drive_type": win32_files.DRIVE_REMOVABLE} if os.name == "nt"
+                 else {"filesystem": "fat", "removable": True})
+        volumes = (lambda handle, drive: facts) if os.name == "nt" else (lambda fd: facts)
+        real = scoped_fs.admit_destination
+        with mock.patch.object(scoped_fs, "admit_destination", lambda root, **options: real(root, volumes=volumes, **options)):
+            plan = self.plan(destination=chosen, non_private_destination=True)
+            with scoped_fs.admit_destination(str(chosen), non_private_destination=True) as root, \
+                    StorageService(output_root=self.output, quiet_workspace=True, backup_destination=root) as service, \
+                    mock.patch.object(storage_policy, "archive_bound", return_value=1 << 32), self.assertRaises(StorageRefusal) as caught:
+                service.check_preconditions(plan=plan, expected_plan_sha256=plan_sha256(plan))
+        self.assertEqual(caught.exception.code, "file-too-large-for-volume")
+        self.assertEqual(str(caught.exception), "This drive cannot hold one file of 4 GB or more, and this backup can reach that size. "
+                                                "Choose another drive or fewer files. Nothing was changed.")
+
+    def test_external_fact_must_agree_with_the_destination_path(self):
+        with self.drive(private=True):
+            outside = self.plan(destination=self.destination())
+        inside = self.plan()
+        for plan in ({**outside, "external": False}, {**inside, "external": True}, {**inside, "external": 0}, {**outside, "external": 1}):
+            with self.subTest(plan["external"]), ExitStack() as stack, self.assertRaises(StorageRefusal) as caught:
+                self.service._backup_destination_root(stack, plan)
+            self.assertIn("not where its plan says", str(caught.exception))
+
+    def test_cloud_synced_work_folder_is_held(self):
+        plan = self.plan()
+        with mock.patch.dict(os.environ, {"OneDrive": str(self.base)}):
+            with self.assertRaises(StorageRefusal) as caught:
+                self.service.check_preconditions(plan=plan, expected_plan_sha256=plan_sha256(plan))
+            self.assertEqual(caught.exception.code, "synced-folder")
+            self.assertIn("The PatchCairn folder is inside OneDrive", str(caught.exception))
+            self.assertIn("Move the PatchCairn folder to a folder that is not synced", str(caught.exception))
+            with self.assertRaises(StorageRefusal):
+                self.service.create_backup(plan=plan, expected_plan_sha256=plan_sha256(plan))
+        self.assertFalse(any(name.startswith("attempt-") for name in os.listdir(self.output)))
+
+    def test_cloud_synced_destination_is_held(self):
+        synced = private_child(self.base, "Dropbox")
+        with self.assertRaises(StorageRefusal) as caught:
+            self.plan(destination=synced)
+        self.assertEqual(caught.exception.code, "synced-folder")
+        self.assertIn("The backup destination is synced by Dropbox", str(caught.exception))
+        source_synced = self.plan()
+        self.assertEqual(source_synced["sources_synced"], [])
+        with mock.patch.dict(os.environ, {"OneDriveCommercial": str(self.source)}):
+            self.assertEqual(self.plan()["sources_synced"], ["OneDrive"])  # synced sources are named, not refused
+
+    def test_destination_admitted_as_destination_is_never_a_source(self):
+        inventory = self.inventory()
+        real = scoped_fs.open_root
+
+        def as_destination(path, **options):
+            root = real(path, **options)
+            root.destination = True
+            return root
+        with mock.patch.object(scoped_fs, "open_root", as_destination), self.assertRaises(StorageRefusal) as caught:
+            self.service.plan_backup(inventory=inventory, selected=["r001/readme.txt"], destination=self.output, content_read_authorized=True)
+        self.assertEqual(caught.exception.code, "destination-as-source")
+
+    def test_destination_inside_a_source_or_above_the_output_is_refused(self):
+        with self.assertRaisesRegex(StorageRefusal, "outside every selected source"):
+            self.plan(destination=self.source / "notes")
+        with self.assertRaisesRegex(StorageRefusal, "separate folder"):
+            self.plan(destination=self.base)
+
+
+class JunkRootPolicyTests(unittest.TestCase):
+    """The Temp exemption: junk_root comes from one win32_files.user_temp_folder() call per service call, never from a
+    plan; a selected root never gets it; every other protected rule stays."""
+
+    def service(self):
+        base = fixture_directory()
+        return StorageService(output_root=private_child(base, "output"), quiet_workspace=True)
+
+    def test_file_under_user_temp_admitted(self):
+        service = self.service()
+        with mock.patch.object(win32_files, "user_temp_folder", return_value=TEMP), service._junk_call():
+            self.assertFalse(service._protected_entry(Path(TEMP), "build-1/setup.log", junk=True))
+            self.assertFalse(service._protected_root(TEMP + "\\build-1", junk=True))
+            self.assertTrue(service._protected_entry(Path(TEMP), "build-1/setup.log"))  # without junk=True, AppData stays private
+
+    def test_browser_folder_under_temp_refused(self):
+        service = self.service()
+        with mock.patch.object(win32_files, "user_temp_folder", return_value=TEMP), service._junk_call():
+            for relative in ("Google/Chrome/Default", "Mozilla/Firefox/x.default", ".ssh/id_ed25519", "copy/.env"):
+                with self.subTest(relative=relative):
+                    self.assertTrue(service._protected_entry(Path(TEMP), relative, junk=True))
+
+    def test_other_appdata_folder_refused(self):
+        service = self.service()
+        appdata = TEMP.rsplit("\\", 2)[0]
+        with mock.patch.object(win32_files, "user_temp_folder", return_value=TEMP), service._junk_call():
+            self.assertTrue(service._protected_root(appdata + "\\Roaming\\Example", junk=True))
+            self.assertTrue(service._protected_root(appdata + "\\Local\\Packages", junk=True))
+            self.assertTrue(service._protected_entry(Path(appdata), "Local/Temp/x.tmp", junk=True))
+
+    def test_junk_root_comes_from_the_api_never_the_plan(self):
+        service = self.service()
+        other = "D:\\" + "Users" + "\\example\\AppData\\Local\\Temp"  # a Temp-shaped folder a plan or inventory might name
+        with mock.patch.object(win32_files, "user_temp_folder", return_value=TEMP), service._junk_call():
+            self.assertTrue(service._protected_entry(Path(other), "x.tmp", junk=True))
+        # Another user's Temp, which differs from the junk root only in the user-name folder, is not the junk root either.
+        mine, theirs = "C:\\Profiles\\example\\AppData\\Local\\Temp", "C:\\Profiles\\other\\AppData\\Local\\Temp"
+        with mock.patch.object(win32_files, "user_temp_folder", return_value=mine), service._junk_call():
+            self.assertFalse(service._protected_entry(Path(mine), "x.tmp", junk=True))
+            self.assertTrue(service._protected_entry(Path(theirs), "x.tmp", junk=True))
+        with mock.patch.object(win32_files, "user_temp_folder", return_value=None), service._junk_call():
+            self.assertTrue(service._protected_entry(Path(TEMP), "x.tmp", junk=True))  # the API could not confirm Temp
+        with self.assertRaises(StorageRefusal) as caught:
+            service._protected_entry(Path(TEMP), "x.tmp", junk=True)  # outside a service call there is no junk root
+        self.assertEqual(caught.exception.code, "junk-scope")
+        import inspect
+        self.assertNotIn("junk_root", inspect.signature(service._protected_entry).parameters)
+
+    def test_selected_root_never_gets_the_temp_exemption(self):
+        service = self.service()
+        with mock.patch.object(win32_files, "user_temp_folder", return_value=TEMP) as api, service._junk_call():
+            self.assertTrue(service._protected_root(TEMP + "\\build-1"))  # junk defaults to False: a selected root
+            with self.assertRaises(StorageRefusal):
+                service.assess_storage(roots=[TEMP + "\\build-1"])
+        self.assertEqual(api.call_count, 1)
+
+    def test_user_temp_folder_read_once_per_service_call(self):
+        service = self.service()
+        with mock.patch.object(win32_files, "user_temp_folder", return_value=TEMP) as api:
+            with service._junk_call():
+                for index in range(5):
+                    service._protected_entry(Path(TEMP), f"build-{index}.log", junk=True)
+                    service._protected_root(TEMP + f"\\build-{index}", junk=True)
+            self.assertEqual(api.call_count, 1)
+            with service._junk_call():
+                service._protected_entry(Path(TEMP), "next.log", junk=True)
+            self.assertEqual(api.call_count, 2)
+            with service._junk_call(), self.assertRaises(StorageRefusal):
+                with service._junk_call():
+                    pass
+
+
+class SyncedFolderTests(unittest.TestCase):
+    def test_synced_folder_detector_is_public_and_injectable(self):
+        home = "C:\\Profiles\\example" if os.name == "nt" else "/home/example"
+        absent = lambda path: (_ for _ in ()).throw(FileNotFoundError(path))  # noqa: E731
+        base = {"platform": "linux", "home": home, "environ": {}, "stat": absent}
+        join = lambda *parts: str(Path(home, *parts))  # noqa: E731
+        self.assertIsNone(storage_policy.synced_folder(join("Documents"), probe=base))
+        self.assertEqual(storage_policy.synced_folder(join("OneDrive - Example", "x"),
+                                                      probe={**base, "environ": {"OneDriveCommercial": join("OneDrive - Example")}}), "OneDrive")
+        self.assertEqual(storage_policy.synced_folder(join("Dropbox", "Work"), probe=base), "Dropbox")
+        self.assertEqual(storage_policy.synced_folder(join("Dropbox (Personal)"), probe=base), "Dropbox")
+        self.assertEqual(storage_policy.synced_folder(join("Google Drive", "x"), probe=base), "Google Drive")
+        darwin = {**base, "platform": "darwin"}
+        self.assertEqual(storage_policy.synced_folder(join("Library", "CloudStorage", "OneDrive-Personal", "x"), probe=darwin), "OneDrive")
+        self.assertEqual(storage_policy.synced_folder(join("Library", "CloudStorage", "GoogleDrive-a", "x"), probe=darwin), "Google Drive")
+        self.assertEqual(storage_policy.synced_folder(join("Library", "CloudStorage", "Example-Cloud", "x"), probe=darwin), "Example")
+        self.assertEqual(storage_policy.synced_folder(join("Library", "Mobile Documents", "com~apple~CloudDocs"), probe=darwin), "iCloud Drive")
+        self.assertIsNone(storage_policy.synced_folder(join("Library", "Mobile Documents"), probe=base))  # only on macOS
+        placeholder = mock.Mock(st_file_attributes=0x400000, st_flags=0)
+        stat = lambda path: placeholder if Path(path) == Path(join("Work")) else absent(path)  # noqa: E731
+        self.assertEqual(storage_policy.synced_folder(join("Work", "inner"), probe={**base, "stat": stat}), "a cloud storage service")
+        dataless = lambda path: mock.Mock(st_file_attributes=0, st_flags=0x40000000)  # noqa: E731
+        self.assertEqual(storage_policy.synced_folder(join("x"), probe={**darwin, "stat": dataless}), "a cloud storage service")
+        with self.assertRaises(StorageRefusal):
+            storage_policy.synced_folder("relative", probe=base)
+
+
+class StorageRecordTests(unittest.TestCase):
+    def test_bad_record_is_refused_through_decode_storage(self):
+        for data in (b'{"a":1,"a":2}', b"[1,2", b'{"kind": NaN}', "{\"x\":\"\u00e9\"}".encode("latin-1"), b"\xef\xbb\xbf{}"):
+            with self.subTest(data=data), self.assertRaises(StorageRefusal) as caught:
+                storage_policy.decode_storage(data, "Fictional unreadable record")
+            self.assertEqual(str(caught.exception), "Fictional unreadable record")
+        source = (ROOT / "scripts" / "storage_verify.py").read_text(encoding="utf-8") + (ROOT / "scripts" / "storage_backup.py").read_text(encoding="utf-8")
+        self.assertNotIn("json.loads", source)
+
+    def test_privacy_hold_message_says_why(self):
+        error = PrivateWorkspaceError("private-path-invalid", "a folder name on this path is one PatchCairn does not accept")
+        self.assertIn("does not accept", str(StorageService._privacy_hold(error)))
+        self.assertEqual(StorageService._privacy_hold(error).code, "private-path-invalid")
+        plain = StorageService._privacy_hold(PrivateWorkspaceError("private-owner-or-mode-refused"))
+        self.assertIn("(private-owner-or-mode-refused)", str(plain))
+
+
+class ContainmentTests(unittest.TestCase):
+    """storage_policy.within compares part by part through private_workspace.relative_parts: inclusive, a look-alike
+    part (U+212A, the Kelvin sign) is not "k", and a pair it cannot decide is refused."""
+
+    def test_within_is_inclusive_and_refuses_look_alikes(self):
+        base = Path("C:\\fictional\\work") if os.name == "nt" else Path("/fictional/work")
+        self.assertTrue(storage_policy.within(base, base))
+        self.assertTrue(storage_policy.within(base / "a" / "b", base))
+        self.assertFalse(storage_policy.within(base.parent / "wor\u212a" / "a", base))
+        self.assertFalse(storage_policy.within(base.parent, base))
+        with self.assertRaises(StorageRefusal) as caught:
+            storage_policy.within(base / "a", Path("relative"))
+        self.assertEqual(caught.exception.code, "containment-undecidable")
+
+    def test_equal_paths_overlap_and_protected_look_alike(self):
+        base = fixture_directory()
+        source = private_child(base, "source")
+        output = private_child(base, "output")
+        with self.assertRaisesRegex(StorageRefusal, "Overlapping"):  # equal paths overlap
+            StorageService(output_root=output, quiet_workspace=True).assess_storage(roots=[source, Path(str(source))])
+        service = StorageService(output_root=output, quiet_workspace=True, protected_roots=[source])
+        self.assertTrue(service._protected_root(source))  # equal to a protected root
+        self.assertTrue(service._protected_entry(base, "source/x.txt"))
+        self.assertFalse(service._protected_entry(base, "sour\u212ae/x.txt"))  # a look-alike is another folder
+
+    def test_protected_entry_rules_out_only_what_no_entry_can_reach(self):
+        base = fixture_directory()
+        source, output, apart = private_child(base, "source"), private_child(base, "output"), private_child(base, "apart")
+        kept = private_child(source, "kept")
+        inner, elsewhere = private_child(kept, "inner"), private_child(base, "elsewhere")
+        service = StorageService(output_root=output, quiet_workspace=True, protected_roots=[kept, apart])
+        self.assertTrue(service._protected_entry(source, "kept"))
+        self.assertTrue(service._protected_entry(source, "kept/x.txt"))  # a protected root below the selected one
+        self.assertTrue(service._protected_entry(inner, "x.txt"))  # a selected root inside a protected one
+        self.assertFalse(service._protected_entry(source, "other/x.txt"))
+        with mock.patch.object(storage_policy, "within", wraps=storage_policy.within) as compared:
+            self.assertFalse(service._protected_entry(source, "other/y.txt"))
+        self.assertNotIn(apart, [call.args[1] for call in compared.call_args_list])  # compared once per selected root
+        with self.assertRaises(StorageRefusal) as caught:  # no protected root is near, and the path still cannot be compared
+            service._protected_entry(elsewhere, "../apart/x.txt")
+        self.assertEqual(caught.exception.code, "containment-undecidable")
+        unprotected = StorageService(output_root=output, quiet_workspace=True)
+        with mock.patch.object(storage_policy, "within") as compared:  # no protected root: nothing to compare
+            self.assertFalse(unprotected._inside_protected(source, source / "x.txt"))
+        compared.assert_not_called()
+
+
+class MixinTests(unittest.TestCase):
+    def test_no_attribute_in_two_mixins_and_only_policy_holds_state(self):
+        from storage_ops import StorageService as Facade
+        names = {}
+        for mixin in Facade.__mro__[1:-1]:
+            for name in vars(mixin):
+                if not name.startswith("__"):
+                    names.setdefault(name, []).append(mixin.__name__)
+        self.assertEqual({name: owners for name, owners in names.items() if len(owners) > 1}, {})
+        self.assertEqual([name for name in vars(Facade) if not name.startswith("__")], [])
+        for module in ("storage_assess", "storage_backup", "storage_verify", "storage_restore", "storage_cleanup", "storage_policy"):
+            tree = ast.parse((ROOT / "scripts" / (module + ".py")).read_text(encoding="utf-8"))
+            for cls in (node for node in tree.body if isinstance(node, ast.ClassDef) and node.name.startswith("Storage")
+                        and node.name != "StorageRefusal"):
+                stores = [node.lineno for node in ast.walk(cls) if isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign))
+                          for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
+                          if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name) and target.value.id == "self"]
+                with self.subTest(cls=cls.name):
+                    if cls.name == "StoragePolicy":
+                        self.assertTrue(stores)
+                    else:
+                        self.assertEqual(stores, [], f"{cls.name} stores state")
+                        self.assertFalse(any(isinstance(node, ast.FunctionDef) and node.name == "__init__" for node in cls.body))
 
 
 if __name__ == "__main__":

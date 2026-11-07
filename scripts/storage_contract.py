@@ -1,7 +1,7 @@
 """The storage adapter payload contract (layer L2-pure: the standard library and L0 modules only).
 
 One home, shared by the engine, the service and the storage code, for the storage plan kind each storage
-adapter binds and for the payload wrapper a reviewed storage action carries (PD-18). It reads only the data
+adapter binds and for the payload wrapper a reviewed storage action carries. It reads only the data
 it is given; the engine adds its own work-tree confinement and the storage code its native checks.
 """
 from __future__ import annotations
@@ -31,20 +31,27 @@ KINDS = frozenset(PLAN_KINDS.values()) | frozenset({
     "inventory", "storage_preconditions", "duplicates", "attempt", "backup_manifest", "backup_receipt", "restore_receipt",
     "quarantine_receipt", "quarantine_restore_receipt", "purge_receipt", "storage_outcome_verification", "capabilities"})
 PAYLOAD_REQUIRED = frozenset({"operation", "storage_plan", "storage_plan_sha256", "output_root", "mode", "protected_roots"})
+# The payload fields of a backup (its folder on another drive, required exactly when the plan is external; the folder of
+# its optional restoration probe) and of a restore; each is checked below for the adapters it belongs to.
+BACKUP_OPTIONAL = frozenset({"backup_destination", "restore_probe_destination"})
+RESTORE_OPTIONAL = frozenset()
 # The number of files or backups and their bytes that the owner's typed reply names: required for, and only for, an
 # adapter whose facts list permanent data loss.
 DELETION_FIELDS = frozenset({"delete_count", "delete_bytes"})
-PAYLOAD_OPTIONAL = frozenset({"restore_probe_destination"}) | DELETION_FIELDS
-# Where each built permanent deletion's plan lists what it deletes: a purge its quarantine receipt's records (each
-# record's original), removing originals its selected files (the plan builders' "files" rows), deleting selected files
-# its rows file's totals. Retention and session release are not built yet and are refused.
+PAYLOAD_OPTIONAL = BACKUP_OPTIONAL | RESTORE_OPTIONAL | DELETION_FIELDS
+# Where each permanent deletion's plan lists what it deletes: a purge its quarantine receipt's records (each record's
+# original), removing originals its selected files (the plan builders' "files" rows), deleting selected files its rows
+# file's totals, and a retention or session release its released kept rows ("rows": one per backup folder or
+# quarantine set, the backups the typed reply counts), each with its "size".
 DELETION_SOURCES = MappingProxyType({
     pc_records.ADAPTER_STORAGE_PURGE: "receipt",
     pc_records.ADAPTER_STORAGE_REMOVE_ORIGINALS: "files",
     pc_records.ADAPTER_STORAGE_DELETE_SELECTED: "rows_file",
+    pc_records.ADAPTER_STORAGE_RETENTION_RELEASE: "rows",
+    pc_records.ADAPTER_STORAGE_SESSION_RELEASE: "rows",
 })
 # Above the service's 10,000 retention rows plus its own namespaces, so retained recovery never locks a
-# new plan out (#1); D-015 later narrows the roots to one per destination.
+# new plan out; the service later narrows the roots to one per destination.
 MAX_PROTECTED_ROOTS = 16_384
 MAX_PATH_TEXT = 2000
 
@@ -99,7 +106,7 @@ def deletion_size(adapter_id, plan):
         if source == "rows_file":
             sizes, count = [plan["rows_file"]["row_bytes"]], plan["rows_file"]["row_count"]
         else:
-            rows = plan["files"] if source == "files" else [record["original"] for record in plan["receipt"]["records"]]
+            rows = [record["original"] for record in plan["receipt"]["records"]] if source == "receipt" else plan[source]
             sizes, count = [row["size"] for row in rows], len(rows)
     except (KeyError, TypeError) as error:
         raise pc_records.Refusal("storage-payload", "A permanent deletion's plan must list the items it deletes and their sizes") from error
@@ -130,10 +137,17 @@ def validate_payload(payload, *, adapter_id, mode, plan_sha256):
     for root in roots:
         absolute_path(root, "A protected root")
     absolute_path(payload["output_root"], "The storage output root")
-    if "restore_probe_destination" in payload:
+    for field in BACKUP_OPTIONAL & set(payload):
         if adapter_id != pc_records.ADAPTER_STORAGE_BACKUP_CREATE:
-            _refuse("Only a reviewed backup can include a restore-probe destination")
-        absolute_path(payload["restore_probe_destination"], "The restore-probe destination")
+            _refuse("Only a reviewed backup can include a backup or restore-probe destination")
+        absolute_path(payload[field], "The " + field.replace("_", " "))
+    if adapter_id == pc_records.ADAPTER_STORAGE_BACKUP_CREATE:
+        # The field is what reserves that folder before the first write, so it is there exactly when the plan is external.
+        external = plan.get("external", False)
+        if type(external) is not bool or external != ("backup_destination" in payload):
+            _refuse("A backup to another drive must name that folder as its destination, and only such a backup may")
+        if external and payload["backup_destination"] != plan.get("destination"):
+            _refuse("A backup destination is exactly the reviewed backup's own folder on another drive")
     # The typed reply names this count and size, so they must be exactly what the plan deletes.
     expected = deletion_size(adapter_id, plan)
     if expected == (None, None):

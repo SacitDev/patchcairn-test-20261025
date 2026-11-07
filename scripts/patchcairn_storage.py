@@ -6,6 +6,12 @@ import json
 import sys
 from pathlib import Path
 
+if __name__ == "__main__" and not (sys.flags.isolated and sys.flags.no_site):
+    # Before anything else is imported or written: an interpreter that may load other code is refused.
+    print("Storage hold (interpreter-not-isolated): start this tool with python -I -S -B so no other code is loaded "
+          "into it; nothing was read or written.", file=sys.stderr)
+    raise SystemExit(2)
+
 # Explicit sibling import supports isolated -I -S -B without ambient PYTHONPATH.
 sys.path.insert(0, str(Path(__file__).absolute().parent))
 from storage_ops import ScopedFSError, StorageRefusal, StorageService, render_storage, storage_capabilities

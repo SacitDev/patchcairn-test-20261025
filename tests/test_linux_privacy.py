@@ -516,5 +516,70 @@ class DrvfsHoldTests(unittest.TestCase):
         self.assertEqual(os.listdir(fixture), [])
 
 
+
+class VolumeIdentityTests(unittest.TestCase):
+    """linux_privacy.volume_identity: the file system UUID that /dev/disk/by-uuid names for the folder's device, never
+    the device number or statvfs f_fsid themselves."""
+
+    def lookup(self, table):
+        def stat_(path):
+            if path not in table:
+                raise FileNotFoundError(path)
+            return table[path]
+        return stat_
+
+    def test_uuid_matched_by_device_through_by_uuid(self):
+        block = stat.S_IFBLK | 0o660
+        table = {"/media/example/backup": types.SimpleNamespace(st_dev=0x801, st_mode=stat.S_IFDIR | 0o700, st_rdev=0),
+                 "/dev/disk/by-uuid/1111-2222": types.SimpleNamespace(st_dev=5, st_mode=block, st_rdev=0x811),
+                 "/dev/disk/by-uuid/0f1e2d3c-aaaa-bbbb-cccc-0123456789ab": types.SimpleNamespace(st_dev=5, st_mode=block, st_rdev=0x801),
+                 "/dev/disk/by-uuid/not-a-block": types.SimpleNamespace(st_dev=5, st_mode=stat.S_IFREG | 0o600, st_rdev=0x801)}
+        listing = lambda folder: ["not-a-block", "1111-2222", "0f1e2d3c-aaaa-bbbb-cccc-0123456789ab", "../escape"]  # noqa: E731
+        self.assertEqual(privacy.volume_identity("/media/example/backup", lookup=self.lookup(table), listdir=listing),
+                         "linux-volume:0f1e2d3c-aaaa-bbbb-cccc-0123456789ab")
+
+    def test_fat_volume_known_only_by_its_device_number_has_no_identity(self):
+        table = {"/media/example/usb": types.SimpleNamespace(st_dev=0x821, st_mode=stat.S_IFDIR | 0o755, st_rdev=0),
+                 "/dev/disk/by-uuid/1111-2222": types.SimpleNamespace(st_dev=5, st_mode=stat.S_IFBLK | 0o660, st_rdev=0x811)}
+        self.assertIsNone(privacy.volume_identity("/media/example/usb", lookup=self.lookup(table), listdir=lambda folder: ["1111-2222"]))
+        self.assertIsNone(privacy.volume_identity("/media/example/usb", lookup=self.lookup(table), listdir=mock.Mock(side_effect=OSError(2, "x"))))
+        self.assertIsNone(privacy.volume_identity("/missing", lookup=self.lookup(table), listdir=lambda folder: []))
+
+    FSID = "0f1e2d3c-aaaa-bbbb-cccc-0123456789ab"
+
+    def btrfs(self, *, fsid=FSID, device=52, mount_id="22"):
+        """volume_identity's arguments on a fictional btrfs mount: device number 0:52, no block device by-uuid names."""
+        table = {"/media/example/btrfs": types.SimpleNamespace(st_dev=device, st_mode=stat.S_IFDIR | 0o700, st_rdev=0),
+                 "/dev/disk/by-uuid/1111-2222": types.SimpleNamespace(st_dev=5, st_mode=stat.S_IFBLK | 0o660, st_rdev=0x801)}
+        files = {"/proc/self/fdinfo/41": f"pos:\t0\nflags:\t02100000\nmnt_id:\t{mount_id}\nino:\t256\n",
+                 "/proc/self/mountinfo": "22 1 0:40 /data /media rw,relatime shared:1 - btrfs /dev/sda2 rw,subvol=/data\n"
+                                         "24 1 0:42 / /run rw - tmpfs tmpfs rw\n"}
+        folders = {"/dev/disk/by-uuid": ["1111-2222"], "/sys/fs/btrfs": ["features", fsid], f"/sys/fs/btrfs/{fsid}/devices": ["sda2"]}
+
+        def listdir(path):
+            if path not in folders:
+                raise FileNotFoundError(path)
+            return folders[path]
+        self.closed = []
+        return {"lookup": self.lookup(table), "listdir": listdir, "realpath": lambda path: path, "read": files.get,
+                "opener": lambda path, flags: 41, "closer": self.closed.append}
+
+    def test_btrfs_is_known_by_the_fsid_of_its_mount(self):
+        """btrfs numbers its devices anonymously, so by-uuid never matches. Fakes only: this has not run on a real btrfs."""
+        self.assertEqual(privacy.volume_identity("/media/example/btrfs", **self.btrfs()), "linux-volume:" + self.FSID)
+        self.assertEqual(self.closed, [41])
+
+    def test_btrfs_without_a_proven_fsid_has_no_identity(self):
+        self.assertIsNone(privacy.volume_identity("/media/example/btrfs", **self.btrfs(mount_id="24")))  # tmpfs
+        self.assertEqual(self.closed, [41])
+        self.assertIsNone(privacy.volume_identity("/media/example/btrfs", **self.btrfs(mount_id="99")))
+        self.assertIsNone(privacy.volume_identity("/media/example/btrfs", **self.btrfs(fsid="not-a-uuid")))
+        self.assertIsNone(privacy.volume_identity("/media/example/btrfs", **{**self.btrfs(), "opener": mock.Mock(side_effect=OSError(13, "x"))}))
+
+    def test_a_block_device_never_reaches_the_btrfs_walk(self):
+        arguments = {**self.btrfs(device=0x811), "opener": mock.Mock(side_effect=AssertionError("the folder was opened"))}
+        self.assertIsNone(privacy.volume_identity("/media/example/btrfs", **arguments))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

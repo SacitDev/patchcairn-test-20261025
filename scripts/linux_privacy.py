@@ -22,7 +22,7 @@ _NATIVE_TYPES = frozenset({0xEF53, 0x58465342, 0x9123683E, 0x01021994, 0x858458F
 # the kernel's exFAT driver. Neither keeps permissions, so neither is private storage.
 _FAT_TYPES = frozenset({0x4D44})
 _EXFAT_TYPES = frozenset({0x2011BAB0})
-# TMPFS_MAGIC and RAMFS_MAGIC: memory, emptied at unmount or restart, so never a backup destination (D-069).
+# TMPFS_MAGIC and RAMFS_MAGIC: memory, emptied at unmount or restart, so never a backup destination.
 _MEMORY_TYPES = frozenset({0x01021994, 0x858458F6})
 _ST_RDONLY = 1  # statfs f_flags (Linux 2.6.36+): mounted read-only
 # Paths of virtual-machine disks in sysfs (virtio, Hyper-V VMBus and its MSFT1000 ACPI node, Xen's /sys/devices/vbd-*),
@@ -242,16 +242,24 @@ def _members(path, realpath, read, listdir, depth=0):
 
 def _disks(descriptor, device, realpath, read, listdir):
     """The distinct whole disks holding the file system of the open ``descriptor`` (device number ``device``, else its
-    fstat), or None when sysfs cannot trace them. A btrfs file system has anonymous device numbers that differ from
-    mountinfo's, so its mount is found by the descriptor's mnt_id (/proc/self/fdinfo); its mount source and
-    /sys/fs/btrfs/<fsid>/devices/ then give its member devices."""
+    fstat), or None when sysfs cannot trace them; a btrfs file system by the member devices _btrfs gives."""
     try:
         device = os.fstat(descriptor).st_dev if device is None else device
     except OSError:
         return None
     if os.major(device):
         found = _members(realpath(f"/sys/dev/block/{os.major(device)}:{os.minor(device)}"), realpath, read, listdir)
-        return list(dict.fromkeys(found)) if found else None
+    else:
+        members = (_btrfs(descriptor, realpath, read, listdir) or (None, []))[1]
+        disks = [_members(realpath(f"/sys/class/block/{name}"), realpath, read, listdir) for name in members]
+        found = None if None in disks else [disk for group in disks for disk in group]
+    return list(dict.fromkeys(found)) if found else None
+
+
+def _btrfs(descriptor, realpath, read, listdir):
+    """(fsid, member device names) of the btrfs file system the open ``descriptor`` lies on, or None. Its device numbers
+    are anonymous and differ from mountinfo's, so its mount is found by the descriptor's mnt_id (/proc/self/fdinfo); its
+    mount source is then found among /sys/fs/btrfs/<fsid>/devices/."""
     fdinfo = (read(f"/proc/self/fdinfo/{descriptor}") or "").splitlines()
     mount, found = dict(line.split(":", 1) for line in fdinfo if ":" in line).get("mnt_id", "").strip(), None
     for line in (read("/proc/self/mountinfo") or "").splitlines() if mount else ():
@@ -263,9 +271,8 @@ def _disks(descriptor, device, realpath, read, listdir):
             for fsid in sorted(_listing(listdir, "/sys/fs/btrfs")):
                 members = sorted(_listing(listdir, f"/sys/fs/btrfs/{fsid}/devices"))
                 if source in members:
-                    disks = [_members(realpath(f"/sys/class/block/{name}"), realpath, read, listdir) for name in members]
-                    found = None if None in disks else [disk for group in disks for disk in group]
-    return list(dict.fromkeys(found)) if found else None
+                    found = fsid, members
+    return found
 
 
 def _listing(listdir, path):
@@ -273,6 +280,40 @@ def _listing(listdir, path):
         return listdir(path)
     except OSError:
         return []
+
+
+def volume_identity(path, *, lookup=os.stat, listdir=os.listdir, by_uuid="/dev/disk/by-uuid", realpath=os.path.realpath,
+                    read=_text, opener=os.open, closer=os.close):
+    """The UUID of the file system holding the folder ``path`` as "linux-volume:<uuid>"; the file system keeps it across a
+    restart and a reconnect. It is found by matching the folder's device number with the block devices /dev/disk/by-uuid
+    names, or, for the anonymous device numbers of btrfs, as the fsid of the folder's mount (_btrfs), whose /sys/fs/btrfs
+    folder name is that UUID. None when neither matches (tmpfs, overlay, no udev, a file system without one). Never the
+    device number or statvfs f_fsid themselves: they change when the drive comes back as another device."""
+    try:
+        device = lookup(path).st_dev
+        names = sorted(_listing(listdir, by_uuid))[:4096]
+    except (OSError, TypeError, ValueError):
+        return None
+    for name in names:
+        if not isinstance(name, str) or not re.fullmatch(r"[0-9A-Za-z-]{1,64}", name):
+            continue
+        try:
+            info = lookup(by_uuid + "/" + name)  # udev's link leads to the block device
+        except (OSError, ValueError):
+            continue
+        if stat.S_ISBLK(info.st_mode) and info.st_rdev == device:
+            return "linux-volume:" + name
+    if device >> 8 & 0xfff or device >> 44:  # a real block device major (os.major), which no btrfs mount has
+        return None
+    try:
+        descriptor = opener(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+    except (OSError, TypeError, ValueError):
+        return None
+    try:
+        found = _btrfs(descriptor, realpath, read, listdir)
+    finally:
+        closer(descriptor)
+    return None if found is None or not re.fullmatch(r"[0-9A-Fa-f-]{36}", found[0]) else "linux-volume:" + found[0]
 
 
 def _fixed(folder, read):
@@ -293,8 +334,8 @@ def _fixed(folder, read):
 
 
 def fixed_disk(descriptor, *, device=None, realpath=os.path.realpath, read=_text, listdir=os.listdir):
-    """True only when sysfs proves that every disk holding the file system of the open ``descriptor`` is fixed (D-069,
-    D-072): device-mapper, md and btrfs are followed to their member disks. A device it cannot trace is not fixed."""
+    """True only when sysfs proves that every disk holding the file system of the open ``descriptor`` is fixed:
+    device-mapper, md and btrfs are followed to their member disks. A device it cannot trace is not fixed."""
     disks = _disks(descriptor, device, realpath, read, listdir)
     return bool(disks) and all(_fixed(folder, read) for folder in disks)
 

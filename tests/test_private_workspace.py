@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import ctypes
 from contextlib import contextmanager
+import errno
 import os
 from pathlib import Path, PurePosixPath
 import shutil
@@ -24,8 +25,7 @@ import private_workspace as private
 import win32_files
 
 FIXTURES = ROOT / "work" / "test-fixtures"
-NAME_RULE_MESSAGE = ("a folder name on this path is one PatchCairn does not accept (a reserved Windows name, too long, or an "
-                     "unsupported character)")
+NAME_RULE_MESSAGE = '" is one PatchCairn does not accept (a reserved Windows name, too long, or an unsupported character)'
 
 
 def remove_fixture(path):
@@ -435,7 +435,7 @@ class PathRuleTests(unittest.TestCase):
                     private._absolute(base + name)
                 self.assertTrue(caught.exception.code == "private-path-invalid")
                 # The person learns why: the code stays, the message names the rule.
-                self.assertTrue(str(caught.exception) == NAME_RULE_MESSAGE)
+                self.assertTrue(str(caught.exception).startswith('the folder name "') and str(caught.exception).endswith(NAME_RULE_MESSAGE))
         for name in ("CON", "CONIN$", "CONOUT$", "COM\u00b9", "LPT\u00b3"):
             with self.subTest(reserved=repr(name)), self.assertRaises(pc_paths.PathRefusal) as caught:
                 pc_paths.relative(name)
@@ -492,6 +492,93 @@ class PosixPrivateWorkspaceTests(unittest.TestCase):
         with self.assertRaises(private.PrivateWorkspaceError) as caught:
             private.ensure_private_directory(FIXTURES, boundary=FIXTURES)
         self.assertTrue(caught.exception.code == "private-boundary-escape")
+
+
+
+class PublishTests(unittest.TestCase):
+    """publish_private_new: a record appears whole under its name or not at all, never over another, and the new name is synced."""
+
+    def setUp(self):
+        self.folder = FIXTURES / ("publish-" + uuid.uuid4().hex)
+        try:
+            private.ensure_private_directory(self.folder, create=True, parents=True)
+        except private.PrivateWorkspaceError as error:
+            if os.name == "posix":
+                self.skipTest("only on posix: actual workspace POSIX private-storage capability unavailable: " + error.code)
+            raise
+        self.addCleanup(remove_fixture, self.folder)
+        self.path = self.folder / "record.json"
+
+    def temporary(self):
+        return sorted(item.name for item in self.folder.iterdir() if item.name.startswith(".w"))
+
+    def test_a_record_is_published_whole_and_never_over_another(self):
+        private.publish_private_new(self.path, b"first")
+        with self.assertRaises(private.PrivateWorkspaceError) as caught:
+            private.publish_private_new(self.path, b"second")
+        self.assertEqual((caught.exception.code, self.path.read_bytes(), self.temporary()), ("private-file-create-refused", b"first", []))
+        private.ensure_private_file(self.path)
+
+    def test_a_temporary_name_already_taken_is_left_alone(self):
+        fixed = uuid.UUID(int=0xABCDEF1 << 100)  # its hex form starts "abcdef1"
+        left = self.folder / (".w" + fixed.hex[:7])
+        private.write_private_new(left, b"left by an earlier kill")
+        with mock.patch.object(private.uuid, "uuid4", return_value=fixed), self.assertRaises(private.PrivateWorkspaceError) as caught:
+            private.publish_private_new(self.path, b"new")
+        self.assertEqual((caught.exception.code, left.read_bytes(), self.path.exists()), ("private-file-create-refused", b"left by an earlier kill", False))
+
+    def test_any_other_failure_of_the_new_name_refuses_and_leaves_no_temporary_file(self):
+        primitive = "rename" if os.name == "nt" else "link"
+        with mock.patch.object(private.os, primitive, side_effect=OSError(errno.EIO, "Fictional failure")), \
+                self.assertRaises(private.PrivateWorkspaceError) as caught:
+            private.publish_private_new(self.path, b"never")
+        self.assertEqual((caught.exception.code, self.path.exists(), self.temporary()), ("private-file-publish-unresolved", False, []))
+
+    @unittest.skipUnless(os.name == "nt", "only on windows: a rename there is refused while another program has the file open")
+    def test_a_short_refusal_of_the_rename_is_tried_again_and_a_lasting_one_refuses(self):
+        real, calls, waits = os.rename, [], []
+
+        def refused_once(source, target):
+            calls.append(source)
+            if len(calls) == 1:
+                raise PermissionError(errno.EACCES, "Fictional scanner has the file open")
+            return real(source, target)
+        with mock.patch.object(private.os, "rename", side_effect=refused_once), mock.patch.object(private.time, "sleep", side_effect=waits.append):
+            private.publish_private_new(self.path, b"published")
+        self.assertEqual((len(calls), self.path.read_bytes(), waits, self.temporary()), (2, b"published", [private.RENAME_WAIT_SECONDS], []))
+        other = self.folder / "other.json"
+        with mock.patch.object(private.os, "rename", side_effect=PermissionError(errno.EACCES, "Fictional scanner")) as rename, \
+                mock.patch.object(private.time, "sleep"), self.assertRaises(private.PrivateWorkspaceError) as caught:
+            private.publish_private_new(other, b"never")
+        self.assertEqual((caught.exception.code, rename.call_count, other.exists(), self.temporary()),
+                         ("private-file-publish-unresolved", private.RENAME_TRIES, False, []))
+
+    def test_the_new_name_is_synced(self):
+        # POSIX syncs the folder once the new name is there; Windows syncs the renamed file.
+        real, synced = os.fsync, []
+
+        def recording(descriptor):
+            info = os.fstat(descriptor)
+            synced.append(((info.st_dev, info.st_ino), self.path.exists()))
+            return real(descriptor)
+        with mock.patch.object(private.os, "fsync", side_effect=recording):
+            private.publish_private_new(self.path, b"synced")
+        info = os.stat(self.path if os.name == "nt" else self.folder)
+        self.assertEqual(synced[-1], ((info.st_dev, info.st_ino), True))
+
+
+class RefusalTypeTests(unittest.TestCase):
+    def test_privacy_errors_are_shared_refusals_keeping_their_codes(self):
+        import pc_records
+        import win32_files
+        error = private.PrivateWorkspaceError("private-path-invalid", "a folder name is not accepted")
+        self.assertIsInstance(error, pc_records.Refusal)
+        self.assertIsInstance(error, ValueError)
+        self.assertEqual((error.code, str(error)), ("private-path-invalid", "a folder name is not accepted"))
+        self.assertEqual(str(private.PrivateWorkspaceError("private-owner-or-mode-refused")), "private-owner-or-mode-refused")
+        refusal = win32_files.PrivacyRefusal("private-dacl-unprotected")
+        self.assertIsInstance(refusal, pc_records.Refusal)
+        self.assertEqual((refusal.code, str(refusal)), ("private-dacl-unprotected", "private-dacl-unprotected"))
 
 
 if __name__ == "__main__":

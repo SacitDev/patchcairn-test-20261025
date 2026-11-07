@@ -15,8 +15,11 @@ import unittest
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).absolute().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
-from workflow_core import WorkflowEngine, WorkflowRefusal, digest
+from workflow_core import WorkflowEngine, WorkflowRefusal, digest, encoded
+import engine_journal
+import engine_recovery
 import pc_records
+from unittest import mock
 from test_engine_journal import WorkflowFixture
 
 
@@ -72,7 +75,8 @@ class WorkflowTests(WorkflowFixture):
         self.plan_hash = self.engine.register_plan(self.sid, plan=plan)["data"]["plan_sha256"]
         self.plan = plan
         for reviewer, role in (("verifier-review-a", "compatibility_data"), ("verifier-review-b", "evidence_security")):
-            self.engine.record_review(self.sid, plan_sha256=self.plan_hash, reviewer_id=reviewer, role=role, verdict="approved", evidence_ids=[self.evidence("review", {"checked": True})], notes="Fictional exact review")
+            review = {"schema": "patchcairn.review", "schema_version": 1, "plan_sha256": self.plan_hash, "role": role, "verdict": "approved", "reviewer_id": reviewer, "attestation": "coordinator-attested"}
+            self.engine.record_review(self.sid, plan_sha256=self.plan_hash, reviewer_id=reviewer, role=role, verdict="approved", evidence_ids=[self.evidence("review", {"checked": True}, content=encoded(review))], notes="Fictional exact review")
         self.engine.approve_plan(self.sid, plan_sha256=self.plan_hash, action_ids=["fictional-action"], owner_quote="Apply this exact fictional action.", owner_message_id="fictional-verifier-plan")
         self.engine.advance_stage(self.sid, evidence_ids=[])
         # The begin-time re-check of a dependent action holds when no verifier was supplied.
@@ -130,6 +134,43 @@ class WorkflowTests(WorkflowFixture):
         self.assertEqual(result["data"]["plan_sha256"], digest(correct))
         self.assertEqual(self.verified, [{"kind": "backup_recovery", "output_root": binding_b["output_root"], "backup_receipt": binding_b["backup_receipt"], "restore_receipt": binding_b["restore_receipt"], "purge_receipt": original_b}])
         self.assertFalse(self.state()["operations"])
+
+
+
+class ContainmentTests(WorkflowFixture):
+    """engine_recovery compares parts through private_workspace.relative_parts: a look-alike part (U+212A, the Kelvin
+    sign) is another folder, equal paths stay inside, and the evidence bounds are read from engine_journal at call time."""
+
+    def test_owned_output_and_work_artifact_refuse_look_alike_parts(self):
+        work = self.engine.root / "work"
+        self.assertEqual(engine_recovery._owned_output(self.engine, str(work)), work)  # inclusive, as before
+        self.assertEqual(engine_recovery._owned_output(self.engine, str(work / "out")), work / "out")
+        look_alike = self.engine.root / "wor\u212a" / "out"
+        with self.assertRaisesRegex(WorkflowRefusal, "owned work output root"):
+            engine_recovery._owned_output(self.engine, str(look_alike))
+        output = work / "out"
+        with self.assertRaisesRegex(WorkflowRefusal, "owned work root"):
+            engine_recovery.work_artifact(self.engine, str(work / "ou\u212a" / "x.json"), "0" * 64, output_root=str(output))
+
+    def test_restore_probe_look_alike_escapes_the_output_root(self):
+        self.plan_ready()
+        binding = self.recovery_binding(self.verified_recovery())
+        output = Path(binding["output_root"])
+        # The probe below work/ spelled with U+212A for its "k": not the output root, so the probe escapes it.
+        self.assertEqual(output.parent.name, "work")
+        look_alike = output.parent.parent / "wor\u212a" / output.name / "restored-probe"
+        binding["restore_receipt"]["destination"] = str(look_alike)
+        forged = self.raw_evidence("recovery", binding)
+        with self.assertRaisesRegex(WorkflowRefusal, "escapes its owned work output root"):
+            self.engine.verify_recovery(self.engine.read_session(self.sid), [forged])
+
+    def test_evidence_bounds_are_read_when_used(self):
+        self.plan_ready()
+        recovery_id = self.verified_recovery()
+        with mock.patch.object(engine_journal, "EVIDENCE_MAX_BYTES", 16):
+            with self.assertRaises(WorkflowRefusal):
+                self.engine.verify_recovery(self.engine.read_session(self.sid), [recovery_id])
+        self.engine.verify_recovery(self.engine.read_session(self.sid), [recovery_id])
 
 
 if __name__ == "__main__":
