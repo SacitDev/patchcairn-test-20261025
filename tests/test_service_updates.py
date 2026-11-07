@@ -21,6 +21,7 @@ from pathlib import Path, PureWindowsPath
 import select
 import shlex
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -1436,37 +1437,47 @@ class ChildTests(unittest.TestCase):
 
     @unittest.skipUnless(hasattr(os, "forkpty"), "only on posix: a pseudo-terminal needs forkpty")
     def test_ctrl_c_in_a_real_terminal_still_returns_the_childs_exit(self):
-        # A real pseudo-terminal: Ctrl-C reaches the whole foreground group, as at sudo's password prompt. The one child is this interpreter.
-        code = "import sys, time; print('waiting', flush=True); time.sleep(30)"
-        pid, master = os.forkpty()
-        if pid == 0:  # the fixture parent, on its own terminal
-            try:
-                exit_code = service_updates._start_child((sys.executable, "-I", "-S", "-c", code), env=dict(os.environ), cwd="/", terminal=True)[0]
-                os.write(1, f"exit={exit_code}\n".encode())
-            finally:
-                os._exit(0)
-        try:
-            text, sent, deadline = b"", False, time.monotonic() + 30
-            while b"exit=" not in text and time.monotonic() < deadline:
-                if select.select([master], [], [], 0.5)[0]:
-                    try:
-                        chunk = os.read(master, 4096)
-                    except OSError:
-                        break  # the terminal closed: the fixture parent is gone
-                    text += chunk
-                    if b"waiting" in text and not sent:
-                        os.write(master, b"\x03")
-                        sent = True
-            self.assertTrue(sent, text)
-            self.assertIn(b"exit=", text, "the parent died with its child, so no exit would have been recorded")
-        finally:
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except OSError:
-                pass
-            os.waitpid(pid, 0)
-            os.close(master)
+        # A real pseudo-terminal: Ctrl-C reaches the whole foreground group, as at sudo's password prompt. The terminal is
+        # made by a fresh interpreter with one thread, so its fork is safe; its forked child is the fixture parent.
+        done = subprocess.run([sys.executable, "-I", "-S", "-c", PTY_SCRIPT, str(ROOT / "scripts")], capture_output=True, timeout=120)
+        self.assertEqual(done.returncode, 0, done.stderr.decode("utf-8", "replace"))
+        self.assertIn(b"ctrl-c sent", done.stdout, done.stdout)
+        self.assertIn(b"exit=", done.stdout, "the parent died with its child, so no exit would have been recorded")
 
+
+PTY_SCRIPT = r"""
+import os, select, signal, sys, time
+sys.path.insert(0, sys.argv[1])
+import service_updates
+code = "import sys, time; print('waiting', flush=True); time.sleep(30)"
+pid, master = os.forkpty()
+if pid == 0:
+    try:
+        exit_code = service_updates._start_child((sys.executable, "-I", "-S", "-c", code), env=dict(os.environ), cwd="/", terminal=True)[0]
+        os.write(1, f"exit={exit_code}\n".encode())
+    finally:
+        os._exit(0)
+text, sent, deadline = b"", False, time.monotonic() + 30
+try:
+    while b"exit=" not in text and time.monotonic() < deadline:
+        if select.select([master], [], [], 0.5)[0]:
+            try:
+                chunk = os.read(master, 4096)
+            except OSError:
+                break
+            text += chunk
+            if b"waiting" in text and not sent:
+                os.write(master, b"\x03")
+                sent = True
+finally:
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+    os.waitpid(pid, 0)
+    os.close(master)
+sys.stdout.write(("ctrl-c sent " if sent else "") + text.decode("utf-8", "replace"))
+"""
 
 @refusals_fail
 class AptRouteFlowTests(unittest.TestCase):
