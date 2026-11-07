@@ -1,7 +1,7 @@
 """PatchCairn session report (layer L2; imports only the standard library, pc_records and pc_paths).
 
-render_session(session, *, assessment=None, free_space=None, packages=None, retained=None) -> bytes renders one
-session snapshot from WorkflowEngine.read_session as a UTF-8 HTML page built from templates/report.html. It is
+render_session(session, *, assessment=None, free_space=None, packages=None, retained=None, labels=None, restarts=None) ->
+bytes renders one session snapshot from WorkflowEngine.read_session as a UTF-8 HTML page built from templates/report.html. It is
 pure: it reads only the template, writes nothing and starts no process, and the same input gives the same bytes
 for the same Python version (pc_paths.display follows that version's Unicode tables). Every refusal is a
 pc_records.Refusal: "report-input" for a malformed session or optional input, "report-template" for a missing or
@@ -9,15 +9,18 @@ changed template, "report-record" for a report record of the wrong layout, and t
 
 The page has a header (the session fields, two page notes and, for a fixture session, the fictional-demonstration
 banner) and nine sections in this order: Scope, Findings, Plan, Assistant reviews of the plan, Approvals,
-Outcomes, Free space, Package results and Recovery copies kept. Values are shown as recorded. A record the session
+Outcomes, Free space, Update results and Recovery copies kept. Values are shown as recorded. A record the session
 does not hold shows "not recorded"; an empty list inside a recorded record shows "None listed". Every owner
-decision (scope, approvals, standing policy, checkpoint, reconciliation, protected-consent, assessment-completion,
-schedule and restart decisions) and every review shows how it was recorded: "coordinator-attested" in words, "Not
-stated" when the record carries no label, and any other label as "Unrecognised label: <label>". The full plan
-fingerprint appears only under Plan; elsewhere a record is "Same as the plan above" or names an earlier plan by its
-first eight characters. Each step shows who authorized it, and a step whose installer asked for a restart (code 3010)
-shows that it is waiting for one until a boot is checked. The session's created_utc must be a UTC time (it dates the
-page title) and its settings_revision must not be negative.
+decision (scope, approvals, standing policy, checkpoint, reconciliation, assessment-completion and schedule decisions)
+and every review shows how it was recorded: "coordinator-attested" in words, "Not stated" when
+the record carries no label, and any other label as "Unrecognised label: <label>". The full plan fingerprint appears
+only under Plan; elsewhere a record is "Same as the plan above" or names an earlier plan by its first eight
+characters. Each step shows who authorized it. A step with a recorded restart signal (restart_pending, exactly
+{"signal", "source"}) shows that signal, or "restart: unknown" without a source; restart_verification (exactly
+{"boot_observed", "evidence_id", "sha256", "recorded_utc"}) shows when a later start of the computer was recorded, and
+the restarts input says whether the step still waits. A step's result is shown in words with the recorded code in brackets,
+and its Step row names its plan action. The session's created_utc must be a UTC time (it dates the page title) and its
+settings_revision must not be negative.
 
 Optional inputs, each a closed key set (None or an empty list shows "not recorded"; malformed input is refused):
   assessment  the decoded patchcairn.assessment.summary record with exactly ASSESSMENT_KEYS. Its job, mode and
@@ -28,8 +31,21 @@ Optional inputs, each a closed key set (None or an empty list shows "not recorde
               "expected_net_bytes": int|None}: free space measured on each drive before and after the work (never
               negative) and PatchCairn's computed net change, shown as the estimate; the measured change is after
               minus before and is "not recorded" unless both measurements are.
-  packages    a list of rows {"manager": text, "package": text, "outcome": text, "restart": text}.
+  packages    a list of update-result rows {"manager": text, "package": text, "outcome": text, "restart": text,
+              "category": text, "group": text}: outcome is the update result, one of pc_records.UPDATE_RESULTS,
+              including an item left out, not run or waiting for a restart; category must be UPDATE_RESULTS[outcome]
+              and group one of pc_records.OUTCOME_GROUPS; restart is one of PACKAGE_RESTARTS. Only these rows carry a
+              category; backup, cleanup and diagnosis steps are shown under Outcomes as recorded.
   retained    a list of rows {"kind": text, "location": text, "bytes": int|None} (bytes never negative).
+  labels      engine_text.report_labels(): a record with exactly LABEL_KEYS, each a record of code -> non-blank
+              text; categories, groups and results name exactly pc_records' sets, package_restarts exactly PACKAGE_RESTARTS.
+              With labels, the job, stage, status, action kinds, checkpoints, restart signals and the package rows'
+              restart, result, category and group are shown as their label with the code in brackets (a code without a
+              label as recorded); without labels every code is shown as recorded.
+  restarts    a record of operation id -> engine_journal.restart_state(operation), one of RESTART_STATES: the engine's one
+              reading of a restart record, passed as data because this module cannot import the engine. Only "waiting"
+              shows a step as waiting for a restart. It names only this session's operations and must fit the recorded
+              restart; a step with a restart signal and no entry shows "Restart seen: not recorded".
 
 Every shown value goes through pc_paths.display. Path values (scope roots, content sources, location and volume)
 are split first, on backslash and slash for a Windows session and on slash otherwise, so a Windows path stays
@@ -66,8 +82,18 @@ RECORD_KEYS = frozenset({"schema", "schema_version", "generated_utc", "title", "
 ASSESSMENT_KEYS = frozenset({"schema", "schema_version", "job", "mode", "scope_sha256", "settings_revision", "summary",
                              "findings", "limitations", "assessed_evidence_ids"})
 FREE_SPACE_KEYS = ("volume", "before_bytes", "after_bytes", "expected_net_bytes")
-PACKAGE_KEYS = ("manager", "package", "outcome", "restart")
+PACKAGE_KEYS = ("manager", "package", "outcome", "restart", "category", "group")
 RETAINED_KEYS = ("kind", "location", "bytes")
+# The keys of engine_text.report_labels(), copied because this L2 module cannot import the engine;
+# test_report.ReportTests.test_label_keys_match_the_engine_tables catches any drift.
+LABEL_KEYS = frozenset({"jobs", "stages", "actions", "statuses", "checkpoints", "restart_signals", "package_restarts", "categories",
+                        "groups", "results"})
+# The values of engine_journal.restart_state, copied for the same reason; test_report.ReportTests checks them against it.
+RESTART_STATES = frozenset({"none", "waiting", "boot_observed"})
+# What a package row's restart says: the service writes "pending" for a step in state "waiting".
+PACKAGE_RESTARTS = frozenset({"none", "pending", "boot_observed", "unknown"})
+RESTART_PENDING_KEYS = frozenset({"signal", "source"})
+RESTART_VERIFICATION_KEYS = frozenset({"boot_observed", "evidence_id", "sha256", "recorded_utc"})
 MAX_INTEGER = 10 ** 20  # pc_records refuses integers of more than 20 digits
 NOT_RECORDED = "not recorded"
 NONE_LISTED = "None listed"
@@ -96,27 +122,29 @@ SAME_PLAN = "Same as the plan above"
 NO_RESULT = ("No result recorded: this step started, but no result had been recorded when this report was made. It may "
              "still be running or may have stopped part-way. Ask the assistant (PatchCairn: status) before starting anything "
              "else on this computer.")
-RESTART_WAITING = ("Waiting for a restart: the installer reported that the computer must restart to finish this step (code "
-                   "3010). The step stays unfinished until the computer has restarted and the result is checked.")
-RESTART_UNDECIDED = "Not decided yet. Tell the assistant whether to restart now or later (PatchCairn: resolve)."
+RESTART_WAITING = ("Waiting for a restart: this update needs a restart and a check before the rest can continue. PatchCairn "
+                   "never restarts the computer: restart it yourself when you are ready, then say PatchCairn: resume.")
+RESTART_CLOSED = ("Waiting for a restart: this update still needs a restart and a check before its result is known. PatchCairn never "
+                  "restarts the computer: restart it yourself when you are ready, then say PatchCairn: status. This job stays stopped.")
+RESTART_UNKNOWN = "restart: unknown"
 OUTCOMES_NOTE = ("Results are shown as recorded. 'failed' means the step did not complete, 'partial' means only part of it "
-                 "took effect, and 'unknown' means its effect could not be confirmed. After any of these, PatchCairn holds "
-                 "further changes in this session until the result is reconciled: ask the assistant what changed and what "
-                 "was kept (PatchCairn: status, then PatchCairn: resolve).")
+                 "took effect, and 'unknown' means its effect could not be confirmed. After any of these, PatchCairn makes no "
+                 "further change in this session until the result is cleared up: ask the assistant what changed and what was "
+                 "kept (PatchCairn: status, then PatchCairn: resolve). The exception is an update that did not install while "
+                 "what is installed was checked: only the steps that depend on it stop.")
 EARLIER_PLAN_NOTE = ("Some steps belong to an earlier plan in this session. That plan, its reviews and its approval were "
                      "replaced by the plan above, so this page does not show them; each step still shows who authorized it.")
 FREE_SPACE_NOTES = ("Free space was measured on each drive before and after the work. The measured change includes anything else "
                     "that used or freed space at the same time, such as downloads or system updates.",
                     "The expected change is PatchCairn's estimate: the size of the files removed minus the size of any backup "
-                    "written to the same drive. Quarantine keeps files on the same drive so they can be put back, so it frees no "
-                    "space there.",
+                    "written to the same drive. Setting files aside keeps them on the same drive so they can be put back, so it "
+                    "frees no space there.",
                     "1 GB here is 1,000,000,000 bytes.")
 EXPLORER_NOTE = " Windows File Explorer counts 1,073,741,824 bytes per GB, so it shows a slightly smaller number."
 LLM_CONTENT_NONE = ("None listed. File names, folder names, sizes and other details from the allowed checks can still appear "
                     "in the chat with the assistant.")
-RETAINED_NOTE = ("PatchCairn keeps these so a change can be undone or files restored. They use disk space until you decide "
-                 "to release them. Ask your assistant before deleting any of them, because afterwards the change cannot be "
-                 "undone.")
+RETAINED_NOTE = ("PatchCairn keeps these so a change can be undone or files restored. They use space on the drive shown until "
+                 "you choose to delete them. Ask your assistant first: afterwards the change cannot be undone.")
 MODES = {"fixture": "practice with made-up data", "real": "a real computer"}
 PLATFORMS = {"windows": "Windows", "macos": "macOS", "linux": "Linux", "unknown": "not stated"}
 SOURCES = {"current_owner_chat": "the chat", "current_owner_terminal": "the terminal"}
@@ -125,21 +153,23 @@ VERDICTS = {"approved": "no reason to stop found", "hold": "a reason to stop was
 TARGETS = {"whole_device": "the whole computer", "selected_paths": "selected folders or files",
            "specific_problem": "one specific problem"}
 OPERATIONS = {"metadata": "file and system details", "diagnosis": "problem diagnosis", "content_read": "reading selected file contents"}
-RESTART_CHOICES = {"defer": "Restart later", "authorize": "Restart allowed; you restart the computer yourself"}
 TYPED_REPLIES = {"permanent_data_loss": "Permanent deletion", "firmware_risk": "Firmware update"}
+# engine_text.RETAINED_LABELS, copied because this L2 module cannot import the engine; test_engine_text compares them.
+RETAINED_KINDS = {"backup": "Backup", "recovery": "Recovery copy", "quarantine": "Files set aside", "destination": "Backup folder you chose",
+                  "reservation": "Reserved for an unfinished backup"}
+OUTCOME_WORDS = {"succeeded": "Finished", "failed": "Did not finish", "partial": "Only part took effect", "unknown": "Not confirmed"}
 # The separate acknowledgment's heading by its recorded type; another type is shown as it is.
 ACK_HEADINGS = {"no_component_rollback": "Agreement that a repair cannot be rolled back (separate acknowledgment)"}
 RESOLUTIONS = {"replan_required": "A new plan is needed before anything else changes",
-               "effects_accounted": "What changed was accounted for after the session stopped"}
+               "effects_accounted": "What changed was accounted for after the session stopped",
+               "verified_failure": "Did not update; the rest of the batch continued"}
 UNSETTLED = frozenset({"failed", "partial", "unknown"})
 UNITS = (("PB", 10 ** 15), ("TB", 10 ** 12), ("GB", 10 ** 9), ("MB", 10 ** 6), ("KB", 10 ** 3))
 EVIDENCE = (("Evidence", "evidence_id"), ("Kind", "kind"), ("Observed (UTC)", "observed_utc"))
-ACTION_NAME = (("Action", "action_id"), ("Kind", "kind"))
 ACTION_TEXT = (("Benefit", "benefit"), ("Risk", "risk"), ("How it can be undone", "reversibility"),
                ("How the result will be checked", "verification"))
-# Owner decisions kept in pending items: the kind's name and where its owner record is (D-007 labels every one).
+# Owner decisions kept in pending items: the kind's name and where its owner record is (every one is labelled).
 PENDING = {"checkpoint": "Go-ahead at a checkpoint", "reconciliation": "Choice after an unfinished step (reconciliation)",
-           "protected_consent": "Operating-system permission prompt handled (protected consent)",
            "assessment_finish": "Assessment closed (assessment completion)"}
 
 
@@ -190,6 +220,32 @@ def _shown(text):
 def _worded(text, words):
     """A recorded code in plain words with the code kept in brackets; an unknown code is shown as it is."""
     return f"{words[text]} ({pc_paths.display(text)})" if text in words else _shown(text)
+
+
+def _coder(labels):
+    """A function code(text, table) showing a recorded code: with labels, as its label from that table with the code in
+    brackets; without, as recorded. Malformed labels are refused here, before anything renders."""
+    if labels is None:
+        return lambda text, table: _shown(text)
+    if not isinstance(labels, dict) or set(labels) != LABEL_KEYS or not all(
+            isinstance(table, dict) and all(isinstance(code, str) and isinstance(text, str) and text.strip() for code, text in table.items())
+            for table in labels.values()):
+        raise _refused("labels must be a record with exactly the keys " + ", ".join(sorted(LABEL_KEYS)) + ", each naming codes in text")
+    if (set(labels["categories"]) != set(pc_records.OUTCOME_CATEGORIES) or set(labels["groups"]) != set(pc_records.OUTCOME_GROUPS)
+            or set(labels["results"]) != set(pc_records.UPDATE_RESULTS) or set(labels["package_restarts"]) != PACKAGE_RESTARTS):
+        raise _refused("labels must name exactly the update categories, groups, results and package restarts")
+    words = {table: {code: pc_paths.display(text) for code, text in entries.items()} for table, entries in labels.items()}
+    return lambda text, table: _worded(text, words[table])
+
+
+def _restart_states(restarts, session):
+    """The restarts input checked against this session's operations; None gives no entries."""
+    if restarts is None:
+        return {}
+    if (not isinstance(restarts, dict) or set(restarts) - set(_value(session, "operations", dict, "session"))
+            or not all(isinstance(state, str) and state in RESTART_STATES for state in restarts.values())):
+        raise _refused("restarts must name operations of this session, each with a restart state: " + ", ".join(sorted(RESTART_STATES)))
+    return restarts
 
 
 def _path(text, windows):
@@ -368,14 +424,16 @@ def _findings(session, checked):
     return blocks if rows else blocks + [_note("Evidence: " + NOT_RECORDED + ".")]
 
 
-def _plan(session, windows):
+def _plan(session, windows, code):
     plan = _value(session, "plan", dict, "session", nullable=True)
     if plan is None:
         return [_note("Not recorded.")]
     document = _value(plan, "document", dict, "plan")
     overview = (_rows(document, "plan", (("Plan", "plan_id"), ("Summary", "summary")))
                 + _rows(plan, "plan", (("Plan fingerprint (SHA-256)", "sha256"), ("Registered (UTC)", "registered_utc"))))
-    actions = [_fields(_rows(action, "plan action", ACTION_NAME) + [["Target", _path(_value(action, "target", str, "plan action"), windows)]]
+    actions = [_fields([["Action", _shown(_value(action, "action_id", str, "plan action"))],
+                        ["Kind", code(_value(action, "kind", str, "plan action"), "actions")],
+                        ["Target", _path(_value(action, "target", str, "plan action"), windows)]]
                        + _rows(action, "plan action", ACTION_TEXT)) for action in _value(document, "actions", list, "plan")]
     return [_fields(overview), _note(PLAN_NOTE)] + actions
 
@@ -392,22 +450,18 @@ def _reviews(session, current):
     return ([_note(REVIEWS_NOTE)] + blocks) if blocks else [_note("Not recorded.")]
 
 
-def _pending_decision(item, current):
+def _pending_decision(item, code):
     """(owner record, decision name, extra rows) of a pending item that holds an owner decision, else None."""
     kind = _value(item, "kind", str, "pending item")
     if kind == "checkpoint":
         # A checkpoint or reconciliation item carries the owner's record only once the owner has decided.
         action = _value(item, "action_id", str, "pending item", nullable=True)
-        extra = [["Checkpoint", _shown(_value(item, "checkpoint", str, "pending item"))],
+        extra = [["Checkpoint", code(_value(item, "checkpoint", str, "pending item"), "checkpoints")],
                  ["Action", "none (whole session)" if action is None else _shown(action)]]
         return _optional(item, "owner_instruction", dict, "pending item"), PENDING[kind], extra
     if kind == "reconciliation":
         extra = [["Operation", _shown(_value(item, "operation_id", str, "pending item"))]]
         return _optional(item, "owner_instruction", dict, "pending item"), PENDING[kind], extra
-    if kind == "protected_consent":
-        record = _value(item, "record", dict, "pending item")
-        return record, PENDING[kind], [["Action", _shown(_value(record, "action_id", str, "protected consent"))],
-                                       _plan_hash(record, "protected consent", current)]
     if kind == "assessment_finish":
         finish = _value(item, "record", dict, "pending item")
         extra = [["Summary evidence", _shown(_value(finish, "summary_evidence_id", str, "assessment completion"))]]
@@ -418,12 +472,12 @@ def _pending_decision(item, current):
     return record, "Other owner decision (" + _shown(kind) + ")", []
 
 
-def _other_decisions(session, current):
-    """Owner decisions outside the three main records: pending items and restart decisions, each sorted by the
-    recorded time text and then the key, and the schedule decision."""
+def _other_decisions(session, code):
+    """Owner decisions outside the three main records: pending items, sorted by the recorded time text and then the key,
+    and the schedule decision."""
     pending = []
     for key, item in _value(session, "pending", dict, "session").items():
-        record, name, extra = _pending_decision(item, current)
+        record, name, extra = _pending_decision(item, code)
         if record is not None:
             when = _value(record, "recorded_utc", str, name.lower())
             pending.append((when, key, _decision(record, name, name.lower(), extra)))
@@ -432,16 +486,7 @@ def _other_decisions(session, current):
     if schedule is not None:
         when = _value(_value(schedule, "proposal", dict, "schedule decision"), "when_utc", str, "schedule proposal")
         blocks.append(_decision(schedule, "Schedule decision", "schedule decision", [["Scheduled for (UTC)", _shown(when)]]))
-    restarts = []
-    for key, operation in _value(session, "operations", dict, "session").items():
-        restart = _optional(operation, "restart_decision", dict, "operation")
-        if restart is not None:
-            where = "restart decision"
-            restarts.append((_value(restart, "recorded_utc", str, where), key, _decision(restart, "Restart decision", where, [
-                ["Choice", _worded(_value(restart, "choice", str, where), RESTART_CHOICES)],
-                ["Operation", _shown(_value(restart, "operation_id", str, where))],
-                ["Not before (UTC)", _shown(_value(restart, "not_before_utc", str, where))], _plan_hash(restart, where, current)])))
-    return blocks + [block for _, _, block in sorted(restarts, key=lambda entry: entry[:2])]
+    return blocks
 
 
 def _typed_reply(record, where):
@@ -457,12 +502,12 @@ def _typed_reply(record, where):
             + "; actions: " + _joined(_texts(reply, "action_ids", place))]
 
 
-def _approval_rows(record, where, current, windows):
+def _approval_rows(record, where, current, windows, code):
     rows = [["Approved actions", _joined(_texts(record, "action_ids", where))], _plan_hash(record, where, current)]
     return rows + ([_typed_reply(record, where)] if "irreversible" in record else [])
 
 
-def _ack_rows(record, where, current, windows):
+def _ack_rows(record, where, current, windows, code):
     return [["Actions it covers", _joined(_texts(record, "action_ids", where))], _plan_hash(record, where, current)]
 
 
@@ -474,14 +519,14 @@ def _ack_heading(record, where):
     return ACK_HEADINGS.get(kind) or "Separate acknowledgment (" + _shown(kind) + ")"
 
 
-def _policy_rows(record, where, current, windows):
-    return [["Kinds of step allowed", _joined(_texts(record, "action_kinds", where))],
+def _policy_rows(record, where, current, windows, code):
+    return [["Kinds of step allowed", ", ".join(code(kind, "actions") for kind in _texts(record, "action_kinds", where)) or NONE_LISTED],
             ["Targets", _joined_paths(_texts(record, "targets", where), windows)],
             ["Steps allowed", str(_value(record, "max_actions", int, where))], ["Steps used", str(_value(record, "used_actions", int, where))],
             ["Expires (UTC)", _shown(_value(record, "expires_utc", str, where))]]
 
 
-def _approvals(session, current, windows):
+def _approvals(session, current, windows, code):
     """The plan approval (with its typed reply), the separate acknowledgment and the standing policy, each in its place, then the
     other owner decisions."""
     blocks = [_note(DECISIONS_NOTE)]
@@ -492,8 +537,8 @@ def _approvals(session, current, windows):
         record = _value(session, key, dict, "session", nullable=True)
         name = _ack_heading(record, where) if name is None else name
         blocks.append(_note(name + ": " + NOT_RECORDED + ".") if record is None
-                      else _decision(record, name, where, rows(record, where, current, windows)))
-    return blocks + _other_decisions(session, current)
+                      else _decision(record, name, where, rows(record, where, current, windows, code)))
+    return blocks + _other_decisions(session, code)
 
 
 def _authorized(operation):
@@ -508,34 +553,78 @@ def _authorized(operation):
     return ("the plan approval" if kind == "exact_plan" else "the standing permission") + f" (message {message})"
 
 
-def _restart(operation):
-    """(result text or None, restart rows) for a step whose installer asked for a restart (code 3010)."""
+def _restart(operation, code, state, closed):
+    """(result text or None, restart rows) for a step with a recorded restart signal; ``state`` is its entry in the restarts
+    input, and without one the page does not say whether the step still waits. ``closed``: the job can no longer carry on."""
     pending = _optional(operation, "restart_pending", dict, "operation")
-    if not pending:
+    if pending is None:
         return None, []
+    if set(pending) != RESTART_PENDING_KEYS:
+        raise _refused("A recorded restart has exactly a signal and a source")
+    signal, source = _value(pending, "signal", str, "restart signal"), _value(pending, "source", str, "restart signal", nullable=True)
+    rows = [["Restart signal", RESTART_UNKNOWN if source is None or not source.strip() or signal == "unknown"
+             else code(signal, "restart_signals") + "; reported by " + _shown(source)]]
     verification = _optional(operation, "restart_verification", dict, "operation")
-    decision = _optional(operation, "restart_decision", dict, "operation")
-    choice = RESTART_UNDECIDED if decision is None else _worded(_value(decision, "choice", str, "restart decision"), RESTART_CHOICES)
-    checked = verification is not None and verification.get("boot_observed") is True
-    return (None if checked else RESTART_WAITING), [["Restart decision", choice]]
+    if verification is not None and (set(verification) != RESTART_VERIFICATION_KEYS or type(verification["boot_observed"]) is not bool):
+        raise _refused("A restart check has exactly boot_observed (true or false), evidence_id, sha256 and recorded_utc")
+    seen = verification is not None and verification["boot_observed"]
+    if state == "boot_observed" and not seen or state == "waiting" and seen:
+        raise _refused("The restart state does not fit the step's recorded restart")
+    if state == "waiting":
+        return RESTART_CLOSED if closed else RESTART_WAITING, rows + [["Restart seen", "Not yet"]]
+    if seen:
+        when = _shown(_value(verification, "recorded_utc", str, "restart check"))
+        return None, rows + [["Restart seen", "A later start of the computer was recorded (UTC " + when + ")"]]
+    return None, rows + ([["Restart seen", NOT_RECORDED]] if state is None else [])
 
 
-def _outcomes(session, current):
+def _plan_actions(session):
+    """The current plan's actions by action id, each with the fields its report rows read."""
+    plan = _value(session, "plan", dict, "session", nullable=True)
+    actions = [] if plan is None else _value(_value(plan, "document", dict, "plan"), "actions", list, "plan")
+    return {_value(action, "action_id", str, "plan action"): action for action in actions}
+
+
+def _step(actions, operation, windows, code):
+    """What a step did, in words, from its plan action; a step of a replaced plan has none on this page."""
+    action = actions.get(_value(operation, "action_id", str, "operation"))
+    if action is None:
+        return NOT_RECORDED
+    return code(_value(action, "kind", str, "plan action"), "actions") + ": " + _path(_value(action, "target", str, "plan action"), windows)
+
+
+def _overview(session):
+    """The at-a-glance line: how many steps finished, did not finish and did not start; None with nothing to count."""
+    operations = _value(session, "operations", dict, "session").values()
+    actions = _plan_actions(session)
+    if not operations and not actions:
+        return None
+    done = sum(1 for operation in operations if operation.get("outcome") == "succeeded")
+    begun = {operation.get("action_id") for operation in operations}
+    return (f"What happened: {done} {'step' if done == 1 else 'steps'} finished, {len(operations) - done} did not finish, "
+            f"{len(set(actions) - begun)} did not start.")
+
+
+def _outcomes(session, current, code, restarts, windows):
     rows, unsettled, earlier = [], False, False
-    for operation in _value(session, "operations", dict, "session").values():
+    closed, actions = _value(session, "status", str, "session") in ("stopped", "completed"), _plan_actions(session)
+    for key, operation in _value(session, "operations", dict, "session").items():
         outcome = _value(operation, "outcome", str, "operation", nullable=True)
-        waiting, restart = _restart(operation)
+        waiting, restart = _restart(operation, code, restarts.get(key), closed)
         resolution = _value(operation, "resolution", dict, "operation", nullable=True)
+        kind = None if resolution is None else _value(resolution, "kind", str, "resolution")
         resolved = [["Resolution", NOT_RECORDED]] if resolution is None else [
-            ["Resolution", _worded(_value(resolution, "kind", str, "resolution"), RESOLUTIONS)],
+            ["Resolution", _worded(kind, RESOLUTIONS)],
             ["Resolution recorded (UTC)", _shown(_value(resolution, "recorded_utc", str, "resolution"))]]
         fingerprint = _plan_hash(operation, "operation", current)
-        pairs = (_rows(operation, "operation", (("Action", "action_id"),)) + [fingerprint, ["Authorized by", _authorized(operation)]]
+        pairs = ([["Step", _step(actions, operation, windows, code)]] + _rows(operation, "operation", (("Action", "action_id"),))
+                 + [fingerprint, ["Authorized by", _authorized(operation)]]
                  + _rows(operation, "operation", (("Started (UTC)", "started_utc"),))
                  + [["Finished (UTC)", _shown(_value(operation, "finished_utc", str, "operation", nullable=True))],
-                    ["Result", waiting or (NO_RESULT if outcome is None else _shown(outcome))], *restart,
+                    ["Result", waiting or (NO_RESULT if outcome is None else _worded(outcome, OUTCOME_WORDS))], *restart,
                     ["Summary", _shown(_value(operation, "summary", str, "operation"))], *resolved])
-        unsettled = unsettled or outcome is None or outcome in UNSETTLED or waiting is not None
+        # A verified failure stops only the steps that depend on it, so it alone needs no note.
+        unsettled = unsettled or outcome is None or outcome in UNSETTLED and kind != "verified_failure" or waiting is not None
         earlier = earlier or fingerprint[1] != SAME_PLAN
         rows.append((pc_records.parse_utc(operation["started_utc"]), _value(operation, "operation_id", str, "operation"), pairs))
     blocks = ([_note(OUTCOMES_NOTE)] if unsettled else []) + ([_note(EARLIER_PLAN_NOTE)] if earlier else [])
@@ -565,14 +654,23 @@ def _free_space(rows, windows):
     return [_note(measured), _note(estimate), _note(units + (EXPLORER_NOTE if windows else ""))] + blocks
 
 
-def _packages(rows):
-    labels = (("Manager", "manager"), ("Package", "package"), ("Result", "outcome"), ("Restart", "restart"))
-    blocks = [_fields(_rows(row, "packages row", labels)) for row in _optional_rows(rows, PACKAGE_KEYS, "packages")]
+def _packages(rows, code):
+    """Update-result rows: the result is one of pc_records.UPDATE_RESULTS, the category exactly its own and the group one of
+    the five; anything else is refused."""
+    blocks = []
+    for row in _optional_rows(rows, PACKAGE_KEYS, "packages"):
+        where = "packages row"
+        result, category, group = (_value(row, key, str, where) for key in ("outcome", "category", "group"))
+        if result not in pc_records.UPDATE_RESULTS or category != pc_records.UPDATE_RESULTS[result] or group not in pc_records.OUTCOME_GROUPS:
+            raise _refused("A package row needs an update result, exactly its category and one of the update groups")
+        blocks.append(_fields([["Installed through", _shown(_value(row, "manager", str, where))], ["Item", _shown(_value(row, "package", str, where))],
+                               ["Result", code(result, "results")], ["Restart", code(_value(row, "restart", str, where), "package_restarts")],
+                               ["Category", code(category, "categories")], ["Group", code(group, "groups")]]))
     return blocks or [_note("Not recorded.")]
 
 
 def _retained(rows, windows):
-    blocks = [_fields([["Kind", _shown(_value(row, "kind", str, "retained row"))],
+    blocks = [_fields([["Kind", _worded(_value(row, "kind", str, "retained row"), RETAINED_KINDS)],
                        ["Location", _path(_value(row, "location", str, "retained row"), windows)],
                        ["Size", _size(_count(row, "bytes", "retained row"))]])
               for row in _optional_rows(rows, RETAINED_KEYS, "retained")]
@@ -635,12 +733,15 @@ def _page(template, data):
     return (before + data + after).encode("utf-8")
 
 
-def render_session(session, *, assessment=None, free_space=None, packages=None, retained=None):
+def render_session(session, *, assessment=None, free_space=None, packages=None, retained=None, labels=None, restarts=None):
     """The session report as UTF-8 HTML bytes (see the module docstring for the inputs); malformed input is refused."""
     pc_records.require_container(session, "session_state")
+    code = _coder(labels)
+    states = _restart_states(restarts, session)
     scope = _value(_value(session, "settings", dict, "session"), "scope", dict, "settings")
-    labels = (("Session", "session_id"), ("Job", "job"), ("Stage", "stage"), ("Status", "status"))
-    header = _rows(session, "session", labels) + [
+    header = [["Session", _shown(_value(session, "session_id", str, "session"))]] + [
+        [name, code(_value(session, key, str, "session"), table)] for name, key, table in (
+            ("Job", "job", "jobs"), ("Stage", "stage", "stages"), ("Status", "status", "statuses"))] + [
         ["Mode", _worded(_value(session, "mode", str, "session"), MODES)],
         ["Platform", _worded(_value(session, "platform", str, "session"), PLATFORMS)]]
     created = _value(session, "created_utc", str, "session")
@@ -654,13 +755,15 @@ def render_session(session, *, assessment=None, free_space=None, packages=None, 
     plan = _value(session, "plan", dict, "session", nullable=True)
     current = None if plan is None else _value(plan, "sha256", str, "plan")
     generated = pc_records.utc_now()
+    outcomes, overview = _outcomes(session, current, code, states, windows), _overview(session)  # the overview reads what _outcomes checked
     record = {"schema": SCHEMA, "schema_version": pc_records.SCHEMA_VERSION, "generated_utc": generated,
-              "title": "PatchCairn session report: " + _shown(session["job"]) + ", created " + day,
+              "title": "PatchCairn session report: " + code(session["job"], "jobs") + ", created " + day,
               "banner": BANNER if session["mode"] == "fixture" else None,
-              "header": [_fields(header + [["Report made (UTC)", _shown(generated)]]), _note(PAGE_NOTE), _note(TIME_NOTE)],
+              "header": [_fields(header + [["Report made (UTC)", _shown(generated)]]), *([_note(overview)] if overview else []), _note(PAGE_NOTE),
+                         _note(TIME_NOTE)],
               "scope": _scope(session, scope, windows), "findings": _findings(session, _assessment(session, assessment, scope)),
-              "plan": _plan(session, windows), "reviews": _reviews(session, current), "approvals": _approvals(session, current, windows),
-              "outcomes": _outcomes(session, current), "free_space": _free_space(free_space, windows), "packages": _packages(packages),
+              "plan": _plan(session, windows, code), "reviews": _reviews(session, current), "approvals": _approvals(session, current, windows, code),
+              "outcomes": outcomes, "free_space": _free_space(free_space, windows), "packages": _packages(packages, code),
               "retained": _retained(retained, windows)}
     data = pc_records.encoded(read_report(record)).decode("ascii")
     for char, escape in (("<", "\\u003c"), (">", "\\u003e"), ("&", "\\u0026")):

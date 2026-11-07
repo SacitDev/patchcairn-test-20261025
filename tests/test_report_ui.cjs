@@ -13,7 +13,7 @@ const SCRIPT_HASH = '@@SCRIPT_SHA256@@';
 const STYLE_HASH = '@@STYLE_SHA256@@';
 const DATA = '@@REPORT_DATA@@';
 const SECTIONS = ['scope', 'findings', 'plan', 'reviews', 'approvals', 'outcomes', 'free_space', 'packages', 'retained'];
-const TITLES = ['Scope', 'Findings', 'Plan', 'Assistant reviews of the plan', 'Approvals', 'Outcomes', 'Free space', 'Package results',
+const TITLES = ['Scope', 'Findings', 'Plan', 'Assistant reviews of the plan', 'Approvals', 'Outcomes', 'Free space', 'Update results',
   'Recovery copies kept'];
 const HOSTILE = '</script><script>globalThis.injected=true</script><img src=x onerror="globalThis.injected=true"><!--';
 const HTML_PATHS = /innerHTML|outerHTML|insertAdjacentHTML|document\s*\.\s*write|\beval\b|Function\s*\(|setTimeout|setInterval|\.on[a-z]+\s*=|\.style\b|setAttribute/;
@@ -40,15 +40,15 @@ const EVIDENCE_NOTE = "Evidence records (technical detail): what the assistant s
 const PLAN_NOTE = "The plan fingerprint changes if anything in the plan changes; the reviews and the approval refer to this exact plan.";
 const SAME_PLAN = "Same as the plan above";
 const NO_RESULT = "No result recorded: this step started, but no result had been recorded when this report was made. It may still be running or may have stopped part-way. Ask the assistant (PatchCairn: status) before starting anything else on this computer.";
-const RESTART_WAITING = "Waiting for a restart: the installer reported that the computer must restart to finish this step (code 3010). The step stays unfinished until the computer has restarted and the result is checked.";
-const RESTART_UNDECIDED = "Not decided yet. Tell the assistant whether to restart now or later (PatchCairn: resolve).";
-const OUTCOMES_NOTE = "Results are shown as recorded. 'failed' means the step did not complete, 'partial' means only part of it took effect, and 'unknown' means its effect could not be confirmed. After any of these, PatchCairn holds further changes in this session until the result is reconciled: ask the assistant what changed and what was kept (PatchCairn: status, then PatchCairn: resolve).";
+const RESTART_WAITING = "Waiting for a restart: this update needs a restart and a check before the rest can continue. PatchCairn never restarts the computer: restart it yourself when you are ready, then say PatchCairn: resume.";
+const RESTART_UNKNOWN = "restart: unknown";
+const OUTCOMES_NOTE = "Results are shown as recorded. 'failed' means the step did not complete, 'partial' means only part of it took effect, and 'unknown' means its effect could not be confirmed. After any of these, PatchCairn makes no further change in this session until the result is cleared up: ask the assistant what changed and what was kept (PatchCairn: status, then PatchCairn: resolve). The exception is an update that did not install while what is installed was checked: only the steps that depend on it stop.";
 const EARLIER_PLAN_NOTE = "Some steps belong to an earlier plan in this session. That plan, its reviews and its approval were replaced by the plan above, so this page does not show them; each step still shows who authorized it.";
 const FREE_SPACE_MEASURED = "Free space was measured on each drive before and after the work. The measured change includes anything else that used or freed space at the same time, such as downloads or system updates.";
-const FREE_SPACE_ESTIMATE = "The expected change is PatchCairn's estimate: the size of the files removed minus the size of any backup written to the same drive. Quarantine keeps files on the same drive so they can be put back, so it frees no space there.";
+const FREE_SPACE_ESTIMATE = "The expected change is PatchCairn's estimate: the size of the files removed minus the size of any backup written to the same drive. Setting files aside keeps them on the same drive so they can be put back, so it frees no space there.";
 const FREE_SPACE_UNITS = "1 GB here is 1,000,000,000 bytes.";
 const EXPLORER_NOTE = " Windows File Explorer counts 1,073,741,824 bytes per GB, so it shows a slightly smaller number.";
-const RETAINED_NOTE = "PatchCairn keeps these so a change can be undone or files restored. They use disk space until you decide to release them. Ask your assistant before deleting any of them, because afterwards the change cannot be undone.";
+const RETAINED_NOTE = "PatchCairn keeps these so a change can be undone or files restored. They use space on the drive shown until you choose to delete them. Ask your assistant first: afterwards the change cannot be undone.";
 
 class Element {
   constructor(tag, parses, text = '', className = '') {
@@ -111,19 +111,20 @@ function fictionalRecord() {
       review('fictional-reviewer-b', 'Evidence and security (evidence_security)', UNLABELLED)],
     approvals: [note(DECISIONS_NOTE),
       owner('Plan approval', HOSTILE, [pair('Approved actions', 'fictional-action'), pair('Plan fingerprint', SAME_PLAN)], UNLABELLED),
-      note('Agreement to a permanent deletion (irreversible-loss acknowledgment): not recorded.'),
+      note('Agreement that a repair cannot be rolled back (separate acknowledgment): not recorded.'),
       owner('Standing permission for routine steps (standing policy)', 'Fictional policy', [pair('Kinds of step allowed', 'backup_create')],
         'Unrecognised label: fictional-other-label')],
     outcomes: [note(OUTCOMES_NOTE), note(EARLIER_PLAN_NOTE), operation('fictional-action', SAME_PLAN, 'succeeded', HOSTILE),
       operation('fictional-second', SAME_PLAN, NO_RESULT, 'Waiting'),
       operation('fictional-update', 'An earlier plan (fingerprint begins eeeeeeee)', RESTART_WAITING, 'Waiting for a restart',
-        pair('Restart decision', RESTART_UNDECIDED))],
+        pair('Restart signal', RESTART_UNKNOWN), pair('Restart seen', 'Not yet'))],
     free_space: [note(FREE_SPACE_MEASURED), note(FREE_SPACE_ESTIMATE), note(FREE_SPACE_UNITS + EXPLORER_NOTE),
       fields(pair('Drive', 'D:\\'), pair('Free space before', 'about 100.0 GB (100,000,000,000 bytes)'),
         pair('Free space after', 'about 111.8 GB (111,811,160,064 bytes)'),
         pair('Measured change', 'about 11.8 GB more free space (11,811,160,064 bytes)'),
         pair('Expected change (estimate)', 'about 11.0 GB more free space (11,000,000,000 bytes)'))],
-    packages: [fields(pair('Manager', 'fictional-manager'), pair('Package', HOSTILE), pair('Result', 'upgraded'), pair('Restart', 'none'))],
+    packages: [fields(pair('Installed through', 'fictional-manager'), pair('Item', HOSTILE), pair('Result', 'Updated; the new version was checked (updated)'),
+      pair('Restart', 'No restart waiting (none)'), pair('Category', 'Updated and checked (updated_checked)'), pair('Group', 'Apps (apps)'))],
     retained: [note(RETAINED_NOTE),
       fields(pair('Kind', 'backup'), pair('Location', 'D:\\Fictional\\backup'), pair('Size', 'about 2.0 KB (2,048 bytes)'))]};
 }
@@ -137,7 +138,7 @@ function emptyRecord(mode) {
   record.findings = [['heading', 'What was found'], note('Assessment summary: not recorded.'), note(NO_FINDINGS), ['heading', EVIDENCE_HEADING],
     note(EVIDENCE_NOTE), note('Evidence: not recorded.')];
   record.approvals = [note(DECISIONS_NOTE), note('Plan approval: not recorded.'),
-    note('Agreement to a permanent deletion (irreversible-loss acknowledgment): not recorded.'),
+    note('Agreement that a repair cannot be rolled back (separate acknowledgment): not recorded.'),
     note('Standing permission for routine steps (standing policy): not recorded.')];
   for (const key of ['plan', 'reviews', 'outcomes', 'free_space', 'packages', 'retained']) record[key] = notRecorded;
   return record;
@@ -331,7 +332,7 @@ function runTests(template) {
   });
   check('A step without a result, or waiting for a restart, says so in words', () => {
     assert.ok(text(report, 'outcomes').includes('Result ' + NO_RESULT));
-    assert.ok(text(report, 'outcomes').includes('Result ' + RESTART_WAITING + ' Restart decision ' + RESTART_UNDECIDED));
+    assert.ok(text(report, 'outcomes').includes('Result ' + RESTART_WAITING + ' Restart signal ' + RESTART_UNKNOWN + ' Restart seen Not yet'));
     assert.ok(text(report, 'outcomes').includes('Plan fingerprint An earlier plan (fingerprint begins eeeeeeee)'));
     assert.deepEqual(report.ids.get('outcomes').children.slice(0, 2).map(x => x.textContent), [OUTCOMES_NOTE, EARLIER_PLAN_NOTE]);
     assert.ok(!text(report, 'outcomes').includes('in progress'));

@@ -8,9 +8,9 @@
   "timing": ["now", "scheduled"],
   "checkpoints": ["scope", "findings", "plan", "before_action", "after_action", "finish"],
   "jobs": {
-    "security_updates": {"label": "Security and updates", "description": "Check agreed software, relevant security concerns and suitable official updates.", "stages": ["scope", "inventory", "research", "plan", "apply", "verify", "complete"]},
-    "storage_cleanup": {"label": "Storage and cleanup", "description": "Inspect selected storage metadata and review exact safe cleanup choices.", "stages": ["scope", "inventory", "candidates", "plan", "apply", "verify", "complete"]},
-    "diagnosis_repair": {"label": "Diagnosis and repair", "description": "Investigate a stated problem, compare causes and review an evidence-backed repair.", "stages": ["scope", "symptom", "hypotheses", "plan", "apply", "verify", "complete"]},
-    "backup_recovery": {"label": "Backup and recovery", "description": "Review selected contents, create a verified backup or plan a checked restoration.", "stages": ["scope", "inventory", "recovery_plan", "plan", "apply", "verify", "complete"]}
+    "security_updates": {"label": "Security and updates", "description": "Find out-of-date apps, Python and Node packages, drivers, firmware and system software, and update what you approve.", "stages": ["scope", "inventory", "research", "plan", "apply", "verify", "complete"]},
+    "storage_cleanup": {"label": "Storage and cleanup", "description": "See what fills your drive; delete files for good, set them aside (can be undone; frees no space) or back them up first (may need extra space).", "stages": ["scope", "inventory", "candidates", "plan", "apply", "verify", "complete"]},
+    "diagnosis_repair": {"label": "Diagnosis and repair", "description": "Find out why something goes wrong and fix what I can: update an app, reinstall the same version (Mac, Linux) or finish a cut-off software install (Debian, Ubuntu).", "stages": ["scope", "symptom", "hypotheses", "plan", "apply", "verify", "complete"]},
+    "backup_recovery": {"label": "Backup and recovery", "description": "Make a checked copy of files you choose, or bring them back.", "stages": ["scope", "inventory", "recovery_plan", "plan", "apply", "verify", "complete"]}
   }
 }

@@ -22,6 +22,7 @@ import uuid
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).absolute().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
+import engine_journal
 import pc_paths
 import pc_records
 import report
@@ -31,16 +32,16 @@ from clock_helpers import start_forward_only_clock
 WORK = ROOT / "work" / "test-fixtures"
 TEMPLATE = ROOT / "templates" / "report.html"
 CLOCK = "2026-01-02T03:04:05.000006Z"
-TITLES = ["Scope", "Findings", "Plan", "Assistant reviews of the plan", "Approvals", "Outcomes", "Free space", "Package results",
+TITLES = ["Scope", "Findings", "Plan", "Assistant reviews of the plan", "Approvals", "Outcomes", "Free space", "Update results",
           "Recovery copies kept"]
 DATA_BLOCK = re.compile(r'<script type="application/json" id="report-data">(.*?)</script>', re.S)
 HOSTILE = ("</script><script>globalThis.injected=1</script><!-- <img src=x onerror=alert(1)> &amp; \u2028 \u202e "
            "@@SCRIPT_SHA256@@ @@STYLE_SHA256@@ @@REPORT_DATA@@ end")
 SUMMARY = "patchcairn.assessment.summary"
 OPERATION = "operation-" + "0" * 32
-# The record digest of report_session() rendered at CLOCK (PLAN.md 4.4 step 6: the report record layout).
-# Changed by the approval's typed-reply row and the relabelled separate acknowledgment (was 7512daed5dfc...).
-GOLDEN_SHA256 = "7d0939feda41d3c7794df452437fa5d8b0935f1942e18c356d6eb70d577e0e65"
+# The record digest of report_session() rendered at CLOCK (the report record layout).
+# Changed by the step row, the worded result, the overview note and the plain update and kept-data names (was 7d0939feda41...).
+GOLDEN_SHA256 = "1b572701de95a49d15f37c67cf086ba377d396c31d010fe1e84363ec847a0b30"
 
 
 def owner(quote, message_id, **extra):
@@ -127,6 +128,11 @@ def shown(record, key):
                       for kind, content in record[key])
 
 
+def shown_all(record):
+    """Every text the page shows, all sections and the header together."""
+    return " | ".join(shown(record, key) for key in ("header", *report.SECTIONS))
+
+
 class Shown(dict):
     """Field values by label; an absent label reads as None, so a missing row fails an assertion instead of erroring."""
 
@@ -193,8 +199,10 @@ class ReportTests(unittest.TestCase):
                 "evidence_ids": [evidence("inventory", {"complete": True, "item_count": 1})], "actions": [action]}
         plan_sha256 = engine.register_plan(sid, plan=plan)["data"]["plan_sha256"]
         for reviewer, role in (("fictional-reviewer-a", "compatibility_data"), ("fictional-reviewer-b", "evidence_security")):
+            review = {"schema": "patchcairn.review", "schema_version": 1, "plan_sha256": plan_sha256, "role": role, "verdict": "approved",
+                      "reviewer_id": reviewer, "attestation": "coordinator-attested"}
             engine.record_review(sid, plan_sha256=plan_sha256, reviewer_id=reviewer, role=role, verdict="approved",
-                                 evidence_ids=[evidence("review", {"reviewed": True})], notes="Fictional assistant review pass")
+                                 evidence_ids=[evidence("review", {"reviewed": True}, review)], notes="Fictional assistant review pass")
         engine.approve_plan(sid, plan_sha256=plan_sha256, action_ids=["fictional-action"], owner_quote="Apply this exact fictional action.",
                             owner_message_id="fictional-owner-plan")
         engine.advance_stage(sid, evidence_ids=[])
@@ -215,7 +223,8 @@ class ReportTests(unittest.TestCase):
         page = report.render_session(
             state, assessment=summary_for(state),
             free_space=[{"volume": "fictional-volume", "before_bytes": 1000, "after_bytes": 1500, "expected_net_bytes": 400}],
-            packages=[{"manager": "fictional-manager", "package": "Fictional.Package", "outcome": "upgraded", "restart": "none"}],
+            packages=[{"manager": "fictional-manager", "package": "Fictional.Package", "outcome": "updated", "restart": "none",
+                       "category": "updated_checked", "group": "apps"}],
             retained=[{"kind": "backup", "location": "work/fictional-backup", "bytes": 2048}])
         html, _, record = embedded(page)
         self.assertEqual(re.findall(r"<h2>([^<]*)</h2>", html), TITLES)
@@ -225,7 +234,7 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(record["banner"], report.BANNER)
         self.assertIn(("Session", state["session_id"]), pairs(record, "header"))
         self.assertIn(("Mode", "practice with made-up data (fixture)"), pairs(record, "header"))
-        self.assertEqual(notes(record, "header"), [report.PAGE_NOTE, report.TIME_NOTE])
+        self.assertEqual(notes(record, "header"), ["What happened: 1 step finished, 0 did not finish, 0 did not start.", report.PAGE_NOTE, report.TIME_NOTE])
         self.assertIn(("Plan fingerprint (SHA-256)", state["plan"]["sha256"]), pairs(record, "plan"))
         self.assertIn(report.PLAN_NOTE, notes(record, "plan"))
         self.assertIn(("How the result will be checked", "Check the fictional copy"), pairs(record, "plan"))
@@ -242,8 +251,9 @@ class ReportTests(unittest.TestCase):
                           report.SAME_PLAN))
         [operation] = state["operations"].values()
         self.assertEqual(items(record, "outcomes"), [[
-            ("Action", "fictional-action"), ("Plan fingerprint", report.SAME_PLAN), ("Authorized by", "the plan approval (message fictional-owner-plan)"),
-            ("Started (UTC)", operation["started_utc"]), ("Finished (UTC)", operation["finished_utc"]), ("Result", "succeeded"),
+            ("Step", "backup_create: Fictional component"), ("Action", "fictional-action"), ("Plan fingerprint", report.SAME_PLAN),
+            ("Authorized by", "the plan approval (message fictional-owner-plan)"),
+            ("Started (UTC)", operation["started_utc"]), ("Finished (UTC)", operation["finished_utc"]), ("Result", "Finished (succeeded)"),
             ("Summary", "Fictional outcome as recorded"), ("Resolution", "not recorded")]])
         self.assertEqual(notes(record, "outcomes"), [])  # a succeeded step from the current plan needs no note
         # The full plan fingerprint appears only under Plan (and inside evidence records, which are copied as written).
@@ -262,7 +272,7 @@ class ReportTests(unittest.TestCase):
         self.assertIn(("Selected folder or drive", "fictional-selected-folder"), pairs(record, "scope"))
         self.assertEqual(dict(items(record, "free_space")[0])["Measured change"], "500 bytes more free space")
         self.assertEqual(dict(items(record, "free_space")[0])["Expected change (estimate)"], "400 bytes more free space")
-        self.assertIn(("Package", "Fictional.Package"), pairs(record, "packages"))
+        self.assertIn(("Item", "Fictional.Package"), pairs(record, "packages"))
         self.assertIn(("Size", "about 2.0 KB (2,048 bytes)"), pairs(record, "retained"))
         self.assertEqual(notes(record, "retained"), [report.RETAINED_NOTE])
 
@@ -280,7 +290,8 @@ class ReportTests(unittest.TestCase):
         session["standing_policy"] = owner("Fictional policy", "fictional-policy", action_kinds=["backup_create"], max_actions=1,
                                            used_actions=0, expires_utc=CLOCK, targets=["D:\\Fictional\\" + HOSTILE])
         page = report.render_session(session, assessment=summary_for(session, summary=HOSTILE, findings=[HOSTILE]),
-                                     packages=[{"manager": HOSTILE, "package": HOSTILE, "outcome": HOSTILE, "restart": HOSTILE}],
+                                     packages=[{"manager": HOSTILE, "package": HOSTILE, "outcome": "unknown", "restart": HOSTILE,
+                                                "category": "needs_check", "group": "apps"}],
                                      retained=[{"kind": HOSTILE, "location": "D:\\Fictional\\" + HOSTILE, "bytes": None}])
         # The script boundaries are checked before anything is decoded: hostile text must not end the data block.
         html, template = page.decode("utf-8"), TEMPLATE.read_text(encoding="utf-8")
@@ -299,7 +310,7 @@ class ReportTests(unittest.TestCase):
                           ("findings", ("Problem found", escaped)), ("findings", ("Recorded value", escaped + ": " + escaped)),
                           ("outcomes", ("Summary", escaped)), ("retained", ("Kind", escaped)),
                           ("retained", ("Location", "D:\\Fictional\\" + escaped)), ("approvals", ("Quoted instruction", escaped)),
-                          ("packages", ("Manager", escaped)), ("packages", ("Package", escaped)), ("packages", ("Result", escaped)),
+                          ("packages", ("Installed through", escaped)), ("packages", ("Item", escaped)), ("packages", ("Result", "unknown")),
                           ("packages", ("Restart", escaped)), ("scope", ("Selected folder or drive", "D:\\Fictional\\Photos")),
                           ("scope", ("Selected folder or drive", "D:\\Fictional/na\\u202eme")),
                           ("scope", ("Content to read", "sel-1: C:/Fictional/na\\u202eme.txt (" + escaped + ")")),
@@ -342,9 +353,8 @@ class ReportTests(unittest.TestCase):
         operation = dict(report_session()["operations"][OPERATION], outcome="failed",
                          authorization={"kind": "exact_plan", "message_id": "fictional-plan", "plan_sha256": plan_sha256, "action_id": "a"},
                          resolution={"kind": "replan_required", "evidence_ids": [], "recorded_utc": CLOCK, "owner_message_id": "m"},
-                         restart_pending={"evidence_id": "rp-ev-1", "recorded_utc": CLOCK},
-                         restart_decision=owner("Restart later.", "fictional-restart", choice="defer", operation_id=OPERATION,
-                                                plan_sha256=plan_sha256, not_before_utc=CLOCK, attestation="coordinator-attested"))
+                         restart_pending={"signal": "required", "source": "fictional-probe"},
+                         restart_verification={"boot_observed": True, "evidence_id": "rp-ev-1", "sha256": "a" * 64, "recorded_utc": CLOCK})
         session = report_session(
             platform="windows", settings={"scope": {"roots": ["D:\\Fictional\\Photos"], "purpose": "Fictional", "assessment": access},
                                           "control": "guided", "timing": "now", "checkpoints": []},
@@ -356,8 +366,6 @@ class ReportTests(unittest.TestCase):
             pending={"c": {"kind": "checkpoint", "checkpoint": "plan", "action_id": "fictional-action",
                            "owner_instruction": owner("Continue.", "fictional-continue")},
                      "r": {"kind": "reconciliation", "operation_id": OPERATION, "owner_instruction": owner("Replan.", "fictional-replan")},
-                     "p": {"kind": "protected_consent", "record": owner("Consent handled.", "fictional-consent", plan_sha256=plan_sha256,
-                                                                        action_id="fictional-action")},
                      "a": {"kind": "assessment_finish", "record": {"summary_evidence_id": "rp-ev-1",
                                                                    "owner_instruction": owner("Finish.", "fictional-finish")}}})
         session["evidence"]["rp-ev-1"]["facts"] = {"plain": "text", "nested": {"list": ["a", "b"]}, "flag": True}
@@ -370,9 +378,12 @@ class ReportTests(unittest.TestCase):
         session["pending"]["u"] = {"kind": "fictional" + evil, "owner_instruction": poisoned(owner("Other.", "fictional-other"))}
         summary = summary_for(session)
         summary.update(summary=evil, findings=[evil], limitations=[evil + "\udfff"])
-        record = rendered(session, assessment=summary,
+        labels = workflow_core.report_labels()
+        labels["actions"]["backup_create"] += evil
+        record = rendered(session, assessment=summary, labels=labels, restarts={OPERATION: "boot_observed"},
                           free_space=[{"volume": "D:\\" + evil, "before_bytes": 5, "after_bytes": None, "expected_net_bytes": None}],
-                          packages=[{"manager": evil + "\ud800", "package": evil, "outcome": evil, "restart": evil}],
+                          packages=[{"manager": evil + "\ud800", "package": evil, "outcome": "unknown", "restart": evil, "category": "needs_check",
+                                     "group": "apps"}],
                           retained=[{"kind": evil, "location": "D:\\" + evil, "bytes": 1}])
 
         def strings(value):
@@ -437,7 +448,7 @@ class ReportTests(unittest.TestCase):
         texts = {name: getattr(report, name) for name in (
             "BANNER", "PAGE_NOTE", "TIME_NOTE", "DECISIONS_NOTE", "SCOPE_NOTE", "REVIEWS_NOTE", "OWNER_ATTESTED", "REVIEW_ATTESTED",
             "UNLABELLED", "NO_FINDINGS", "EVIDENCE_HEADING", "EVIDENCE_NOTE", "PLAN_NOTE", "SAME_PLAN", "NO_RESULT", "RESTART_WAITING",
-            "RESTART_UNDECIDED", "OUTCOMES_NOTE", "EARLIER_PLAN_NOTE", "EXPLORER_NOTE", "RETAINED_NOTE")}
+            "RESTART_UNKNOWN", "OUTCOMES_NOTE", "EARLIER_PLAN_NOTE", "EXPLORER_NOTE", "RETAINED_NOTE")}
         texts.update(zip(("FREE_SPACE_MEASURED", "FREE_SPACE_ESTIMATE", "FREE_SPACE_UNITS"), report.FREE_SPACE_NOTES))
         for name, text in texts.items():
             with self.subTest(text=name):
@@ -478,7 +489,6 @@ class ReportTests(unittest.TestCase):
             "operation not a record": (dict(session, operations={"o": 5}), {}, "report-input"),
             "outcome not text": (dict(session, operations={"o": dict(operation, outcome=5)}), {}, "report-input"),
             "resolution not a record": (dict(session, operations={"o": dict(operation, resolution="done")}), {}, "report-input"),
-            "restart decision not a record": (dict(session, operations={"o": dict(operation, restart_decision=[])}), {}, "report-input"),
             "attestation not text": (dict(session, approval=dict(session["approval"], attestation=7)), {}, "report-input"),
             "pending item not a record": (dict(session, pending={"p": "x"}), {}, "report-input"),
             "schedule without proposal": (dict(session, schedule=owner("Fictional schedule", "fictional-schedule")), {}, "report-input"),
@@ -493,6 +503,17 @@ class ReportTests(unittest.TestCase):
             "plan approval without message": (dict(session, operations={"o": dict(operation, authorization={"kind": "exact_plan"})}), {},
                                               "report-input"),
             "restart pending not a record": (dict(session, operations={"o": dict(operation, restart_pending="3010")}), {}, "report-input"),
+            "restart pending in the old layout": (dict(session, operations={"o": dict(operation, restart_pending={
+                "evidence_id": "rp-ev-1", "original_exit_code": 3010, "recorded_utc": CLOCK})}), {}, "report-input"),
+            "restart signal not text": (dict(session, operations={"o": dict(operation, restart_pending={"signal": 3010, "source": "p"})}), {},
+                                        "report-input"),
+            "restart check with another key": (dict(session, operations={"o": dict(operation, restart_pending={"signal": "required", "source": "p"},
+                                                                                  restart_verification={"boot_observed": True, "behavior_passed": True})}),
+                                               {}, "report-input"),
+            "restart check boot not a flag": (dict(session, operations={"o": dict(operation, restart_pending={"signal": "required", "source": "p"},
+                                                                                 restart_verification={"boot_observed": "yes", "evidence_id": "e",
+                                                                                                       "sha256": "a", "recorded_utc": CLOCK})}),
+                                              {}, "report-input"),
             "unknown pending kind without quote": (dict(session, pending={"p": {"kind": "fictional-kind", "record": {"note": "x"}}}), {},
                                                    "report-input"),
             "free_space not a list": (session, {"free_space": {"volume": "v"}}, "report-input"),
@@ -504,9 +525,12 @@ class ReportTests(unittest.TestCase):
             "free_space 21 digits": (session, {"free_space": [dict(row, after_bytes=10 ** 20)]}, "report-input"),
             "free_space expected 21 digits": (session, {"free_space": [dict(row, expected_net_bytes=-10 ** 20)]}, "report-input"),
             "free_space no volume": (session, {"free_space": [dict(row, volume=None)]}, "report-input"),
-            "packages not text": (session, {"packages": [{"manager": "m", "package": "p", "outcome": 1, "restart": "r"}]}, "report-input"),
-            "packages unknown key": (session, {"packages": [{"manager": "m", "package": "p", "outcome": "o", "restart": "r",
-                                                             "version": "1"}]}, "report-input"),
+            "packages not text": (session, {"packages": [{"manager": "m", "package": "p", "outcome": 1, "restart": "r", "category": "c",
+                                                          "group": "apps"}]}, "report-input"),
+            "packages unknown key": (session, {"packages": [{"manager": "m", "package": "p", "outcome": "updated", "restart": "r",
+                                                             "category": "updated_checked", "group": "apps", "version": "1"}]}, "report-input"),
+            "packages without category and group": (session, {"packages": [{"manager": "m", "package": "p", "outcome": "updated",
+                                                                            "restart": "r"}]}, "report-input"),
             "retained float bytes": (session, {"retained": [{"kind": "backup", "location": "l", "bytes": 1.5}]}, "report-input"),
             "retained negative bytes": (session, {"retained": [{"kind": "backup", "location": "l", "bytes": -1}]}, "report-input"),
             "retained 21 digits": (session, {"retained": [{"kind": "backup", "location": "l", "bytes": 10 ** 20}]}, "report-input"),
@@ -556,7 +580,9 @@ class ReportTests(unittest.TestCase):
     def test_same_input_same_bytes(self):
         """The same input gives the same bytes for the same Python version, and the input is not changed."""
         session = report_session()
-        options = {"assessment": summary_for(session), "packages": [{"manager": "m", "package": "p", "outcome": "o", "restart": "r"}]}
+        options = {"assessment": summary_for(session), "labels": workflow_core.report_labels(), "restarts": {OPERATION: "none"},
+                   "packages": [{"manager": "m", "package": "p", "outcome": "excluded", "restart": "r", "category": "skipped_by_you",
+                                 "group": "your_decision"}]}
         before = copy.deepcopy((session, options))
         with mock.patch("pc_records.utc_now", return_value=CLOCK):
             first, second = (report.render_session(session, **options) for _ in range(2))
@@ -673,9 +699,7 @@ class ReportTests(unittest.TestCase):
 
     def test_every_owner_decision_is_shown(self):
         plan_sha256 = report_session()["plan"]["sha256"]
-        operation = dict(report_session()["operations"][OPERATION], restart_decision=owner(
-            "Restart later, fictionally.", "fictional-restart", choice="defer", operation_id=OPERATION, plan_sha256=plan_sha256,
-            not_before_utc="2026-01-02T05:00:00Z"))
+        operation = dict(report_session()["operations"][OPERATION])
 
         def at(seconds, quote, message_id, **extra):
             return dict(owner(quote, message_id, **extra), recorded_utc=f"2026-01-02T03:04:{seconds:02d}Z")
@@ -696,9 +720,6 @@ class ReportTests(unittest.TestCase):
                                     "created_utc": CLOCK, "resolved": False, "settings_revision": 0},
                 "reconcile-op": {"pending_id": "reconcile-op", "kind": "reconciliation", "operation_id": OPERATION, "created_utc": CLOCK,
                                  "resolved": True, "settings_revision": 0, "owner_instruction": at(2, "Make a new plan.", "fictional-replan")},
-                "consent-a": {"pending_id": "consent-a", "kind": "protected_consent", "resolved": True,
-                              "record": at(3, "I handled the prompt.", "fictional-consent", plan_sha256=plan_sha256, action_id="fictional-action",
-                                           evidence_id="rp-ev-1")},
                 "other-x": {"pending_id": "other-x", "kind": "fictional‮kind", "resolved": True,
                             "owner_instruction": at(4, "A fictional later decision kind.", "fictional-other")},
                 "assessment-finish-x": {"pending_id": "assessment-finish-x", "kind": "assessment_finish", "resolved": True,
@@ -715,9 +736,8 @@ class ReportTests(unittest.TestCase):
         names = [dict(item)["Decision"] for item in items(record, "approvals")]
         self.assertEqual(names, ["Plan approval", "Agreement that a repair cannot be rolled back (separate acknowledgment)",
                                  "Standing permission for routine steps (standing policy)", "Go-ahead at a checkpoint",
-                                 "Choice after an unfinished step (reconciliation)",
-                                 "Operating-system permission prompt handled (protected consent)", "Assessment closed (assessment completion)",
-                                 "Other owner decision (fictional\\u202ekind)", "Go-ahead at a checkpoint", "Schedule decision", "Restart decision"])
+                                 "Choice after an unfinished step (reconciliation)", "Assessment closed (assessment completion)",
+                                 "Other owner decision (fictional\\u202ekind)", "Go-ahead at a checkpoint", "Schedule decision"])
         ack = decision(record, names[1])
         self.assertEqual((ack["Quoted instruction"], ack["Message id"], ack["Actions it covers"], ack["Plan fingerprint"]),
                          ("I accept the fictional loss.", "fictional-ack", "fictional-action", report.SAME_PLAN))
@@ -728,13 +748,9 @@ class ReportTests(unittest.TestCase):
         self.assertEqual([(row["Checkpoint"], row["Action"], row["Message id"]) for row in checkpoints],
                          [("plan", "none (whole session)", "fictional-continue"), ("before_action", "fictional-action", "fictional-step")])
         self.assertEqual(decision(record, names[4])["Operation"], OPERATION)
-        self.assertEqual((decision(record, names[5])["Action"], decision(record, names[5])["Plan fingerprint"]), ("fictional-action", report.SAME_PLAN))
-        self.assertEqual(decision(record, names[6])["Summary evidence"], "rp-ev-1")
-        self.assertEqual(decision(record, names[7])["Message id"], "fictional-other")
-        restart = decision(record, "Restart decision")
+        self.assertEqual(decision(record, names[5])["Summary evidence"], "rp-ev-1")
+        self.assertEqual(decision(record, names[6])["Message id"], "fictional-other")
         self.assertEqual(decision(record, "Schedule decision")["Scheduled for (UTC)"], CLOCK)
-        self.assertEqual((restart["Choice"], restart["Operation"], restart["Not before (UTC)"], restart["Plan fingerprint"]),
-                         ("Restart later (defer)", OPERATION, "2026-01-02T05:00:00Z", report.SAME_PLAN))
         names = [name for name in names if name != "Go-ahead at a checkpoint"]
         for name in names:
             with self.subTest(decision=name):
@@ -749,7 +765,7 @@ class ReportTests(unittest.TestCase):
 
     def test_outcomes_without_a_result(self):
         session = report_session()
-        started = dict(session["operations"][OPERATION], outcome=None, finished_utc=None, summary="Waiting for an actual operation outcome")
+        started = dict(session["operations"][OPERATION], outcome=None, finished_utc=None, summary="Still running, or waiting for its result")
         earlier = dict(started, operation_id="operation-" + "f" * 32, action_id="fictional-earlier", started_utc="2026-01-02T03:04:04Z",
                        outcome="failed", finished_utc="2026-01-02T03:04:05Z",
                        resolution={"kind": "replan_required", "evidence_ids": [], "recorded_utc": CLOCK, "owner_message_id": "fictional-replan"})
@@ -758,7 +774,7 @@ class ReportTests(unittest.TestCase):
         record = rendered(session)
         first, second = (Shown(item) for item in items(record, "outcomes"))
         self.assertEqual((first["Action"], first["Result"], first["Resolution"], first["Resolution recorded (UTC)"]),
-                         ("fictional-earlier", "failed", "A new plan is needed before anything else changes (replan_required)", CLOCK))
+                         ("fictional-earlier", "Did not finish (failed)", "A new plan is needed before anything else changes (replan_required)", CLOCK))
         self.assertEqual((second["Result"], second["Finished (UTC)"], second["Resolution"], second["Resolution recorded (UTC)"]),
                          (report.NO_RESULT, "not recorded", "not recorded", None))
         self.assertTrue(report.NO_RESULT.startswith("No result recorded: this step started, but no result had been recorded"))
@@ -767,8 +783,8 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(record["outcomes"][0], ["note", report.OUTCOMES_NOTE])
         self.assertEqual(record["outcomes"][-1], ["note", "Planned steps not started: fictional-later. They may still be waiting to run, or may "
                                                           "have been skipped."])
-        self.assertTrue(report.OUTCOMES_NOTE.endswith("ask the assistant what changed and what was kept (PatchCairn: status, then "
-                                                      "PatchCairn: resolve)."))
+        self.assertIn("ask the assistant what changed and what was kept (PatchCairn: status, then PatchCairn: resolve).", report.OUTCOMES_NOTE)
+        self.assertTrue(report.OUTCOMES_NOTE.endswith("only the steps that depend on it stop."))
         # The note appears only when a step failed, is partial or unknown, or has no result.
         for outcome, shown_note in (("succeeded", False), ("failed", True), ("partial", True), ("unknown", True), (None, True)):
             with self.subTest(outcome=outcome):
@@ -782,36 +798,85 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(Shown(items(rendered(dict(session, operations={OPERATION: other})), "outcomes")[0])["Resolution"], "fictional\\u202ekind")
 
     def test_restart_pending(self):
+        # The typed restart record (restart_pending = {"signal", "source"}); no owner restart decision exists any more.
         session = report_session(platform="windows")
-        plan_sha256 = session["plan"]["sha256"]
-        pending = {"evidence_id": "rp-ev-1", "sha256": "a" * 64, "before_boot_evidence_id": "rp-ev-1", "before_boot_sha256": "a" * 64,
-                   "original_exit_code": 3010, "recorded_utc": CLOCK, "decision_ids": []}
-        waiting = dict(session["operations"][OPERATION], outcome=None, finished_utc=None, restart_pending=pending)
-        row = Shown(items(rendered(dict(session, operations={OPERATION: waiting})), "outcomes")[0])
-        self.assertEqual((row["Result"], row["Restart decision"]), (report.RESTART_WAITING, report.RESTART_UNDECIDED))
-        self.assertEqual(report.RESTART_WAITING, "Waiting for a restart: the installer reported that the computer must restart to finish this "
-                                                 "step (code 3010). The step stays unfinished until the computer has restarted and the result "
-                                                 "is checked.")
-        self.assertEqual(report.RESTART_UNDECIDED, "Not decided yet. Tell the assistant whether to restart now or later (PatchCairn: resolve).")
-        self.assertIn(report.OUTCOMES_NOTE, notes(rendered(dict(session, operations={OPERATION: dict(waiting, outcome="unknown")})), "outcomes"))
-        for choice, words in (("defer", "Restart later (defer)"), ("authorize", "Restart allowed; you restart the computer yourself (authorize)"),
-                              ("fictional", "fictional")):
-            with self.subTest(choice=choice):
-                decided = dict(waiting, restart_decision=owner("Fictional restart choice.", "fictional-restart", choice=choice,
-                                                               operation_id=OPERATION, plan_sha256=plan_sha256, not_before_utc=CLOCK))
-                record = rendered(dict(session, operations={OPERATION: decided}))
-                row = Shown(items(record, "outcomes")[0])
-                self.assertEqual((row["Result"], row["Restart decision"]), (report.RESTART_WAITING, words))
-                entry = decision(record, "Restart decision")
-                self.assertEqual((entry["Choice"], entry["Not before (UTC)"], entry["Plan fingerprint"]), (words, CLOCK, report.SAME_PLAN))
-        # Once a boot is checked the step is no longer waiting; its recorded result shows again.
-        checked = dict(decided, restart_verification={"evidence_id": "rp-ev-1", "sha256": "a" * 64, "recorded_utc": CLOCK,
-                                                      "boot_observed": True, "behavior_passed": True})
-        row = Shown(items(rendered(dict(session, operations={OPERATION: checked})), "outcomes")[0])
-        self.assertEqual(row["Result"], report.NO_RESULT)
-        unchecked = dict(checked, restart_verification=dict(checked["restart_verification"], boot_observed=False))
-        self.assertEqual(Shown(items(rendered(dict(session, operations={OPERATION: unchecked})), "outcomes")[0])["Result"], report.RESTART_WAITING)
-        self.assertIsNone(Shown(items(rendered(session), "outcomes")[0])["Restart decision"])
+        waiting = dict(session["operations"][OPERATION], outcome=None, finished_utc=None,
+                       restart_pending={"signal": "required", "source": "fictional-probe"})
+
+        def row(operation, state="waiting", **options):
+            return Shown(items(rendered(dict(session, operations={OPERATION: operation}), restarts={OPERATION: state}, **options), "outcomes")[0])
+        shown = row(waiting)
+        self.assertEqual((shown["Result"], shown["Restart signal"], shown["Restart seen"]),
+                         (report.RESTART_WAITING, "required; reported by fictional-probe", "Not yet"))
+        self.assertEqual(row(waiting, labels=workflow_core.report_labels())["Restart signal"],
+                         "Restart needed to finish (required); reported by fictional-probe")
+        self.assertEqual(report.RESTART_WAITING, "Waiting for a restart: this update needs a restart and a check before the rest can continue. "
+                                                 "PatchCairn never restarts the computer: restart it yourself when you are ready, then say "
+                                                 "PatchCairn: resume.")
+        self.assertIn(report.OUTCOMES_NOTE, notes(rendered(dict(session, operations={OPERATION: waiting}), restarts={OPERATION: "waiting"}), "outcomes"))
+        # Without a source, or with the signal unknown, the signal reads "restart: unknown".
+        for pending in ({"signal": "required", "source": None}, {"signal": "required", "source": " "}, {"signal": "unknown", "source": "probe"}):
+            with self.subTest(pending=pending):
+                self.assertEqual(row(dict(waiting, restart_pending=pending))["Restart signal"], "restart: unknown")
+        # Once a later start of the computer is recorded the step no longer waits; its recorded result shows again.
+        verification = {"boot_observed": True, "evidence_id": "rp-ev-1", "sha256": "a" * 64, "recorded_utc": CLOCK}
+        checked = row(dict(waiting, restart_verification=verification), "boot_observed")
+        self.assertEqual((checked["Result"], checked["Restart seen"]),
+                         (report.NO_RESULT, "A later start of the computer was recorded (UTC " + CLOCK + ")"))
+        self.assertEqual(row(dict(waiting, restart_verification=dict(verification, boot_observed=False)))["Result"], report.RESTART_WAITING)
+        # A step without a restart record has no restart rows.
+        self.assertIsNone(row(session["operations"][OPERATION], "none")["Restart signal"])
+        shown_text = shown_all(rendered(dict(session, operations={OPERATION: waiting}), restarts={OPERATION: "waiting"}))
+        for retired in ("3010", "defer", "Not decided yet"):
+            self.assertNotIn(retired, shown_text)
+
+    def test_restart_wait_comes_from_the_engine_state_not_from_the_record(self):
+        session = report_session()
+        base = dict(session["operations"][OPERATION], outcome=None, finished_utc=None, restart_pending={"signal": "required", "source": "fictional-probe"})
+        gone = dict(base, restart_pending={"signal": "none", "source": "linux.reboot_required"})
+        boot = {"boot_observed": True, "evidence_id": "rp-ev-1", "sha256": "a" * 64, "recorded_utc": CLOCK}
+
+        def page(operation, restarts, **options):
+            return rendered(dict(session, operations={OPERATION: operation}), restarts=restarts, **options)
+        # The signal read again as "none": the engine has released the step, so nothing on the page says it waits.
+        released = Shown(items(page(gone, {OPERATION: "none"}), "outcomes")[0])
+        self.assertEqual((released["Result"], released["Restart signal"], released["Restart seen"]),
+                         (report.NO_RESULT, "none; reported by linux.reboot_required", None))
+        self.assertEqual(Shown(items(page(gone, {OPERATION: "none"}, labels=workflow_core.report_labels()), "outcomes")[0])["Restart signal"],
+                         "No restart reported (none); reported by linux.reboot_required")
+        finished = dict(gone, outcome="succeeded", finished_utc=CLOCK)
+        self.assertEqual(Shown(items(page(finished, {OPERATION: "none"}), "outcomes")[0])["Result"], "Finished (succeeded)")
+        self.assertEqual(notes(page(finished, {OPERATION: "none"}), "outcomes"), [])
+        self.assertNotIn(report.RESTART_WAITING, shown_all(page(gone, {OPERATION: "none"})))
+        # A firmware step can have both: the signal gone, and a later start recorded.
+        self.assertEqual(Shown(items(page(dict(gone, restart_verification=boot), {OPERATION: "boot_observed"}), "outcomes")[0])["Restart seen"],
+                         "A later start of the computer was recorded (UTC " + CLOCK + ")")
+        # Without the engine's state the page shows the record and says neither "waiting" nor "released".
+        for restarts in (None, {}):
+            with self.subTest(restarts=restarts):
+                unread = Shown(items(page(base, restarts), "outcomes")[0])
+                self.assertEqual((unread["Result"], unread["Restart signal"], unread["Restart seen"]),
+                                 (report.NO_RESULT, "required; reported by fictional-probe", "not recorded"))
+        # A step without a restart record takes any state and shows no restart row.
+        self.assertEqual(rendered(session, restarts={OPERATION: "none"})["outcomes"], rendered(session)["outcomes"])
+        # A state that names another session's step, is unknown or contradicts the record is refused before anything renders.
+        for name, operation, restarts in (("waiting after a recorded start", dict(base, restart_verification=boot), {OPERATION: "waiting"}),
+                                          ("seen without a recorded start", base, {OPERATION: "boot_observed"}),
+                                          ("seen with a false start", dict(base, restart_verification=dict(boot, boot_observed=False)), {OPERATION: "boot_observed"}),
+                                          ("another step", base, {"operation-other": "none"}), ("unknown state", base, {OPERATION: "pending"}),
+                                          ("state not text", base, {OPERATION: ["waiting"]}), ("not a record", base, ["waiting"])):
+            with self.subTest(case=name):
+                self.refused(lambda: page(operation, restarts), "report-input")
+
+    def test_restart_states_are_the_engine_readings(self):
+        # report.RESTART_STATES copies engine_journal.restart_state's values, which this L2 module cannot import.
+        pending, boot = {"signal": "required", "source": "fictional-probe"}, {"boot_observed": True}
+        for operation, state in (({}, "none"), ({"restart_pending": dict(pending, signal="none")}, "none"), ({"restart_pending": pending}, "waiting"),
+                                 ({"restart_pending": pending, "restart_verification": boot}, "boot_observed"),
+                                 ({"restart_pending": dict(pending, signal="none"), "restart_verification": boot}, "boot_observed")):
+            with self.subTest(state=state):
+                self.assertEqual(engine_journal.restart_state(operation), state)
+                self.assertIn(state, report.RESTART_STATES)
 
     def test_replanned_outcomes(self):
         session = report_session()
@@ -873,10 +938,13 @@ class ReportTests(unittest.TestCase):
                          [measured, estimate, "1 GB here is 1,000,000,000 bytes. Windows File Explorer counts 1,073,741,824 bytes per GB, so "
                                               "it shows a slightly smaller number."])
         self.assertTrue(measured.endswith("such as downloads or system updates."))
-        self.assertTrue(estimate.startswith("The expected change is PatchCairn's estimate") and "Quarantine keeps files on the same drive" in estimate)
+        self.assertTrue(estimate.startswith("The expected change is PatchCairn's estimate")
+                        and "Setting files aside keeps them on the same drive" in estimate)
+        self.assertNotIn("uarantine", estimate)
         retained = rendered(report_session(), retained=[{"kind": "backup", "location": "work/b", "bytes": 3_210_000_000},
                                                         {"kind": "quarantine", "location": "work/q", "bytes": None}])
         self.assertEqual([dict(item)["Size"] for item in items(retained, "retained")], ["about 3.2 GB (3,210,000,000 bytes)", "not recorded"])
+        self.assertEqual([dict(item)["Kind"] for item in items(retained, "retained")], ["Backup (backup)", "Files set aside (quarantine)"])
 
     def test_read_report_layout_rules(self):
         with mock.patch("pc_records.utc_now", return_value=CLOCK):
@@ -904,12 +972,198 @@ class ReportTests(unittest.TestCase):
         self.refused(lambda: read(dict(good, generated_utc="yesterday")), "utc-time")
         self.refused(lambda: read(dict(good, schema_version="1")), "schema-version")
 
+    def test_backup_cleanup_and_diagnosis_rows_render_unchanged(self):
+        # Update categories and groups belong to update results only: other steps show their recorded outcome, with labels or not.
+        base = report_session()
+        steps = {"fictional-backup": ("backup_create", pc_records.ADAPTER_STORAGE_BACKUP_CREATE, "succeeded"),
+                 "fictional-set-aside": ("cleanup_quarantine", pc_records.ADAPTER_STORAGE_QUARANTINE, "succeeded"),
+                 "fictional-delete": ("delete_selected", pc_records.ADAPTER_STORAGE_DELETE_SELECTED, "failed"),
+                 "fictional-diagnosis": ("assessment", pc_records.ADAPTER_DIAGNOSTIC_COLLECT, "partial")}
+        operations = {}
+        for number, (action_id, (_, adapter_id, outcome)) in enumerate(steps.items()):
+            operation_id = "operation-" + str(number) * 32
+            operations[operation_id] = dict(base["operations"][OPERATION], operation_id=operation_id, action_id=action_id, outcome=outcome,
+                                            adapter_id=adapter_id, started_utc=f"2026-01-02T03:04:0{number}Z", summary="Fictional " + action_id)
+        actions = [dict(base["plan"]["document"]["actions"][0], action_id=action_id, kind=kind, adapter_id=adapter_id)
+                   for action_id, (kind, adapter_id, _) in steps.items()]
+        session = report_session(operations=operations, plan=dict(base["plan"], document=dict(base["plan"]["document"], actions=actions)))
+        retained = [{"kind": "backup", "location": "work/fictional-backup", "bytes": 2048}, {"kind": "quarantine", "location": "work/q", "bytes": 10}]
+        plain = rendered(session, retained=retained)
+        labelled = rendered(session, retained=retained, labels=workflow_core.report_labels())
+        self.assertEqual([[(label, value) for label, value in item if label in ("Action", "Result", "Summary", "Resolution")]
+                          for item in items(plain, "outcomes")],
+                         [[("Action", action_id), ("Result", report.OUTCOME_WORDS[outcome] + " (" + outcome + ")"), ("Summary", "Fictional " + action_id),
+                           ("Resolution", "not recorded")] for action_id, (_, _, outcome) in steps.items()])
+        self.assertEqual([[label for label, _ in item] for item in items(plain, "outcomes")],
+                         [["Step", "Action", "Plan fingerprint", "Authorized by", "Started (UTC)", "Finished (UTC)", "Result", "Summary", "Resolution"]] * 4)
+        for key in ("retained", "free_space", "packages"):
+            with self.subTest(section=key):
+                self.assertEqual(labelled[key], plain[key])
+        # Only the step row takes its label; every other outcome row reads the same with labels.
+        self.assertEqual([item[1:] for item in items(labelled, "outcomes")], [item[1:] for item in items(plain, "outcomes")])
+        for record in (plain, labelled):
+            for key in ("outcomes", "retained", "plan"):
+                self.assertNotRegex(shown(record, key), r"Category|Group|updated_checked|did_not_update|needs_check|Needs a check")
+
+    def test_package_rows_carry_category_and_group(self):
+        self.assertEqual(report.PACKAGE_KEYS, ("manager", "package", "outcome", "restart", "category", "group"))
+        row = {"manager": "fictional-manager", "package": "Fictional.Package", "outcome": "did_not_update", "restart": "none",
+               "category": "did_not_update", "group": "apps"}
+        self.assertEqual(items(rendered(report_session(), packages=[row]), "packages"), [[
+            ("Installed through", "fictional-manager"), ("Item", "Fictional.Package"), ("Result", "did_not_update"), ("Restart", "none"),
+            ("Category", "did_not_update"), ("Group", "apps")]])
+        self.assertEqual(items(rendered(report_session(), packages=[row], labels=workflow_core.report_labels()), "packages"), [[
+            ("Installed through", "fictional-manager"), ("Item", "Fictional.Package"),
+            ("Result", "Did not update; what is installed was checked (did_not_update)"), ("Restart", "No restart waiting (none)"),
+            ("Category", "Did not update (did_not_update)"), ("Group", "Apps (apps)")]])
+        # Every update result renders with exactly its own category, in every group.
+        for result, category in pc_records.UPDATE_RESULTS.items():
+            for group in pc_records.OUTCOME_GROUPS:
+                rendered(report_session(), packages=[dict(row, outcome=result, category=category, group=group)])
+        bad = {"result outside the update results": dict(row, outcome="upgraded"),
+               "category not the result's own": dict(row, category="updated_checked"),
+               "unverified result counted as not updated": dict(row, outcome="could_not_check", category="did_not_update"),
+               "category outside the seven": dict(row, category="fixed"), "group outside the five": dict(row, group="drivers"),
+               "no category": {key: value for key, value in row.items() if key != "category"},
+               "no group": {key: value for key, value in row.items() if key != "group"}, "category not text": dict(row, category=None)}
+        for name, value in bad.items():
+            with self.subTest(case=name):
+                self.refused(lambda: report.render_session(report_session(), packages=[row, value]), "report-input")
+
+    def test_left_out_not_run_and_restart_pending_items_are_shown(self):
+        # A batch also has items without a finished result; the service derives these rows and the page names each one plainly.
+        rows = [{"manager": "fictional-manager", "package": "Fictional." + result, "outcome": result, "restart": restart,
+                 "category": pc_records.UPDATE_RESULTS[result], "group": "apps"}
+                for result, restart in (("excluded", "none"), ("not_run", "none"), ("restart_needed", "pending"))]
+        labelled = items(rendered(report_session(), packages=rows, labels=workflow_core.report_labels()), "packages")
+        self.assertEqual([[dict(item)[label] for label in ("Item", "Result", "Restart", "Category")] for item in labelled], [
+            ["Fictional.excluded", "Left out by you (excluded)", "No restart waiting (none)", "Left out by you (skipped_by_you)"],
+            ["Fictional.not_run", "Not run: it never started (for example after a pause, a stop, a restart still waiting, or an item it depends on) (not_run)",
+             "No restart waiting (none)", "Did not update (did_not_update)"],
+            ["Fictional.restart_needed", "Needs a restart to finish (restart_needed)", "Waiting for a restart (pending)",
+             "Needs a restart to finish (need_restart)"]])
+        self.assertEqual(dict(items(rendered(report_session(), packages=[dict(rows[0], restart="boot_observed")], labels=workflow_core.report_labels()),
+                                    "packages")[0])["Restart"], "Restart seen (boot_observed)")
+        self.assertEqual(dict(items(rendered(report_session(), packages=rows), "packages")[2])["Restart"], "pending")
+
+    def test_the_service_projection_reads_in_plain_words(self):
+        # The rows as the service builds them, not by hand: each reading of a step's restart record has its plain label.
+        from service_state import package_rows
+        payloads = {OPERATION: {"manager": "fictional-manager", "id": "Fictional.Package", "group": "apps"}}
+        boot = {"boot_observed": True, "evidence_id": "rp-ev-1", "sha256": "a" * 64, "recorded_utc": CLOCK}
+        required = {"signal": "required", "source": "fictional-probe"}
+        for markers, label in (({"restart_pending": required}, "Waiting for a restart (pending)"),
+                               ({"restart_pending": required, "restart_verification": boot}, "Restart seen (boot_observed)"),
+                               ({"restart_pending": dict(required, signal="none")}, "No restart waiting (none)"), ({}, "No restart waiting (none)")):
+            with self.subTest(markers=sorted(markers)):
+                session = report_session()
+                session["evidence"]["rp-ev-1"]["facts"]["result"] = "restart_needed"
+                session["operations"][OPERATION].update(evidence_ids=["rp-ev-1"], **markers)
+                rows = package_rows(session, payloads)
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(dict(items(rendered(session, packages=rows, labels=workflow_core.report_labels()), "packages")[0])["Restart"], label)
+
+    def test_verified_failure_resolution_label(self):
+        self.assertEqual(report.RESOLUTIONS["verified_failure"], "Did not update; the rest of the batch continued")
+        failed = dict(report_session()["operations"][OPERATION], outcome="failed", resolution={
+            "kind": "verified_failure", "evidence_ids": ["rp-ev-1"], "recorded_utc": CLOCK, "owner_message_id": None})
+        record = rendered(report_session(operations={OPERATION: failed}))
+        row = Shown(items(record, "outcomes")[0])
+        self.assertEqual((row["Result"], row["Resolution"], row["Resolution recorded (UTC)"]),
+                         ("Did not finish (failed)", "Did not update; the rest of the batch continued (verified_failure)", CLOCK))
+        # A verified failure alone holds nothing, so the hold note stays away; any other failure brings it back.
+        self.assertNotIn(report.OUTCOMES_NOTE, notes(record, "outcomes"))
+        replanned = dict(failed, resolution=dict(failed["resolution"], kind="replan_required"))
+        self.assertIn(report.OUTCOMES_NOTE, notes(rendered(report_session(operations={OPERATION: replanned})), "outcomes"))
+
+    def test_label_keys_match_the_engine_tables(self):
+        # report.LABEL_KEYS copies the keys of the engine's report_labels(), which this L2 module cannot import.
+        self.assertEqual(report.LABEL_KEYS, set(workflow_core.report_labels()))
+        self.assertEqual(report.PACKAGE_RESTARTS, set(workflow_core.report_labels()["package_restarts"]))
+
+    def test_labels_show_each_code_with_its_label_and_refuse_malformed_labels(self):
+        labels = workflow_core.report_labels()
+        session = report_session(
+            standing_policy=owner("Fictional policy.", "fictional-policy", action_kinds=["backup_create", "fictional-kind"], targets=[],
+                                  max_actions=1, used_actions=0, expires_utc=CLOCK),
+            pending={"c": {"kind": "checkpoint", "checkpoint": "plan", "action_id": None, "owner_instruction": owner("Continue.", "fictional-go")}})
+        plain, labelled = rendered(session), rendered(session, labels=labels)
+        self.assertEqual(labelled["title"], "PatchCairn session report: Security and updates (security_updates), created 2026-01-02")
+        self.assertEqual(plain["title"], "PatchCairn session report: security_updates, created 2026-01-02")
+        for key, pair in (("header", ("Job", "Security and updates (security_updates)")), ("header", ("Stage", "Carry out the approved work (apply)")),
+                          ("header", ("Status", "Working on the current step (active)")), ("plan", ("Kind", "Create the reviewed backup (backup_create)")),
+                          ("approvals", ("Kinds of step allowed", "Create the reviewed backup (backup_create), fictional-kind")),
+                          ("approvals", ("Checkpoint", "the proposed changes (plan)"))):
+            with self.subTest(label=pair[0]):
+                self.assertIn(pair, pairs(labelled, key))
+        for key, pair in (("header", ("Job", "security_updates")), ("header", ("Status", "active")), ("plan", ("Kind", "backup_create")),
+                          ("approvals", ("Kinds of step allowed", "backup_create, fictional-kind")), ("approvals", ("Checkpoint", "plan"))):
+            with self.subTest(code=pair[0]):
+                self.assertIn(pair, pairs(plain, key))
+        bad = {"not a record": [labels], "a key missing": {key: value for key, value in labels.items() if key != "statuses"},
+               "an extra key": dict(labels, modes={}), "a table not a record": dict(labels, jobs=["Security and updates"]),
+               "a blank label": dict(labels, stages=dict(labels["stages"], scope=" ")), "a label not text": dict(labels, actions={"update": 1}),
+               "a category missing": dict(labels, categories={k: v for k, v in labels["categories"].items() if k != "needs_check"}),
+               "an extra result": dict(labels, results=dict(labels["results"], upgraded="Upgraded")),
+               "a group missing": dict(labels, groups={}), "a package restart missing": dict(labels, package_restarts={"none": "No restart"})}
+        for name, value in bad.items():
+            with self.subTest(case=name):
+                self.refused(lambda: report.render_session(session, labels=value), "report-input")
+
     def test_report_record_golden_bytes(self):
         with mock.patch("pc_records.utc_now", return_value=CLOCK):
             _, block, record = embedded(report.render_session(report_session()))
         data = pc_records.encoded(record)
         self.assertEqual(block, data.decode("ascii").replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026"))
         self.assertEqual(hashlib.sha256(data).hexdigest(), GOLDEN_SHA256)
+
+
+class PlainReportTests(unittest.TestCase):
+    """The words a person reads on the page: the step, its result, an overview, and a closed job's restart text."""
+
+    def test_each_step_names_its_action_and_its_result_in_words(self):
+        session = report_session()
+        record = rendered(session, labels=workflow_core.report_labels())
+        [row] = items(record, "outcomes")
+        shown = dict(row)
+        self.assertEqual(shown["Step"], "Create the reviewed backup (backup_create): Fictional component")
+        self.assertEqual(shown["Result"], "Finished (succeeded)")
+        for outcome, words in (("failed", "Did not finish (failed)"), ("partial", "Only part took effect (partial)"), ("unknown", "Not confirmed (unknown)")):
+            with self.subTest(outcome=outcome):
+                changed = copy.deepcopy(session)
+                changed["operations"][OPERATION]["outcome"] = outcome
+                self.assertEqual(dict(items(rendered(changed), "outcomes")[0])["Result"], words)
+
+    def test_a_step_of_a_replaced_plan_keeps_its_row(self):
+        session = report_session()
+        session["operations"][OPERATION]["action_id"] = "fictional-earlier-action"
+        self.assertEqual(dict(items(rendered(session), "outcomes")[0])["Step"], "not recorded")
+
+    def test_the_header_says_what_happened_at_a_glance(self):
+        session = report_session()
+        session["plan"]["document"]["actions"].append(dict(session["plan"]["document"]["actions"][0], action_id="fictional-later"))
+        later = dict(session["operations"][OPERATION], operation_id="operation-" + "1" * 32, action_id="fictional-other", outcome="failed")
+        session["operations"][later["operation_id"]] = later
+        self.assertIn("What happened: 1 step finished, 1 did not finish, 1 did not start.", notes(rendered(session), "header"))
+        self.assertFalse([note for note in notes(rendered(dict(report_session(), plan=None, operations={})), "header") if note.startswith("What happened")])
+
+    def test_a_stopped_job_never_says_resume(self):
+        session = report_session(status="stopped")
+        waiting = dict(session["operations"][OPERATION], outcome=None, finished_utc=None, restart_pending={"signal": "required", "source": "fictional-probe"})
+        record = rendered(dict(session, operations={OPERATION: waiting}), restarts={OPERATION: "waiting"})
+        self.assertEqual(dict(items(record, "outcomes")[0])["Result"], report.RESTART_CLOSED)
+        self.assertEqual(report.RESTART_CLOSED, "Waiting for a restart: this update still needs a restart and a check before its result is known. "
+                                                "PatchCairn never restarts the computer: restart it yourself when you are ready, then say PatchCairn: "
+                                                "status. This job stays stopped.")
+
+    def test_kept_rows_have_plain_names_and_update_rows_plain_headings(self):
+        rows = [{"kind": kind, "location": "fictional-location", "bytes": None} for kind in ("backup", "recovery", "quarantine", "destination", "reservation")]
+        record = rendered(report_session(), retained=rows)
+        self.assertEqual([dict(item)["Kind"] for item in items(record, "retained")],
+                         ["Backup (backup)", "Recovery copy (recovery)", "Files set aside (quarantine)", "Backup folder you chose (destination)",
+                          "Reserved for an unfinished backup (reservation)"])
+        self.assertEqual(report.RETAINED_NOTE, "PatchCairn keeps these so a change can be undone or files restored. They use space on the drive shown until "
+                                               "you choose to delete them. Ask your assistant first: afterwards the change cannot be undone.")
 
 
 if __name__ == "__main__":
