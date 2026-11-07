@@ -1,4 +1,5 @@
-"""Pure diagnostic record rules (layer L2-pure, PD-12): validators, no files and no executor.
+"""Pure diagnostic record rules and the read-only recipe table (layer L2-pure): validators and data, no files and no
+executor.
 
 The trusted coordinator owns collection authority and sequential persistence.
 These controls are an operational boundary in a quiet, exclusively controlled
@@ -6,9 +7,11 @@ workspace, not a sandbox against another process running as the same user.
 """
 from __future__ import annotations
 
+from collections import namedtuple
 import copy
 from datetime import timedelta
 import re
+from types import MappingProxyType
 import unicodedata
 from urllib.parse import urlsplit
 
@@ -20,13 +23,76 @@ MAX_RECORD = 128 * 1024
 REQUEST_RE = re.compile(r"diag-[a-f0-9]{32}\Z")
 RECORD_RE = re.compile(r"(request|result|excerpt|hypotheses|verification)-([a-f0-9]{64})\Z")
 TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_.:-]{0,95}\Z")
-RECIPES = {
-    "macos.os_version": "macos", "macos.root_capacity": "macos",
-    "linux.kernel_version": "linux", "linux.root_capacity": "linux",
-    "windows.os_version": "windows", "windows.system_capacity": "windows",
-    "windows.update_context": "windows", "windows.system_event_metadata": "windows",
-    "windows.update_event_metadata": "windows",
-}
+
+# Every read-only recipe: its platform, how it runs, its official sources, its fixed command (executable candidates,
+# then arguments) and, for a recipe that does not run, why it holds. How it runs: "runner" (the command, through
+# readonly_runner), "in_process" (the standard library), "helper" (the Windows PowerShell helper, which a scheduled run
+# skips) or "inventory" (a collector's query: only that collector runs it, and no diagnostic request names it).
+Recipe = namedtuple("Recipe", "platform run sources command held", defaults=((), None, None))
+_MS = "https://learn.microsoft.com/en-us/"
+_GNU = "https://www.gnu.org/software/coreutils/manual/html_node/"
+_ADMIN = ("This check needs an administrator prompt, which PatchCairn never opens; an administrator can run {} "
+          "themselves and share what it reports.")
+_UNVERIFIED = ("How {} behaves without administrator rights is not verified yet, so this check holds and nothing is run.")
+TABLE = MappingProxyType({
+    "macos.os_version": Recipe("macos", "runner", (
+        "https://developer.apple.com/documentation/technologyoverviews/building-your-macos-game-remotely-from-your-pc",),
+        (("/usr/bin/sw_vers",), ("-productVersion",))),
+    "macos.root_capacity": Recipe("macos", "runner", (
+        "https://raw.githubusercontent.com/apple-oss-distributions/file_cmds/main/df/df.1",),
+        # "/" is the sealed system volume, whose figures leave out the person's data; the Data volume holds them.
+        (("/bin/df",), ("-k", "-I", "/System/Volumes/Data"))),
+    "linux.kernel_version": Recipe("linux", "runner", (_GNU + "uname-invocation.html",), (("/usr/bin/uname", "/bin/uname"), ("-r",))),
+    "linux.root_capacity": Recipe("linux", "runner", (_GNU + "df-invocation.html",), (("/usr/bin/df", "/bin/df"), ("-Pk", "/"))),
+    "linux.dpkg_audit": Recipe("linux", "runner", ("https://manpages.debian.org/trixie/dpkg/dpkg.1.en.html",),
+                               held=_UNVERIFIED.format("the package database audit of dpkg")),
+    "linux.rpm_verify": Recipe("linux", "runner", ("https://rpm-software-management.github.io/rpm/man/rpm.8.html",),
+                               held=_UNVERIFIED.format("the package verification of rpm")),
+    "windows.os_version": Recipe("windows", "in_process", (
+        "https://docs.python.org/3/library/sys.html",
+        _MS + "windows/win32/api/wow64apiset/nf-wow64apiset-iswow64process2")),
+    "windows.system_capacity": Recipe("windows", "in_process", (
+        _MS + "windows/win32/api/fileapi/nf-fileapi-getdiskfreespaceexw",)),
+    "windows.update_context": Recipe("windows", "helper", (
+        _MS + "powershell/module/microsoft.powershell.management/get-hotfix",)),
+    "windows.system_event_metadata": Recipe("windows", "helper", (
+        _MS + "powershell/module/microsoft.powershell.diagnostics/get-winevent",)),
+    "windows.update_event_metadata": Recipe("windows", "helper", (
+        _MS + "powershell/module/microsoft.powershell.diagnostics/get-winevent",)),
+    "windows.dism_check_health": Recipe("windows", "runner", (
+        _MS + "windows-hardware/manufacture/desktop/repair-a-windows-image",),
+        held=_ADMIN.format("the Windows image health check (DISM with CheckHealth)")),
+    "windows.sfc_verify_only": Recipe("windows", "runner", (
+        _MS + "windows-server/administration/windows-commands/sfc",),
+        held=_ADMIN.format("the System File Checker in its verify-only mode")),
+    # The collectors' queries; the Linux ones keep the collector's own search order of system folders.
+    "linux.dpkg_installed": Recipe("linux", "inventory", command=(
+        ("/usr/bin/dpkg-query", "/bin/dpkg-query", "/usr/sbin/dpkg-query"),
+        ("--show", "--showformat=${binary:Package}\\t${Version}\\t${Architecture}\\t${db:Status-Abbrev}\\t${source:Package}\\n"))),
+    "linux.rpm_installed": Recipe("linux", "inventory", command=(
+        ("/usr/bin/rpm", "/bin/rpm", "/usr/sbin/rpm"),
+        ("--noplugins", "--rcfile", "/dev/null", "--macros", "/dev/null", "--dbpath", "/var/lib/rpm", "-qa", "--qf",
+         "%{NAME}\\t%{EPOCHNUM}:%{VERSION}-%{RELEASE}\\t%{ARCH}\\t%{SOURCERPM}\\n"))),
+    "linux.snap_list": Recipe("linux", "inventory", command=(("/usr/bin/snap", "/bin/snap", "/usr/sbin/snap"), ("list",))),
+    "linux.flatpak_system": Recipe("linux", "inventory", command=(
+        ("/usr/bin/flatpak", "/bin/flatpak", "/usr/sbin/flatpak"), ("list", "--system", "--columns=application,version,arch,branch"))),
+    "macos.sw_vers": Recipe("macos", "inventory", command=(("/usr/bin/sw_vers",), ())),
+    "macos.machine": Recipe("macos", "inventory", command=(("/usr/bin/uname",), ("-m",))),
+    "macos.arm64_capable": Recipe("macos", "inventory", command=(("/usr/sbin/sysctl",), ("-n", "hw.optional.arm64"))),
+    "macos.translated": Recipe("macos", "inventory", command=(("/usr/sbin/sysctl",), ("-in", "sysctl.proc_translated"))),
+    "macos.developer_dir": Recipe("macos", "inventory", command=(("/usr/bin/xcode-select",), ("--print-path",))),
+    "macos.receipts": Recipe("macos", "inventory", command=(("/usr/sbin/pkgutil",), ("--pkgs",))),
+})
+# {recipe id: platform} for every recipe (readonly_runner's closed table takes its ids from here).
+RECIPES = {recipe_id: row.platform for recipe_id, row in TABLE.items()}
+# The fixed command of each recipe that runs through readonly_runner; a held recipe has none, so it holds there too.
+ARGV = MappingProxyType({recipe_id: row.command for recipe_id, row in TABLE.items() if row.command and not row.held})
+HELD = MappingProxyType({recipe_id: row.held for recipe_id, row in TABLE.items() if row.held})
+HELPER_RECIPES = frozenset(recipe_id for recipe_id, row in TABLE.items() if row.run == "helper")
+INVENTORY_RECIPES = frozenset(recipe_id for recipe_id, row in TABLE.items() if row.run == "inventory")
+# Why a result holds when the Windows PowerShell helper could not answer: the script policy refused it, Windows
+# PowerShell did not start, it ran past its time limit, or it printed more than its output bound.
+HOLDS = frozenset({"windows-script-policy", "windows-helper-start", "windows-helper-timeout", "windows-helper-output"})
 SENSITIVE = re.compile(
     r"(?i)password|passwd|\bpwd\b|token|secret|api[ _-]?key|(?:[_-]?auth(?:entication|orization)?\b)|bearer|"
     r"cookie|credential|private[ _-]?key|session[ _-]?(?:id|key)|access[ _-]?key|"
@@ -34,7 +100,8 @@ SENSITIVE = re.compile(
     r"(?:[A-Za-z0-9_+/=-]{32,})|(?:https?://[^\s]*[?@#])")
 SOURCES = {"developer.apple.com", "support.apple.com", "www.gnu.org", "gnu.org",
            "learn.microsoft.com", "www.freedesktop.org", "freedesktop.org",
-           "www.kernel.org", "kernel.org", "man7.org", "www.man7.org"}
+           "www.kernel.org", "kernel.org", "man7.org", "www.man7.org", "docs.python.org", "manpages.debian.org",
+           "rpm-software-management.github.io"}
 
 
 class DiagnosticRefusal(pc_records.Refusal):
@@ -59,18 +126,18 @@ def parse_time(value):
     return _shared(pc_records.parse_utc, value)
 
 
-# D-056: a backward step of the computer's clock between two times PatchCairn stamped in one flow.
+# A backward step of the computer's clock between two times PatchCairn stamped in one flow.
 CLOCK_STEP_MESSAGE = "The computer's clock moved back while PatchCairn was working; observe again."
 
 
 def stepped_back(observed, after):
-    """True when ``observed`` precedes ``after`` by no more than pc_records' future-skew bound (D-056): ordering keeps
-    no tolerance, but such a small backward gap is refused as a clock step, not as stale evidence."""
+    """True when ``observed`` precedes ``after`` by no more than pc_records' future-skew bound: ordering keeps no
+    tolerance, but such a small backward gap is refused as a clock step, not as stale evidence."""
     return after - timedelta(seconds=pc_records.FUTURE_SKEW_SECONDS) <= observed < after
 
 
 def after_now(observed):
-    """True when the time ``observed`` lies beyond now plus pc_records' tolerance for clock steps (#80)."""
+    """True when the time ``observed`` lies beyond now plus pc_records' tolerance for clock steps."""
     return observed > parse_time(pc_records.utc_now()) + timedelta(seconds=pc_records.FUTURE_SKEW_SECONDS)
 
 
@@ -131,7 +198,9 @@ def validate_request(request):
     exact_keys(request, {"schema", "schema_version", "kind", "request_id", "platform", "recipe_id", "mode", "symptom", "scope", "observed_utc"})
     if request["kind"] != "request" or not REQUEST_RE.fullmatch(str(request["request_id"])):
         raise DiagnosticRefusal("Foreign diagnostic request")
-    if not isinstance(request["recipe_id"], str) or not isinstance(request["platform"], str) or not isinstance(request["mode"], str) or RECIPES.get(request["recipe_id"]) != request["platform"] or request["mode"] not in {"fixture", "real"}:
+    if (not isinstance(request["recipe_id"], str) or not isinstance(request["platform"], str) or not isinstance(request["mode"], str)
+            or RECIPES.get(request["recipe_id"]) != request["platform"] or request["recipe_id"] in INVENTORY_RECIPES
+            or request["mode"] not in {"fixture", "real"}):
         raise DiagnosticRefusal("Unknown or foreign-platform recipe")
     scope_tokens(request["scope"])
     parse_time(request["observed_utc"])
@@ -176,7 +245,7 @@ def _facts(recipe, facts):
                 raise DiagnosticRefusal("Unexpected update identifier")
             if item["installed_utc"] is not None:
                 parse_time(item["installed_utc"])
-    else:
+    elif recipe in ("windows.system_event_metadata", "windows.update_event_metadata"):
         exact_keys(facts, {"events"})
         if not isinstance(facts["events"], list) or len(facts["events"]) > 50:
             raise DiagnosticRefusal("Event metadata cap exceeded")
@@ -186,21 +255,27 @@ def _facts(recipe, facts):
             _number(item["level"], maximum=5)
             if item["event_id"] == 0 or item["level"] == 0:
                 raise DiagnosticRefusal("Event identifier and level must be nonzero")
-            if not isinstance(item["provider"], str) or item["provider"] not in {"Microsoft-Windows-WindowsUpdateClient", "Microsoft-Windows-Kernel-Power", "EventLog", "Microsoft-Windows-WHEA-Logger", "disk", "Ntfs", "volmgr"}:
+            if not isinstance(item["provider"], str) or item["provider"] not in {"Microsoft-Windows-WindowsUpdateClient", "Microsoft-Windows-Kernel-Power", "EventLog", "Microsoft-Windows-WHEA-Logger", "disk", "Ntfs", "Microsoft-Windows-Ntfs", "volmgr"}:
                 raise DiagnosticRefusal("Unreviewed event provider")
             parse_time(item["observed_utc"])
+    else:
+        raise DiagnosticRefusal("This recipe holds; it has no observed facts")
     return copy.deepcopy(facts)
 
 
 def validate_adapter_result(request, result):
+    """A recipe's result for ``request``, checked and copied. An optional ``hold`` names why a held result holds (HOLDS)."""
     validate_request(request)
     read_diagnostic(result)
-    exact_keys(result, {"schema", "schema_version", "kind", "request_id", "platform", "recipe_id", "mode", "status", "observed_utc", "facts", "limitations", "provenance"})
+    exact_keys(result, {"schema", "schema_version", "kind", "request_id", "platform", "recipe_id", "mode", "status", "observed_utc", "facts",
+                        "limitations", "provenance"}, {"hold"})
     for key in ("request_id", "platform", "recipe_id", "mode"):
         if result[key] != request[key]:
             raise DiagnosticRefusal("Result/request identity mismatch")
     if result["kind"] != "adapter_result" or not isinstance(result["status"], str) or result["status"] not in {"observed", "held", "failed"}:
         raise DiagnosticRefusal("Unknown adapter result")
+    if "hold" in result and (result["status"] != "held" or not isinstance(result["hold"], str) or result["hold"] not in HOLDS):
+        raise DiagnosticRefusal("Unknown hold reason")
     observed, requested = parse_time(result["observed_utc"]), parse_time(request["observed_utc"])
     if stepped_back(observed, requested):
         raise DiagnosticRefusal(CLOCK_STEP_MESSAGE, code="clock-step")

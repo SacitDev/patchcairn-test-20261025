@@ -1,9 +1,11 @@
 [CmdletBinding()]
 param()
-# The Windows diagnostic helper scripts/diagnostic_windows.ps1: its recipes in fixture mode, its strict request
-# refusals and its documented start (-File under GetSystemDirectoryW's Windows PowerShell, module path of the shell's
-# own modules only). Prints one PASS or FAIL line per check and exits 1 if any check fails. No host recipe runs.
-# Selected-file I/O is tested in tests/test_windows_io.py. Fixture files live under work/test-fixtures/ and are removed.
+# The Windows diagnostic helper scripts/diagnostic_windows.ps1: its update and event recipes in fixture mode (the OS
+# version and capacity recipes run in-process in Python and are refused here), its strict request refusals, its
+# script-policy holds and its documented start (-File under GetSystemDirectoryW's Windows PowerShell, module path of
+# the shell's own modules only). Prints one PASS or FAIL line per check and exits 1 if any check fails. No host recipe
+# runs. Selected-file I/O is tested in tests/test_windows_io.py. Fixture files live under work/test-fixtures/ and are
+# removed.
 $env:TZ='UTC'
 $ErrorActionPreference='Stop'
 Set-StrictMode -Version Latest
@@ -26,7 +28,7 @@ function Request([string]$Recipe,[object[]]$Scope=@()) {
 # An older-style name, built at run time so no version label sits in the source.
 function Versioned([string]$Name,[int]$Number) { return $Name+'.v'+$Number }
 function Changed([string]$Key,$Value,[switch]$Remove) {
- $request=Request 'windows.os_version'
+ $request=Request 'windows.update_context'
  if ($Remove) { $request.Remove($Key) } else { $request[$Key]=$Value }
  return $request
 }
@@ -61,18 +63,64 @@ function Start-Helper([string]$RequestText,[string]$FactsText,[byte[]]$Prefix=@(
 try {
  . $helper
  # Recipes in fixture mode.
- Check 'diagnostic fictional OS context' { $r=Invoke-WindowsDiagnostic -Request (Request 'windows.os_version') -FixtureFacts @{version='10.0.99999';build='99999';architecture='x64'};$r.status -ceq 'observed' -and $r.mode -ceq 'fixture' }
- Check 'diagnostic capacity projection' { (Invoke-WindowsDiagnostic -Request (Request 'windows.system_capacity') -FixtureFacts @{total_bytes=1024L;available_bytes=512L}).facts.available_bytes -eq 512 }
- Check 'diagnostic update projection' { @((Invoke-WindowsDiagnostic -Request (Request 'windows.update_context') -FixtureFacts @{updates=@(@{kb_id='KB1234567';installed_utc=$null})}).facts.updates).Count -eq 1 }
+ $update=@{updates=@(@{kb_id='KB1234567';installed_utc=$null})}
+ Check 'diagnostic update projection' { $r=Invoke-WindowsDiagnostic -Request (Request 'windows.update_context') -FixtureFacts $update;$r.status -ceq 'observed' -and $r.mode -ceq 'fixture' -and @($r.facts.updates).Count -eq 1 }
  Check 'diagnostic bounded event metadata' { @((Invoke-WindowsDiagnostic -Request (Request 'windows.update_event_metadata' @('window_hours:1','max_events:2')) -FixtureFacts @{events=@(@{event_id=20;provider='Microsoft-Windows-WindowsUpdateClient';level=2;observed_utc='2026-01-01T00:00:00Z'})}).facts.events).Count -eq 1 }
+ Check 'diagnostic bounded system event metadata' { @((Invoke-WindowsDiagnostic -Request (Request 'windows.system_event_metadata' @('window_hours:24','max_events:3')) -FixtureFacts @{events=@(@{event_id=41;provider='Microsoft-Windows-Kernel-Power';level=1;observed_utc='2026-01-01T00:00:00Z'})}).facts.events).Count -eq 1 }
+ Check 'update events from another provider refused' { Refused { Invoke-WindowsDiagnostic -Request (Request 'windows.update_event_metadata' @('window_hours:1','max_events:2')) -FixtureFacts @{events=@(@{event_id=41;provider='Microsoft-Windows-Kernel-Power';level=1;observed_utc='2026-01-01T00:00:00Z'})} } 'diagnostic:invalid-fixture-facts' }
  Check 'events require selected scope' { Refused { Invoke-WindowsDiagnostic -Request (Request 'windows.update_event_metadata') -FixtureFacts @{events=@()} } 'diagnostic:explicit-event-scope-required' }
- Check 'diagnostic extra field refused' { Refused { Invoke-WindowsDiagnostic -Request (Request 'windows.os_version') -FixtureFacts @{version='10.0';build='1';architecture='x64';password='fictional forbidden field'} } 'diagnostic:invalid-fixture-facts' }
- Check 'diagnostic extra field named Keys refused' { $facts=ConvertFrom-StrictJson -Text '{"version":"10.0","build":"1","architecture":"x64","Keys":["version","build","architecture"]}';Refused { Invoke-WindowsDiagnostic -Request (Request 'windows.os_version') -FixtureFacts $facts } 'diagnostic:invalid-fixture-facts' }
+ foreach ($recipe in @('windows.os_version','windows.system_capacity','windows.dism_check_health','windows.sfc_verify_only')) {
+  Check ('recipe not run by the helper refused: '+$recipe) { Refused { Invoke-WindowsDiagnostic -Request (Request $recipe) -FixtureFacts @{total_bytes=1024L;available_bytes=512L} } 'diagnostic:invalid-request' }
+ }
+ Check 'diagnostic extra field refused' { Refused { Invoke-WindowsDiagnostic -Request (Request 'windows.update_context') -FixtureFacts @{updates=@();password='fictional forbidden field'} } 'diagnostic:invalid-fixture-facts' }
+ Check 'diagnostic extra field named Keys refused' { $facts=ConvertFrom-StrictJson -Text '{"updates":[],"Keys":["updates"]}';Refused { Invoke-WindowsDiagnostic -Request (Request 'windows.update_context') -FixtureFacts $facts } 'diagnostic:invalid-fixture-facts' }
  Check 'command string recipe refused' { Refused { Invoke-WindowsDiagnostic -Request (Request 'powershell; fake-command') -FixtureFacts @{} } 'diagnostic:invalid-request' }
  Check 'event limit escalation refused' { Refused { Invoke-WindowsDiagnostic -Request (Request 'windows.system_event_metadata' @('window_hours:24','max_events:51')) -FixtureFacts @{events=@()} } 'diagnostic:invalid-scope' }
  Check 'unknown provider refused' { Refused { Invoke-WindowsDiagnostic -Request (Request 'windows.system_event_metadata' @('window_hours:24','max_events:1')) -FixtureFacts @{events=@(@{event_id=1;provider='private-provider';level=2;observed_utc='2026-01-01T00:00:00Z'})} } 'diagnostic:invalid-fixture-facts' }
- Check 'request record cannot authorize real collection' { $real=Request 'windows.os_version';$real.mode='real';$held=Invoke-WindowsDiagnostic -Request $real;$held.status -ceq 'held' -and @($held.facts.Keys).Count -eq 0 }
- Check 'result carries the unversioned name and integer version' { $r=Invoke-WindowsDiagnostic -Request (Request 'windows.os_version') -FixtureFacts @{version='10.0.1';build='1';architecture='x64'};$r.schema -ceq 'patchcairn.diagnostics' -and $r.schema_version -is [int] -and ([long]$r.schema_version).Equals([long]1) }
+ Check 'request record cannot authorize real collection' { $real=Request 'windows.update_context';$real.mode='real';$held=Invoke-WindowsDiagnostic -Request $real;$held.status -ceq 'held' -and @($held.facts.Keys).Count -eq 0 }
+ Check 'fixture facts refused in a real request' { $real=Request 'windows.update_context';$real.mode='real';Refused { Invoke-WindowsDiagnostic -Request $real -FixtureFacts $update -CoordinatorAuthorized } 'diagnostic:fixture-facts-in-real-request' }
+ Check 'result carries the unversioned name and integer version' { $r=Invoke-WindowsDiagnostic -Request (Request 'windows.update_context') -FixtureFacts $update;$r.schema -ceq 'patchcairn.diagnostics' -and $r.schema_version -is [int] -and ([long]$r.schema_version).Equals([long]1) }
+ # Cultures with another time separator (fi-FI) or calendar (th-TH) must not reach the helper's times. Get-WinEvent
+ # reads each window bound as local time whatever its Kind says, as Read-AsGetWinEvent does here; on a host at UTC only
+ # the Kind check can tell the two apart. The moment lies far from any daylight-saving change.
+ function Under-Culture([string]$Name,[scriptblock]$Test) {
+  $thread=[Threading.Thread]::CurrentThread;$previous=$thread.CurrentCulture
+  $thread.CurrentCulture=[Globalization.CultureInfo]::new($Name)
+  try { & $Test } finally { $thread.CurrentCulture=$previous }
+ }
+ function Read-AsGetWinEvent([datetime]$Bound) { return [DateTime]::Parse($Bound.ToString()).ToUniversalTime() }
+ $moment=[DateTime]::new(2026,6,15,5,6,7,[DateTimeKind]::Utc)
+ $stamp='2026-06-15T05:06:07Z'
+ foreach ($culture in @('fi-FI','th-TH')) {
+  Check ('culture '+$culture+' changes plain date text') { Under-Culture $culture { $moment.ToString('yyyy-MM-ddTHH:mm:ssZ') -cne $stamp } }
+  Check ('culture '+$culture+' leaves the result stamp in its fixed form') {
+   Under-Culture $culture {
+    $at=(Invoke-WindowsDiagnostic -Request (Request 'windows.update_context') -FixtureFacts $update).observed_utc
+    [Math]::Abs(([DateTime]::UtcNow-[DateTime]::ParseExact($at,"yyyy-MM-dd'T'HH:mm:ss.ffffff'Z'",[Globalization.CultureInfo]::InvariantCulture)).TotalMinutes) -lt 10
+   }
+  }
+  Check ('culture '+$culture+' leaves update and event stamps in their fixed form') {
+   Under-Culture $culture {
+    $row=ConvertTo-DiagnosticUpdateRow ([pscustomobject]@{HotFixID='KB1234567';InstalledOn=$moment})
+    $entry=ConvertTo-DiagnosticEventRow ([pscustomobject]@{Id=140;ProviderName='Microsoft-Windows-Ntfs';Level=3;TimeCreated=$moment})
+    $row.installed_utc -ceq $stamp -and $entry.observed_utc -ceq $stamp -and (Test-WindowsDiagnosticFacts 'windows.update_context' @{updates=@($row)}) -and (Test-WindowsDiagnosticFacts 'windows.system_event_metadata' @{events=@($entry)})
+   }
+  }
+  Check ('culture '+$culture+' leaves the event window in local time') {
+   Under-Culture $culture {
+    $filter=Get-DiagnosticEventFilter 'windows.system_event_metadata' $moment 6
+    $filter.StartTime.Kind -eq [DateTimeKind]::Local -and $filter.EndTime.Kind -eq [DateTimeKind]::Local -and (Read-AsGetWinEvent $filter.StartTime) -eq $moment.AddHours(-6) -and (Read-AsGetWinEvent $filter.EndTime) -eq $moment
+   }
+  }
+ }
+ # The script-policy holds: a module loaded from outside the shell's own folder, and an inherited policy override.
+ Check 'a module loaded from outside the shell folder is refused' {
+  $folder=[IO.Directory]::CreateDirectory((Join-Path $work 'fictional-module')).FullName
+  [IO.File]::WriteAllText((Join-Path $folder 'fictional-module.psm1'),"function Get-FictionalValue { 1 }`n",$utf8)
+  Assert-SystemModules
+  $module=Import-Module (Join-Path $folder 'fictional-module.psm1') -PassThru
+  try { Refused { Assert-SystemModules } 'diagnostic:foreign-module' } finally { Remove-Module $module }
+ }
  # Strict request refusals.
  foreach ($case in @(@('schema_version text','schema_version','1','record:schema-version'),@('schema_version decimal','schema_version',1.0,'record:schema-version'),
                      @('schema_version boolean','schema_version',$true,'record:schema-version'),@('schema_version 2','schema_version',2,'record:schema-version'),
@@ -89,9 +137,9 @@ try {
   Check ('request refused: '+$case[0]+' of the wrong type') { Refused { Invoke-WindowsDiagnostic -Request (Changed $case[0] $case[1]) -FixtureFacts @{} } 'diagnostic:invalid-request' }
  }
  # The documented start.
- $requestText=(Request 'windows.os_version' | ConvertTo-Json -Compress)
- $factsText='{"version":"10.0.99999","build":"99999","architecture":"x64"}'
- Check 'helper started with -File observes the fixture' { $run=Start-Helper $requestText $factsText;$result=ConvertFrom-StrictJson -Text $run.output.Trim();$run.code -eq 0 -and $result['status'] -ceq 'observed' -and $result['schema'] -ceq 'patchcairn.diagnostics' -and $result['facts']['build'] -ceq '99999' }
+ $requestText=(Request 'windows.update_context' | ConvertTo-Json -Compress)
+ $factsText='{"updates":[{"kb_id":"KB1234567","installed_utc":null}]}'
+ Check 'helper started with -File observes the fixture' { $run=Start-Helper $requestText $factsText;$result=ConvertFrom-StrictJson -Text $run.output.Trim();$run.code -eq 0 -and $result['status'] -ceq 'observed' -and $result['schema'] -ceq 'patchcairn.diagnostics' -and @($result['facts']['updates']).Count -eq 1 -and $result['facts']['updates'][0]['kb_id'] -ceq 'KB1234567' }
  # Modules named like the real ones, first on an inherited module path (a user's Documents folder, say), must not load.
  $planted=Join-Path $work 'planted-modules'
  foreach ($name in @('Microsoft.PowerShell.Management','Microsoft.PowerShell.Utility','Microsoft.PowerShell.Diagnostics','CimCmdlets')) {

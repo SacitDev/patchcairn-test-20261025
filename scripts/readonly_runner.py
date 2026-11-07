@@ -6,7 +6,7 @@ itself. Callers pass a recipe id and grammar-checked values, never a command lin
 allowlist: system tools listed in a POSIX system folder whose resolved file has root-owned ancestry, tools in the
 Windows system folder, Homebrew at its documented prefix owned by the current user, and the winget App Execution
 Alias (reparse tag 0x8000001B, pointing to App Installer) under the LocalAppData known folder. No shell is used and
-nothing that changes software runs here: changing commands are rendered for the coordinator. The stdout bytes
+nothing that changes software runs here: changing commands run only through the ticket-bound launcher. The stdout bytes
 returned are raw manager output for a package_routes or diagnostic parser, never text for a person.
 """
 from __future__ import annotations
@@ -32,9 +32,15 @@ from private_workspace import PrivateWorkspaceError, ensure_private_directory
 
 POSIX_TOOL_DIRS = frozenset({"/usr/bin", "/bin", "/usr/sbin", "/sbin"})
 APT_LISTS = "/var/lib/apt/lists"
-# Diagnostic recipes keep the limits and environment of today's diagnostic runner.
+# Diagnostic recipes keep the limits and environment of the earlier diagnostic runner.
 DIAGNOSTIC_ENV = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "LANG": "C", "TZ": "UTC"}
 DIAGNOSTIC_TIMEOUT_SECONDS, DIAGNOSTIC_MAX_BYTES = 5, 4096
+# The collectors' inventory queries list whole package databases. No inherited home, configuration, cache, pager,
+# proxy, loader or authentication setting reaches them; /dev/null cannot become a per-user folder.
+INVENTORY_ENV = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C", "LANG": "C", "TZ": "UTC", "HOME": "/dev/null",
+                 "XDG_CONFIG_HOME": "/dev/null", "XDG_CACHE_HOME": "/dev/null", "XDG_DATA_HOME": "/dev/null",
+                 "GIO_USE_VFS": "local", "PAGER": "cat", "DPKG_PAGER": "cat"}
+INVENTORY_TIMEOUT_SECONDS, INVENTORY_MAX_BYTES = 8, 2 * 1024 * 1024
 # A process that ignores the kill is left after this wait rather than turning a hold into an endless wait.
 KILL_WAIT_SECONDS = 5
 _LOCAL_APPDATA = "F1B32785-6FBA-4FCF-9D55-7B8E7F157091"  # FOLDERID_LocalAppData
@@ -50,9 +56,9 @@ def recipes():
 
 
 def _diagnostic_command(recipe_id):
-    """(executable candidates, fixed arguments) that diagnostic_core publishes for a recipe (its ARGV table, moved
-    there from diagnostic_posix by the DIAG leaf); a recipe without one holds."""
-    command = getattr(diagnostic_core, "ARGV", {}).get(recipe_id)
+    """(executable candidates, fixed arguments) that diagnostic_core.ARGV publishes for a recipe; a recipe without one
+    (held, in-process or run by the Windows helper) holds."""
+    command = diagnostic_core.ARGV.get(recipe_id)
     if (not isinstance(command, tuple) or len(command) != 2 or not command[0]
             or not all(isinstance(part, str) and part and "\x00" not in part for part in command[0] + command[1])):
         raise Refusal("runner-recipe-unavailable", "This diagnostic recipe has no fixed command yet; it holds")
@@ -252,9 +258,13 @@ def _system_tool(candidates, probe):
     raise Refusal("runner-executable", "No listed system tool owned by root was found; the recipe holds")
 
 
+ADMIN_GID = 80  # macOS's admin group
+
+
 def _brew(probe):
     """brew at the documented prefix for this machine: a file owned by this account and not writable by others, its link
-    owned by this account or root, and every folder from / to both owned by this account or root, not writable by others."""
+    owned by this account or root, and every folder from / to both owned by this account or root, not writable by others;
+    a folder's group may write only when that group is macOS's admin group (not staff, which every local account is in)."""
     machine = probe.machine() if probe.platform == "darwin" else None
     path, root = BREW_PATHS.get(machine), BREW_REAL_ROOTS.get(machine)
     try:
@@ -265,7 +275,8 @@ def _brew(probe):
         path = None
     if (path is None or euid == 0 or not PurePosixPath(real).is_relative_to(root) or not stat.S_ISREG(info.st_mode)
             or info.st_uid != euid or info.st_mode & 0o022 or link.st_uid not in (euid, 0)
-            or any(not stat.S_ISDIR(f.st_mode) or f.st_uid not in (euid, 0) or f.st_mode & 0o002 for f in folders)):
+            or any(not stat.S_ISDIR(f.st_mode) or f.st_uid not in (euid, 0) or f.st_mode & 0o002
+                   or (f.st_mode & 0o020 and f.st_gid != ADMIN_GID) for f in folders)):
         raise Refusal("runner-executable", "PatchCairn runs under Rosetta; start it with a native arm64 Python" if "rosetta" in str(machine)
                       else "Homebrew is not at its documented prefix, owned by this account and protected from others "
                            "(Homebrew on Linux and other prefixes hold)")
@@ -340,12 +351,14 @@ def _prepare(recipe_id, values, probe, run_folder):
         if values:
             raise Refusal("runner-recipe-values", "Diagnostic recipes take no values")
         candidates, arguments = _diagnostic_command(recipe_id)
-        executable, env, folder = _system_tool(candidates, probe), dict(DIAGNOSTIC_ENV), "/"
+        inventory = recipe_id in diagnostic_core.INVENTORY_RECIPES
+        executable, env, folder = _system_tool(candidates, probe), dict(INVENTORY_ENV if inventory else DIAGNOSTIC_ENV), "/"
         if probe.platform == "win32":
             folder = probe.system_directory()
             windows = ntpath.dirname(folder.rstrip(ntpath.sep))
             env = {"SystemRoot": windows, "windir": windows, "PATH": f"{folder};{windows}"}
-        return (executable,) + tuple(arguments), env, DIAGNOSTIC_TIMEOUT_SECONDS, DIAGNOSTIC_MAX_BYTES, frozenset({0}), folder
+        timeout, limit = (INVENTORY_TIMEOUT_SECONDS, INVENTORY_MAX_BYTES) if inventory else (DIAGNOSTIC_TIMEOUT_SECONDS, DIAGNOSTIC_MAX_BYTES)
+        return (executable,) + tuple(arguments), env, timeout, limit, frozenset({0}), folder
     found = package_routes.READ_RECIPES[recipe_id]
     package_routes.refuse_elevated(probe.elevation())
     if any(isinstance(element, Slot) and element.name in RUN_FILES for element in found.template):

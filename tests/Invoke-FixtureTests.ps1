@@ -68,9 +68,9 @@ try {
  Strict 'depth limit refused' ($typed+'1,"x":'+('['*64)+(']'*64)+'}') 'record:json-too-deep'
  Check 'strict schema: depth limit accepts 64 levels' { $record=Assert-PatchCairnRecord -Record (ConvertFrom-StrictJson -Text ($typed+'1,"x":'+('['*63)+(']'*63)+'}')) -Schema 'patchcairn.diagnostics';$null -ne $record }
  Check 'strict schema: diagnostic request file read end to end' {
-  $text='{"schema":"patchcairn.diagnostics","schema_version":1,"kind":"request","request_id":"diag-'+('b'*32)+'","platform":"windows","recipe_id":"windows.os_version","mode":"fixture","symptom":"Fictional","scope":[],"observed_utc":"2026-01-01T00:00:00Z"}'
+  $text='{"schema":"patchcairn.diagnostics","schema_version":1,"kind":"request","request_id":"diag-'+('b'*32)+'","platform":"windows","recipe_id":"windows.update_context","mode":"fixture","symptom":"Fictional","scope":[],"observed_utc":"2026-01-01T00:00:00Z"}'
   $request=Assert-PatchCairnRecord -Record (Read-StrictJsonFile -Path (File $utf8.GetBytes($text))) -Schema 'patchcairn.diagnostics'
-  $result=Invoke-WindowsDiagnostic -Request $request -FixtureFacts @{version='10.0.1';build='1';architecture='x64'}
+  $result=Invoke-WindowsDiagnostic -Request $request -FixtureFacts @{updates=@(@{kb_id='KB1234567';installed_utc=$null})}
   $result.status -ceq 'observed' -and $request['schema_version'] -is [long]
  }
 } finally {

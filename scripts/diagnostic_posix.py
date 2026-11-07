@@ -1,96 +1,23 @@
-"""Fixed, bounded macOS/Linux diagnostic metadata recipes (Python 3.12+).
+"""Fixed, bounded macOS/Linux diagnostic metadata recipes (Python 3.12+), run through readonly_runner.
 
 No journal, Console, keychain, browser/profile, environment, process argument,
 private project or credential-store reader is provided. No repair is executed.
 """
 from __future__ import annotations
 
-import os
 import re
-import selectors
-import stat
-import subprocess
 import sys
-import time
-from pathlib import Path
 
 import pc_records
-from diagnostic_core import DiagnosticRefusal, validate_request, validate_adapter_result
+import readonly_runner
+from diagnostic_core import ARGV, HELD, RECIPES, TABLE, DiagnosticRefusal, validate_request, validate_adapter_result
 
-MAX_OUTPUT = 4096
-TIMEOUT = 5
-PROVENANCE = {
-    "macos.os_version": ["https://developer.apple.com/documentation/technologyoverviews/building-your-macos-game-remotely-from-your-pc"],
-    "macos.root_capacity": ["https://raw.githubusercontent.com/apple-oss-distributions/file_cmds/main/df/df.1"],
-    "linux.kernel_version": ["https://www.gnu.org/software/coreutils/manual/html_node/uname-invocation.html"],
-    "linux.root_capacity": ["https://www.gnu.org/software/coreutils/manual/html_node/df-invocation.html"],
-}
-ARGV = {
-    "macos.os_version": (("/usr/bin/sw_vers",), ("-productVersion",)),
-    "macos.root_capacity": (("/bin/df",), ("-k", "-I", "/")),
-    "linux.kernel_version": (("/usr/bin/uname", "/bin/uname"), ("-r",)),
-    "linux.root_capacity": (("/usr/bin/df", "/bin/df"), ("-Pk", "/")),
-}
-
-
-def _trusted_executable(candidates):
-    """Resolve only fixed OS-tool candidates; reject writable/non-root tools."""
-    for candidate in candidates:
-        try:
-            path = Path(candidate).resolve(strict=True)
-            info = path.stat()
-            if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022 or not info.st_mode & 0o111:
-                continue
-            for ancestor in path.parents:
-                parent = ancestor.stat()
-                if not stat.S_ISDIR(parent.st_mode) or parent.st_uid != 0 or parent.st_mode & 0o022:
-                    raise DiagnosticRefusal("Untrusted system-tool ancestry")
-            return str(path)
-        except (OSError, DiagnosticRefusal):
-            continue
-    raise DiagnosticRefusal("Supported protected system tool unavailable")
-
-
-def _run_bounded(argv, *, timeout=TIMEOUT, max_bytes=MAX_OUTPUT):
-    """Read at most cap+1 bytes in memory and discard stderr without persisting it."""
-    process = subprocess.Popen(argv, shell=False, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                               stderr=subprocess.DEVNULL, cwd="/", close_fds=True,
-                               env={"PATH": "/usr/bin:/bin", "LC_ALL": "C", "LANG": "C", "TZ": "UTC"})
-    output = bytearray()
-    deadline = time.monotonic() + timeout
-    try:
-        with selectors.DefaultSelector() as selector:
-            selector.register(process.stdout, selectors.EVENT_READ)
-            while selector.get_map():
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise DiagnosticRefusal("Diagnostic recipe timed out")
-                ready = selector.select(remaining)
-                if not ready:
-                    raise DiagnosticRefusal("Diagnostic recipe timed out")
-                chunk = os.read(process.stdout.fileno(), min(1024, max_bytes + 1 - len(output)))
-                if not chunk:
-                    selector.unregister(process.stdout)
-                else:
-                    output.extend(chunk)
-                    if len(output) > max_bytes:
-                        raise DiagnosticRefusal("Diagnostic output cap exceeded")
-        status = process.wait(timeout=max(0.01, deadline - time.monotonic()))
-        if status != 0:
-            raise DiagnosticRefusal("Diagnostic recipe returned a failure status")
-        return bytes(output)
-    finally:
-        try:
-            if process.poll() is None:
-                process.kill()
-            # A process stuck inside a kernel operation may not exit promptly.
-            # Do not turn a diagnostic timeout into an unbounded helper wait.
-            process.wait(timeout=1)
-        finally:
-            process.stdout.close()
+MAX_OUTPUT = readonly_runner.DIAGNOSTIC_MAX_BYTES
+TIMEOUT = readonly_runner.DIAGNOSTIC_TIMEOUT_SECONDS
 
 
 def _parse(recipe_id, raw):
+    """The typed facts of a recipe's stdout. uname, df and sw_vers print ASCII; any other byte is refused."""
     if not isinstance(raw, bytes) or len(raw) > MAX_OUTPUT:
         raise DiagnosticRefusal("Bounded byte output required")
     try:
@@ -109,58 +36,75 @@ def _parse(recipe_id, raw):
     if len(lines) != 2:
         raise DiagnosticRefusal("Unexpected capacity output shape")
     columns = lines[1].split()
-    if len(columns) != 6 or columns[5] != "/" or not all(re.fullmatch(r"[0-9]{1,20}", s) for s in columns[1:4]) or not re.fullmatch(r"[0-9]{1,3}%", columns[4]):
+    if len(columns) != 6 or columns[5] != ARGV[recipe_id][1][-1] or not all(re.fullmatch(r"[0-9]{1,20}", s) for s in columns[1:4]) or not re.fullmatch(r"[0-9]{1,3}%", columns[4]):
         raise DiagnosticRefusal("Unexpected numeric capacity metadata")
     # Filesystem source and mount labels are deliberately discarded.
     return {"total_bytes": int(columns[1]) * 1024, "used_bytes": int(columns[2]) * 1024,
             "available_bytes": int(columns[3]) * 1024, "used_percent": int(columns[4][:-1])}
 
 
-def collect_recipe(request, *, runner=None, coordinator_authorized=False):
+def collect_recipe(request, *, runner=None, coordinator_authorized=False, probe=None):
     """Run one enumerated recipe or return an explicit capability hold.
 
     Fixture mode REQUIRES an injected runner and never invokes the host. Real
     mode forbids a runner, requires matching POSIX/native platform and explicit
-    trusted-coordinator call authority. A JSON boolean is not user consent.
+    trusted-coordinator call authority, and runs the recipe through readonly_runner
+    (``probe`` answers its host lookups; tests pass a fake). A JSON boolean is not
+    user consent. A held recipe holds in both modes and nothing runs.
     """
     request = validate_request(request)
     recipe_id = request["recipe_id"]
-    if recipe_id not in ARGV:
+    if RECIPES[recipe_id] not in ("macos", "linux"):
         raise DiagnosticRefusal("POSIX adapter cannot handle this recipe")
-    expected_scope = ["root_capacity"] if recipe_id.endswith("root_capacity") else ["os_metadata"]
-    if request["scope"] != expected_scope:
-        raise DiagnosticRefusal("Recipe requires its exact selected metadata scope")
     result = {key: request[key] for key in ("schema", "schema_version", "request_id", "platform", "recipe_id", "mode")}
     result.update(kind="adapter_result", status="held", observed_utc=pc_records.utc_now(), facts={},
                   limitations=["Metadata observation cannot establish the original cause or verify application behavior."],
-                  provenance=PROVENANCE[recipe_id])
+                  provenance=list(TABLE[recipe_id].sources))
+    if recipe_id in HELD:
+        result["limitations"].append(HELD[recipe_id])
+        return validate_adapter_result(request, result)
+    expected_scope = ["root_capacity"] if recipe_id.endswith("root_capacity") else ["os_metadata"]
+    if request["scope"] != expected_scope:
+        raise DiagnosticRefusal("Recipe requires its exact selected metadata scope")
+    candidates, arguments = ARGV[recipe_id]
+    # Never retain exception text, stderr or malformed stdout: they may hold
+    # private paths or secrets even when a selected command failed.
     if request["mode"] == "fixture":
         if runner is None:
             result["limitations"].append("Fixture requires an explicit fictional runner; no host query occurred.")
             return validate_adapter_result(request, result)
-        executable = ARGV[recipe_id][0][0]
         result["limitations"].append("Fictional injected recipe output; native behavior remains unverified.")
+        try:
+            raw = runner((candidates[0], *arguments), timeout=TIMEOUT, max_bytes=MAX_OUTPUT)
+        except (OSError, ValueError, TypeError):
+            return _failed(request, result)
     else:
         if runner is not None:
             raise DiagnosticRefusal("Injected output cannot become a real observation")
-        native = "macos" if sys.platform == "darwin" else "linux" if sys.platform.startswith("linux") else "unsupported"
-        if coordinator_authorized is not True or os.name != "posix" or native != request["platform"] or sys.version_info < (3, 12):
+        probe = probe or readonly_runner.HostProbe()
+        native = "macos" if probe.platform == "darwin" else "linux" if probe.platform.startswith("linux") else "unsupported"
+        if coordinator_authorized is not True or native != request["platform"] or sys.version_info < (3, 12):
             result["limitations"].append("Native platform, supported Python and current coordinator collection authority are required; no query occurred.")
             return validate_adapter_result(request, result)
         try:
-            executable = _trusted_executable(ARGV[recipe_id][0])
-        except DiagnosticRefusal:
+            found = readonly_runner.run_recipe(recipe_id, probe=probe)
+        except pc_records.Refusal as error:
+            if error.code != "runner-executable":
+                return _failed(request, result)
             result["limitations"].append("A protected supported OS tool was unavailable; no query occurred.")
             return validate_adapter_result(request, result)
-        runner = _run_bounded
-    argv = (executable, *ARGV[recipe_id][1])
+        if not found["ok"]:
+            return _failed(request, result)
+        raw = found["stdout"]
     try:
-        facts = _parse(recipe_id, runner(argv, timeout=TIMEOUT, max_bytes=MAX_OUTPUT))
-        result.update(status="observed", facts=facts, observed_utc=pc_records.utc_now())
+        result.update(status="observed", facts=_parse(recipe_id, raw), observed_utc=pc_records.utc_now())
         return validate_adapter_result(request, result)
-    except (DiagnosticRefusal, OSError, subprocess.SubprocessError, ValueError, TypeError):
-        # Never retain exception text, stderr or malformed stdout: they may hold
-        # private paths or secrets even when a selected command failed.
-        result.update(status="failed", facts={}, observed_utc=pc_records.utc_now())
-        result["limitations"].append("Selected metadata was unavailable, malformed, oversized or timed out; no cause is established.")
-        return validate_adapter_result(request, result)
+    except (OSError, ValueError, TypeError):
+        return _failed(request, result)
+
+
+def _failed(request, result):
+    """``result`` as a categorical failure: no facts, no exception text and no output kept."""
+    result.update(status="failed", facts={}, observed_utc=pc_records.utc_now())
+    result["limitations"].append("Selected metadata was unavailable, malformed, oversized or timed out; no cause is established.")
+    return validate_adapter_result(request, result)

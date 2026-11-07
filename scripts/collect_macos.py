@@ -3,7 +3,9 @@
 A read-only inventory provider: collect() returns validated facts, which the coordinator
 registers as inventory evidence in an engine session whose owner authorized this collection.
 Create the engine session first; it admits private storage before any collection.
-The real entry point is Darwin-only. Tests must explicitly opt into fixtures and
+The real entry point is Darwin-only, and each real query is a recipe of readonly_runner
+(fixed root-owned tool, fixed arguments and environment, a timeout and an output bound);
+this module starts no process itself. Tests must explicitly opt into fixtures and
 provide their own command runner, application roots, and Homebrew candidates;
 fixture results report collection_mode "fixture".
 Never pass imported report values as collector options or executable commands.
@@ -19,14 +21,14 @@ import plistlib
 import re
 import stat
 import struct
-import subprocess
-import threading
 import unicodedata
 from dataclasses import dataclass
 from typing import Callable, Iterable, Sequence
 from xml.parsers.expat import ExpatError
 
+import diagnostic_core
 import pc_records
+import readonly_runner
 
 
 MAX_COMMAND_BYTES = 256 * 1024
@@ -35,16 +37,10 @@ MAX_HEADER_BYTES = 4096
 MAX_ENTRIES_PER_ROOT = 1000
 MAX_ROOTS = 6
 MAX_TEXT = 256
-ALLOWED_COMMANDS = frozenset(
-    {
-        ("/usr/bin/sw_vers",),
-        ("/usr/bin/uname", "-m"),
-        ("/usr/sbin/sysctl", "-n", "hw.optional.arm64"),
-        ("/usr/sbin/sysctl", "-in", "sysctl.proc_translated"),
-        ("/usr/bin/xcode-select", "--print-path"),
-        ("/usr/sbin/pkgutil", "--pkgs"),
-    }
-)
+# The fixed queries, as the command tuples a fixture runner receives, each with its readonly_runner recipe id.
+RECIPE_IDS = {(diagnostic_core.ARGV[recipe_id][0][0], *diagnostic_core.ARGV[recipe_id][1]): recipe_id for recipe_id in (
+    "macos.sw_vers", "macos.machine", "macos.arm64_capable", "macos.translated", "macos.developer_dir", "macos.receipts")}
+ALLOWED_COMMANDS = frozenset(RECIPE_IDS)
 CPU_NAMES = {7: "i386", 0x01000007: "x86_64", 12: "arm", 0x0100000C: "arm64", 18: "ppc"}
 
 
@@ -239,51 +235,22 @@ def inspect_app(app: Path, root_label: str) -> dict[str, object] | None:
 
 
 def _default_runner(command: Sequence[str], timeout: float) -> CommandResult:
+    """Run one fixed query as its readonly_runner recipe. ``timeout`` bounds a fixture runner only: a real query keeps
+    readonly_runner's fixed limits. sw_vers, uname, sysctl, xcode-select and pkgutil print UTF-8 (an unreadable byte becomes
+    U+FFFD, and the parsers keep only values that match their fixed patterns); a refusal or failure status keeps only a
+    categorical error, never the tool's text."""
     if platform.system() != "Darwin":
         raise UnsupportedPlatform("Native macOS commands are unavailable on this platform")
     if tuple(command) not in ALLOWED_COMMANDS:
         raise ValueError("Command is not in the fixed macOS metadata allowlist")
-    # No inherited credential environment, shell, PATH resolution, or stderr dump.
-    environment = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "C", "LC_ALL": "C", "TZ": "UTC"}
     try:
-        process = subprocess.Popen(list(command), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=environment, shell=False)
-    except OSError:
-        return CommandResult(None, error="unavailable")
-    output: list[bytes] = []
-    exceeded = threading.Event()
-
-    def read_bounded() -> None:
-        try:
-            assert process.stdout is not None
-            data = process.stdout.read(MAX_COMMAND_BYTES + 1)
-            output.append(data)
-            if len(data) > MAX_COMMAND_BYTES:
-                exceeded.set()
-                process.kill()
-        except (OSError, ValueError):
-            output.append(b"")
-
-    reader = threading.Thread(target=read_bounded, daemon=True)
-    reader.start()
-    error = None
-    try:
-        process.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        error = "timeout"
-        process.kill()
-        process.wait(timeout=2)
-    finally:
-        reader.join(timeout=2)
-        if process.stdout is not None:
-            process.stdout.close()
-    if exceeded.is_set():
-        return CommandResult(process.returncode, error="output limit exceeded")
-    if error or reader.is_alive():
-        return CommandResult(process.returncode, error=error or "output incomplete")
-    if process.returncode:
-        return CommandResult(process.returncode, error="nonzero exit")
-    raw = output[0] if output else b""
-    return CommandResult(process.returncode, raw.decode("utf-8", errors="replace"))
+        found = readonly_runner.run_recipe(RECIPE_IDS[tuple(command)])
+    except pc_records.Refusal as error:
+        return CommandResult(None, error={"runner-timeout": "timeout", "runner-output-too-large": "output limit exceeded"}.get(
+            error.code, "unavailable"))
+    if not found["ok"]:
+        return CommandResult(found["exit_code"], error="nonzero exit")
+    return CommandResult(0, found["stdout"].decode("utf-8", errors="replace"))
 
 
 def collect(*, runner: CommandRunner | None = None, fixture: bool = False,
@@ -295,6 +262,8 @@ def collect(*, runner: CommandRunner | None = None, fixture: bool = False,
 
     Fixture mode requires an injected runner and explicit fixture-only filesystem
     roots, ensuring Windows/Linux tests never query native application paths.
+    ``timeout`` is passed to an injected runner; real queries keep readonly_runner's
+    fixed time limit and output bound.
     """
     if fixture:
         if runner is None or application_roots is None or homebrew_candidates is None:

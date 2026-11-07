@@ -1,11 +1,12 @@
-"""Read-only runner (G09, RR2-7): a closed recipe table, listed executables only, fixed environment and bounds.
+"""Read-only runner: a closed recipe table, listed executables only, fixed environment and bounds.
 
 Recipes run through a fake launcher and a fake probe; no test starts a package manager. The bounded launcher itself is
-exercised with the Python interpreter running this suite. Fictional paths are not user-profile paths (D-026).
+exercised with the Python interpreter running this suite. Fictional paths are not user-profile paths.
 Run from the repository root: python3 -I -S -B -m unittest discover -s tests -p "test_readonly_runner.py"
 """
 from __future__ import annotations
 
+import ast
 import inspect
 import ntpath
 import os
@@ -140,10 +141,10 @@ class ReadonlyRunnerTests(unittest.TestCase):
                        {"package": "examplecurl", "extra": "1"}, {"package": ["examplecurl"]}):
             with self.assertRaises(Refusal):
                 readonly_runner.run_recipe("apt.policy", values, launcher=launcher, probe=FakeProbe())
-        with mock.patch.object(diagnostic_core, "ARGV", {}, create=True):
+        with mock.patch.object(diagnostic_core, "ARGV", {}):
             with self.assertRaises(Refusal):
                 readonly_runner.run_recipe("linux.kernel_version", launcher=launcher, probe=FakeProbe())
-        with mock.patch.object(diagnostic_core, "ARGV", UNAME, create=True):
+        with mock.patch.object(diagnostic_core, "ARGV", UNAME):
             with self.assertRaises(Refusal):
                 readonly_runner.run_recipe("linux.kernel_version", {"flag": "-a"}, launcher=launcher, probe=FakeProbe())
         self.assertEqual(launcher.calls, [])
@@ -152,7 +153,7 @@ class ReadonlyRunnerTests(unittest.TestCase):
 
     def test_runner_refuses_unlisted_executable(self):
         launcher = FakeLauncher(b"6.8.0-45-generic\n")
-        with mock.patch.object(diagnostic_core, "ARGV", UNAME, create=True):
+        with mock.patch.object(diagnostic_core, "ARGV", UNAME):
             readonly_runner.run_recipe("linux.kernel_version", launcher=launcher, probe=FakeProbe())
             self.assertEqual(launcher.calls[0].argv, ("/usr/bin/uname", "-r"))
             coreutils = "/usr/lib/cargo/bin/coreutils"
@@ -172,11 +173,11 @@ class ReadonlyRunnerTests(unittest.TestCase):
         for command in ((("/opt/tools/uname",), ("-r",)), (("uname",), ("-r",)), (("/usr/local/bin/uname",), ("-r",)),
                         (("/usr/bin/../../opt/uname",), ("-r",)), (("/usr/bin/uname",), ("-r\x00",)), ((), ("-r",)), "uname -r",
                         (("/usr/bin/uname",), ("-r",), ("-a",))):
-            with mock.patch.object(diagnostic_core, "ARGV", {"linux.kernel_version": command}, create=True):
+            with mock.patch.object(diagnostic_core, "ARGV", {"linux.kernel_version": command}):
                 with self.assertRaises(Refusal):
                     readonly_runner.run_recipe("linux.kernel_version", launcher=launcher, probe=FakeProbe(files=OUTSIDE))
         whoami = {"linux.kernel_version": (("whoami.exe",), ("/user",))}
-        with mock.patch.object(diagnostic_core, "ARGV", whoami, create=True):
+        with mock.patch.object(diagnostic_core, "ARGV", whoami):
             readonly_runner.run_recipe("linux.kernel_version", launcher=launcher, probe=FakeProbe(platform="win32"))
             self.assertEqual(launcher.calls[2].argv, (ntpath.join(SYSTEM_DIR, "whoami.exe"), "/user"))
             self.assertEqual((launcher.calls[2].env, launcher.calls[2].cwd),
@@ -186,7 +187,7 @@ class ReadonlyRunnerTests(unittest.TestCase):
                 with self.assertRaises(Refusal):
                     readonly_runner.run_recipe("linux.kernel_version", launcher=launcher, probe=probe)
         for name in ("..\\whoami.exe", "C:\\Tools\\whoami.exe", "whoami", "missing.exe"):
-            with mock.patch.object(diagnostic_core, "ARGV", {"linux.kernel_version": ((name,), ())}, create=True):
+            with mock.patch.object(diagnostic_core, "ARGV", {"linux.kernel_version": ((name,), ())}):
                 with self.assertRaises(Refusal):
                     readonly_runner.run_recipe("linux.kernel_version", launcher=launcher, probe=FakeProbe(platform="win32"))
         alias = routes.winget_alias_path(LOCAL_APPDATA)
@@ -204,15 +205,56 @@ class ReadonlyRunnerTests(unittest.TestCase):
 
     def test_diagnostic_recipe_runs_with_fixed_command_environment_and_bounds(self):
         launcher = FakeLauncher(b"6.8.0-45-generic\n")
-        with mock.patch.object(diagnostic_core, "ARGV", {"linux.kernel_version": (("/bin/uname",), ("-r",))}, create=True):
+        with mock.patch.object(diagnostic_core, "ARGV", {"linux.kernel_version": (("/bin/uname",), ("-r",))}):
             result = readonly_runner.run_recipe("linux.kernel_version", launcher=launcher, probe=FakeProbe())
         call = launcher.calls[0]
         self.assertEqual((call.argv, call.env, call.cwd, call.timeout, call.max_bytes),
                          (("/bin/uname", "-r"), readonly_runner.DIAGNOSTIC_ENV, "/", 5, 4096))
         self.assertEqual(result, {"recipe": "linux.kernel_version", "exit_code": 0, "ok": True, "stdout": b"6.8.0-45-generic\n"})
-        with mock.patch.object(diagnostic_core, "ARGV", UNAME, create=True):
+        with mock.patch.object(diagnostic_core, "ARGV", UNAME):
             with self.assertRaises(Refusal):
                 readonly_runner.run_recipe("linux.kernel_version", launcher=FakeLauncher(b"x" * 4097), probe=FakeProbe())
+
+    def test_inventory_recipes_keep_the_collectors_environment_and_bounds(self):
+        launcher = FakeLauncher(b"example\t1.0\tamd64\tii \texample\n")
+        probe = FakeProbe(files={"/usr/bin/dpkg-query": regular(), "/usr/sbin/pkgutil": regular()})
+        readonly_runner.run_recipe("linux.dpkg_installed", launcher=launcher, probe=probe)
+        readonly_runner.run_recipe("macos.receipts", launcher=launcher, probe=probe)
+        for call, argv in zip(launcher.calls, (("/usr/bin/dpkg-query",) + diagnostic_core.ARGV["linux.dpkg_installed"][1], ("/usr/sbin/pkgutil", "--pkgs"))):
+            self.assertEqual((call.argv, call.env, call.cwd, call.timeout, call.max_bytes),
+                             (argv, readonly_runner.INVENTORY_ENV, "/", 8, 2 * 1024 * 1024))
+        self.assertEqual({key: readonly_runner.INVENTORY_ENV[key] for key in ("HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME")},
+                         dict.fromkeys(("HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME"), "/dev/null"))
+        with self.assertRaises(Refusal):
+            readonly_runner.run_recipe("linux.dpkg_installed", {"package": "example"}, launcher=launcher, probe=probe)
+        self.assertEqual(len(launcher.calls), 2)
+
+    def test_every_diagnostic_command_is_a_listed_system_tool_and_the_rest_hold(self):
+        for recipe_id, (candidates, arguments) in diagnostic_core.ARGV.items():
+            with self.subTest(recipe=recipe_id):
+                self.assertTrue(candidates)
+                for candidate in candidates:
+                    self.assertTrue(PurePosixPath(candidate).is_absolute() and str(PurePosixPath(candidate).parent) in readonly_runner.POSIX_TOOL_DIRS)
+                self.assertTrue(all(isinstance(part, str) and part for part in arguments))
+        launcher = FakeLauncher()
+        for recipe_id in set(diagnostic_core.RECIPES) - set(diagnostic_core.ARGV):
+            with self.subTest(held=recipe_id), self.assertRaises(Refusal) as caught:
+                readonly_runner.run_recipe(recipe_id, launcher=launcher, probe=FakeProbe(platform="win32" if recipe_id.startswith("windows.") else "linux"))
+            self.assertEqual(caught.exception.code, "runner-recipe-unavailable")
+        self.assertEqual(launcher.calls, [])
+
+    def test_collectors_and_posix_recipes_start_no_process_themselves(self):
+        process_modules = {"subprocess", "asyncio", "multiprocessing", "pty", "selectors"}
+        for name in ("diagnostic_posix", "collect_linux", "collect_macos"):
+            tree = ast.parse((ROOT / "scripts" / (name + ".py")).read_text(encoding="utf-8"))
+            with self.subTest(module=name):
+                imported = {alias.name.split(".")[0] for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names}
+                imported |= {(node.module or "").split(".")[0] for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)}
+                self.assertFalse(imported & process_modules)
+                self.assertIn("readonly_runner", imported)
+                calls = [node.func.attr for node in ast.walk(tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                         and isinstance(node.func.value, ast.Name) and node.func.value.id == "os"]
+                self.assertFalse([call for call in calls if call in {"system", "popen", "startfile"} or call.startswith(("spawn", "exec", "posix_spawn"))])
 
     def test_result_is_normalised_and_bounded(self):
         failed = readonly_runner.run_recipe("apt.config", launcher=FakeLauncher(code=-1), probe=FakeProbe())
@@ -428,7 +470,7 @@ class ReadonlyRunnerTests(unittest.TestCase):
             self.assertIsNone(probe.appexec_link(str(plain)))
             self.assertIsNone(probe.appexec_link(str(Path(folder_path, "missing.exe"))))
         self.assertTrue(ntpath.isabs(probe.program_files()), "ProgramFiles known folder")
-        with mock.patch.object(diagnostic_core, "ARGV", {"linux.kernel_version": (("whoami.exe",), ())}, create=True):
+        with mock.patch.object(diagnostic_core, "ARGV", {"linux.kernel_version": (("whoami.exe",), ())}):
             launcher = FakeLauncher()
             readonly_runner.run_recipe("linux.kernel_version", launcher=launcher, probe=probe)
         self.assertEqual(launcher.calls[0].argv, (ntpath.join(system, "whoami.exe"),))
@@ -441,7 +483,7 @@ class ReadonlyRunnerTests(unittest.TestCase):
         self.assertTrue(PurePosixPath(home).is_absolute() and user)
         self.assertEqual(probe.euid(), os.geteuid())
         self.assertTrue(probe.machine())
-        with mock.patch.object(diagnostic_core, "ARGV", UNAME, create=True):
+        with mock.patch.object(diagnostic_core, "ARGV", UNAME):
             launcher = FakeLauncher()
             readonly_runner.run_recipe("linux.kernel_version", launcher=launcher, probe=probe)
         self.assertIn(launcher.calls[0].argv, (("/usr/bin/uname", "-r"), ("/bin/uname", "-r")))

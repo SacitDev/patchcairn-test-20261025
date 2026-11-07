@@ -1,4 +1,8 @@
-"""Fictional macOS metadata tests; never query the development computer."""
+"""Fictional macOS metadata tests; never query the development computer.
+
+Real queries go through readonly_runner, replaced here by fakes. Fixture folders live under work/test-fixtures/ and
+are removed.
+"""
 
 from __future__ import annotations
 
@@ -6,40 +10,21 @@ import json
 import os
 from pathlib import Path
 import plistlib
-import shutil
 import struct
 import sys
 import tempfile
 import unittest
 from unittest.mock import patch
-import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import collect_macos as mac
 import pc_records
+import readonly_runner
+from pc_records import Refusal
+from test_linux_collector import assert_inventory_needs_the_scope_decision, inventory_session
 
 
 WORK = Path(__file__).resolve().parents[1] / "work" / "test-fixtures" / "macos"
-
-
-def inventory_session(test, platform):
-    """A fresh engine session in its own fixture folder (removed after the test) whose whole-device,
-    metadata-only scope the fictional owner authorizes before evidence is registered."""
-    # The engine core does not check the host platform (the CLI and the service refuse a non-native
-    # real session), so this real session simulates a native host of the given platform.
-    import workflow_core
-    root = WORK / ("fictional-engine-" + uuid.uuid4().hex)
-    root.mkdir(parents=True)
-    test.addCleanup(shutil.rmtree, root)
-    engine = workflow_core.WorkflowEngine(root)
-    access = {"schema": "patchcairn.assessment.access", "schema_version": 1, "target": "whole_device",
-              "operations": ["metadata"], "local_content": [], "llm_content": [], "sensitive_exceptions": []}
-    scope = {"roots": [], "purpose": "Fictional installed-software inventory", "assessment": access}
-    session_id = engine.create_session(mode="real", platform=platform, scope=scope)["session_id"]
-    engine.authorize_scope(session_id, owner_quote="Read only installed-software metadata on this fictional device.",
-                           owner_message_id="fictional-owner-scope")
-    test.assertEqual(engine.read_session(session_id)["scope_authorization"]["scope_sha256"], pc_records.digest(scope))
-    return engine, scope, session_id
 
 
 def fake_runner(responses=None):
@@ -125,19 +110,68 @@ class MacCollectorTests(unittest.TestCase):
         saved = pc_records.decode_strict((engine.work / session_id / row["path"]).read_bytes())
         self.assertEqual(saved, facts)
         self.assertEqual((saved["observations"][0]["version"], saved["observations"][0]["build"]), ("15.5.2", "24F123"))
-        # The engine refuses kind 'fixture' evidence in a real session; it does not read collection_mode.
+        # A fixture result never enters a real session: the engine refuses it as kind "fixture", and as inventory it
+        # reads the result's collection_mode and refuses it (inventory-fixture-result).
         import workflow_core
         fixture = self.collect_fixture()
         self.assertEqual(fixture["collection_mode"], "fixture")
         with self.assertRaisesRegex(workflow_core.WorkflowRefusal, "cannot be promoted into a real session"):
             engine.register_evidence(session_id, evidence_id="fictional-macos-fixture", content=pc_records.encoded(fixture),
                                      kind="fixture", scope=scope, observed_utc=fixture["observed_utc"])
+        with self.assertRaises(workflow_core.WorkflowRefusal) as caught:
+            engine.register_evidence(session_id, evidence_id="fictional-macos-fixture-inventory", content=pc_records.encoded(fixture),
+                                     kind="inventory", scope=scope, observed_utc=fixture["observed_utc"])
+        self.assertEqual(caught.exception.code, "inventory-fixture-result")
         self.assertEqual(set(engine.read_session(session_id)["evidence"]), {"fictional-macos-inventory"})
+        # Negative control: the real result is refused while the owner has not authorized the scope.
+        assert_inventory_needs_the_scope_decision(self, "macos", content)
 
     def test_wrong_platform_stops_before_commands_or_files(self):
-        with patch.object(mac.platform, "system", return_value="Windows"), patch.object(mac.os, "scandir", side_effect=AssertionError("Must not inspect")), patch.object(mac.subprocess, "Popen", side_effect=AssertionError("Must not execute")):
+        with patch.object(mac.platform, "system", return_value="Windows"), patch.object(mac.os, "scandir", side_effect=AssertionError("Must not inspect")), patch.object(mac.readonly_runner, "run_recipe", side_effect=AssertionError("Must not execute")):
             with self.assertRaises(mac.UnsupportedPlatform):
                 mac.collect()
+            with self.assertRaises(mac.UnsupportedPlatform):
+                mac._default_runner(("/usr/sbin/pkgutil", "--pkgs"), 5.0)
+
+    def test_default_runner_runs_each_fixed_query_as_its_read_only_recipe(self):
+        self.assertEqual(mac.ALLOWED_COMMANDS, {("/usr/bin/sw_vers",), ("/usr/bin/uname", "-m"), ("/usr/sbin/sysctl", "-n", "hw.optional.arm64"),
+                                                ("/usr/sbin/sysctl", "-in", "sysctl.proc_translated"), ("/usr/bin/xcode-select", "--print-path"),
+                                                ("/usr/sbin/pkgutil", "--pkgs")})
+        answers = {"macos.receipts": {"ok": True, "exit_code": 0, "stdout": b"org.example.alpha\n"},
+                   "macos.sw_vers": {"ok": False, "exit_code": 3, "stdout": b"fictional private output"},
+                   "macos.machine": Refusal("runner-timeout", "fictional"), "macos.developer_dir": Refusal("runner-output-too-large", "fictional"),
+                   "macos.translated": Refusal("runner-executable", "fictional")}
+        calls = []
+
+        def run_recipe(recipe_id):
+            calls.append(recipe_id)
+            if isinstance(answers[recipe_id], Exception):
+                raise answers[recipe_id]
+            return {"recipe": recipe_id, **answers[recipe_id]}
+
+        with patch.object(mac.platform, "system", return_value="Darwin"), patch.object(mac.readonly_runner, "run_recipe", side_effect=run_recipe):
+            results = {command: mac._default_runner(command, 5.0) for command in (
+                ("/usr/sbin/pkgutil", "--pkgs"), ("/usr/bin/sw_vers",), ("/usr/bin/uname", "-m"), ("/usr/bin/xcode-select", "--print-path"),
+                ("/usr/sbin/sysctl", "-in", "sysctl.proc_translated"))}
+            with self.assertRaises(ValueError):
+                mac._default_runner(("/usr/sbin/pkgutil", "--files", "org.example.alpha"), 5.0)
+        self.assertEqual(calls, ["macos.receipts", "macos.sw_vers", "macos.machine", "macos.developer_dir", "macos.translated"])
+        self.assertEqual(list(results.values()), [mac.CommandResult(0, "org.example.alpha\n"), mac.CommandResult(3, error="nonzero exit"),
+                                                  mac.CommandResult(None, error="timeout"), mac.CommandResult(None, error="output limit exceeded"),
+                                                  mac.CommandResult(None, error="unavailable")])
+
+    def test_default_runner_uses_the_read_only_runner_environment_and_root_owned_tools(self):
+        from test_readonly_runner import FakeLauncher, FakeProbe, regular
+        probe = FakeProbe(platform="darwin", files={"/usr/sbin/pkgutil": regular()})
+        launcher = FakeLauncher(b"org.example.alpha\n")
+        with patch.object(mac.platform, "system", return_value="Darwin"), patch.object(readonly_runner, "HostProbe", return_value=probe), \
+                patch.object(readonly_runner, "_launch", launcher):
+            self.assertEqual(mac._default_runner(("/usr/sbin/pkgutil", "--pkgs"), 5.0), mac.CommandResult(0, "org.example.alpha\n"))
+            self.assertEqual(mac._default_runner(("/usr/bin/xcode-select", "--print-path"), 5.0), mac.CommandResult(None, error="unavailable"))
+        call, = launcher.calls
+        self.assertEqual((call.argv, call.env, call.cwd, call.timeout, call.max_bytes),
+                         (("/usr/sbin/pkgutil", "--pkgs"), readonly_runner.INVENTORY_ENV, "/", readonly_runner.INVENTORY_TIMEOUT_SECONDS,
+                          readonly_runner.INVENTORY_MAX_BYTES))
 
     def test_fixture_requires_every_injected_boundary(self):
         with self.assertRaises(ValueError):
@@ -147,7 +181,7 @@ class MacCollectorTests(unittest.TestCase):
 
     def test_explicit_fixture_calls_only_fixed_queries(self):
         runner = fake_runner()
-        with patch.object(mac.subprocess, "Popen", side_effect=AssertionError("No native command in fixtures")), patch.object(mac.Path, "home", side_effect=AssertionError("No home lookup in fixtures")):
+        with patch.object(mac.readonly_runner, "run_recipe", side_effect=AssertionError("No native command in fixtures")), patch.object(mac.Path, "home", side_effect=AssertionError("No home lookup in fixtures")):
             data = self.collect_fixture(runner=runner)
         self.assertEqual(set(runner.calls), mac.ALLOWED_COMMANDS)
         self.assertEqual(len(runner.calls), 6)
@@ -182,7 +216,7 @@ class MacCollectorTests(unittest.TestCase):
 
     def test_selected_app_fields_only_and_header_never_executed(self):
         make_app(self.root)
-        with patch.object(mac.subprocess, "Popen", side_effect=AssertionError("Never launch application")):
+        with patch.object(mac.readonly_runner, "run_recipe", side_effect=AssertionError("Never launch application")):
             data = self.collect_fixture(roots=(self.root,))
         apps = [item for item in data["observations"] if item["kind"] == "application"]
         self.assertEqual(len(apps), 1)

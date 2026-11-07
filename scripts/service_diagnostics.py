@@ -1,5 +1,6 @@
-"""Assessment family: the diagnostic record store (PD-12), the diagnostic action, its effect and its completion, and
-the assessment dispatch (PLAN 3.3). The fictional fixture assessment holds here until its family code is written.
+"""Assessment family: the diagnostic record store, the diagnostic action, its effect and its completion, the one
+consumer of the inventory collectors, and the assessment dispatch. The fictional fixture assessment holds here until its family code is
+written.
 """
 from __future__ import annotations
 
@@ -11,20 +12,25 @@ import re
 import stat
 import uuid
 
+import collect_linux
+import collect_macos
+import diagnostic_windows
 import pc_paths
 import pc_records
-from workflow_core import digest, DIAGNOSTIC_ADAPTER
+from workflow_core import digest, encoded, DIAGNOSTIC_ADAPTER
 from diagnostic_core import (DiagnosticRefusal, MAX_RECORD, after_now, RECORD_RE, REQUEST_RE, SCHEMA as DIAGNOSTIC_RECORD, TOKEN_RE,
                              exact_keys, parse_time, read_diagnostic, sanitize_text, scope_tokens, validate_adapter_result,
                              validate_request)
 from diagnostic_posix import collect_recipe
 from private_workspace import PrivateWorkspaceError, ensure_private_directory, ensure_private_file, write_private_new
-from service_state import DEFAULT_ROOT, ServiceRefusal, service_value
+from service_state import DEFAULT_ROOT, ServiceRefusal, decoded
 
 DIAGNOSTIC_ADAPTER_ID = pc_records.ADAPTER_DIAGNOSTIC_COLLECT
+# The inventory collector of each platform; Windows software is listed by winget discovery instead.
+COLLECTORS = {"linux": collect_linux.collect, "macos": collect_macos.collect}
 
 
-# The diagnostic record store (PD-12: moved from diagnostic_core so the engine's validator stays pure).
+# The diagnostic record store (kept here, out of diagnostic_core, so the engine's validator stays pure).
 
 def _diagnostic_encoded(value):
     try:
@@ -243,7 +249,31 @@ class DiagnosticStore:
 
 
 class DiagnosticsMixin:
-    """The diagnostic action: a fixed recipe request, and the coordinator's observed result for a handoff."""
+    """The diagnostic action (a fixed recipe request, its effect, and the coordinator's observed result for a diagnostic
+    operation still open) and the inventory collection."""
+
+    def collect_inventory(self, session_id, *, collector=None):
+        """Collect this computer's installed-software inventory with the session platform's collector, register it as
+        inventory evidence, and return the registered result decoded. The only caller of the collectors: it runs
+        ``collect()`` itself (``collector`` replaces it in tests), never registers collector bytes handed to it, and only
+        inside an existing real session whose owner authorized the current scope, after the service's private storage
+        is admitted. A result that is not a real collection from the session's platform is refused. It writes only
+        engine evidence and takes no service lock, so a locked service method may call it."""
+        state = self._state(session_id, collecting=True)
+        if state["mode"] != "real":
+            raise ServiceRefusal("Installed software is collected only in a real session on this computer")
+        collect = collector or COLLECTORS.get(state["platform"])
+        if collect is None:
+            raise ServiceRefusal("This platform has no inventory collector; its package manager's discovery lists the software")
+        result = collect()
+        if not isinstance(result, dict) or result.get("collection_mode") != "real" or not isinstance(result.get("observations"), list):
+            raise ServiceRefusal("This collector result is not a real collection; it cannot be recorded as this computer's inventory")
+        if result.get("platform") != state["platform"]:
+            raise ServiceRefusal("This inventory was collected on a different platform than this session's computer")
+        content = encoded(result)
+        self._register(state, kind="inventory", value=result, facts={"item_count": len(result["observations"])},
+                       observed_utc=result.get("observed_utc"))
+        return decoded(content)
 
     def prepare_diagnostic_action(self, session_id, *, action_id, recipe_id, symptom, diagnostic_scope,
             target, benefit, risk, reversibility, verification):
@@ -272,27 +302,27 @@ class DiagnosticsMixin:
                                 outcome="succeeded" if observed["status"] == "observed" else "failed", receipt=record)
 
     # Dispatch targets (service_execute.EXECUTE, service_reconcile.RECONCILE; reached only through execute_action and
-    # reconcile_operation): the diagnostic runs its effect through the shared steps of service_execute and completes
-    # through its own callback, so neither assessment adapter reconciles; the fictional fixture assessment is not
-    # written yet.
+    # reconcile_operation): the diagnostic runs its effect through the shared steps of service_execute and finishes in
+    # it, so neither assessment adapter reconciles; the fictional fixture assessment is not written yet.
     def _execute_diagnostic_collect(self, session_id, state, action, payload, **arguments):
         if state["mode"] != "fixture" and (arguments["diagnostic_fixture_runner"] is not None or arguments["diagnostic_fixture_result"] is not None):
             raise ServiceRefusal("Fictional diagnostic output cannot enter a real operation")
+        if arguments["diagnostic_fixture_runner"] is not None and payload["request"]["platform"] == "windows":
+            raise ServiceRefusal("A Windows recipe takes a fictional result, not a fictional runner")
         return self._run_adapter(session_id, state, action, payload, self._effect_diagnostic_collect, **arguments)
 
     def _effect_diagnostic_collect(self, session_id, state, operation, action, payload, path, intent, *, diagnostic_fixture_runner,
                                    diagnostic_fixture_result):
-        """The fixed recipe or the Windows helper handoff, after the effect boundary (service_execute._run_effect)."""
-        request = payload["request"]
-        if request["platform"] == "windows" and diagnostic_fixture_result is None:
-            handoff = {**service_value("windows_diagnostic_handoff"), "operation_id": operation["operation_id"],
-                       "request": request, "helper": "diagnostic_windows.ps1:Invoke-WindowsDiagnostic",
-                       "instruction": "Use this fixed native helper in the matching host; return its selected actual adapter result. "
-                                      "No generic command is accepted."}
-            self._immutable(path / "handoff.json", handoff)
-            return handoff
-        observed = (validate_adapter_result(request, diagnostic_fixture_result) if diagnostic_fixture_result is not None
-                    else collect_recipe(request, runner=diagnostic_fixture_runner, coordinator_authorized=state["mode"] == "real"))
+        """The fixed recipe after the effect boundary (service_execute._run_effect): a fixture session's fictional result,
+        a Windows recipe (in-process, or the PowerShell helper this approved action starts in a real session) or a POSIX
+        recipe; the operation then finishes with the recorded result."""
+        request, real = payload["request"], state["mode"] == "real"
+        if diagnostic_fixture_result is not None:
+            observed = validate_adapter_result(request, diagnostic_fixture_result)
+        elif request["platform"] == "windows":
+            observed = diagnostic_windows.collect_recipe(request, folder=path, work=self.work, coordinator_authorized=real)
+        else:
+            observed = collect_recipe(request, runner=diagnostic_fixture_runner, coordinator_authorized=real)
         record = self.diagnostics.record_result(request["request_id"], adapter_result=observed)
         return self._finish(self.engine.read_session(session_id), operation,
                             outcome="succeeded" if observed["status"] == "observed" else "failed", receipt=record)

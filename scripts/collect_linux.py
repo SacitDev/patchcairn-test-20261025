@@ -3,38 +3,29 @@
 A read-only inventory provider: collect() returns validated facts, which the coordinator
 registers as inventory evidence in an engine session whose owner authorized this collection.
 Create the engine session first; it admits private storage before any collection.
+Every package query is a recipe of readonly_runner (fixed root-owned tool, fixed arguments and
+environment, a timeout and an output bound); this module starts no process itself.
 This module deliberately does not discover projects, user profiles or repositories.
 """
 
 import os
 from pathlib import Path
 import re
-import selectors
 import shlex
 import stat
-import subprocess
 import sys
-import time
 
 import pc_records
+import readonly_runner
 
 
-MAX_BYTES = 2 * 1024 * 1024
 MAX_ROWS = 10000
-QUERY_TIMEOUT = 8.0
 OS_RELEASE_LIMIT = 16384
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9+._:@~^!/-]{0,199}\Z")
 _PLAIN = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._()\[\]/:+-]{0,159}\Z")
 _OS_KEYS = frozenset({"ID", "ID_LIKE", "VERSION_ID", "PRETTY_NAME"})
-_TOOLS = ("dpkg-query", "rpm", "snap", "flatpak")
-# No inherited HOME, proxy, loader, Python or authentication configuration.
-# /dev/null cannot become a per-user configuration/cache directory.
-_QUERY_ENV = {
-    "PATH": "/usr/bin:/bin", "LC_ALL": "C", "LANG": "C", "TZ": "UTC",
-    "HOME": "/dev/null", "XDG_CONFIG_HOME": "/dev/null",
-    "XDG_CACHE_HOME": "/dev/null", "XDG_DATA_HOME": "/dev/null",
-    "GIO_USE_VFS": "local", "PAGER": "cat", "DPKG_PAGER": "cat",
-}
+# readonly_runner's refusal codes as this collector's categorical error codes.
+_RUNNER_ERRORS = {"runner-timeout": "query_timeout", "runner-output-too-large": "query_output_limit"}
 
 
 class CollectionError(Exception):
@@ -45,20 +36,17 @@ def _token(value):
     return isinstance(value, str) and bool(_TOKEN.fullmatch(value))
 
 
-def _trusted_system_path(path, executable=False):
-    """Accept only root-owned non-writable system files and their ancestors.
+def _trusted_system_path(path):
+    """Accept only a root-owned non-writable system file below /etc or /usr/lib, and its root-owned ancestors.
 
     This is an ownership boundary, not a signature or package-integrity proof.
     A compromised root/OS is outside the guarantee of an in-process collector.
     """
     try:
         resolved = Path(path).resolve(strict=True)
-        allowed_roots = (Path("/usr/bin"), Path("/usr/sbin")) if executable else (
-            Path("/etc"), Path("/usr/lib"))
-        if not any(resolved == root or root in resolved.parents for root in allowed_roots):
+        if not any(resolved == root or root in resolved.parents for root in (Path("/etc"), Path("/usr/lib"))):
             return False
-        info = resolved.stat()
-        if not stat.S_ISREG(info.st_mode) or (executable and not info.st_mode & 0o111):
+        if not stat.S_ISREG(resolved.stat().st_mode):
             return False
         for entry in (resolved,) + tuple(resolved.parents):
             item = entry.stat()
@@ -67,16 +55,6 @@ def _trusted_system_path(path, executable=False):
         return True
     except (OSError, RuntimeError):
         return False
-
-
-def _find_program(name):
-    if name not in _TOOLS:
-        return None
-    for directory in ("/usr/bin", "/bin", "/usr/sbin"):
-        candidate = Path(directory) / name
-        if _trusted_system_path(candidate, executable=True):
-            return str(candidate.resolve(strict=True))
-    return None
 
 
 def _read_os_release():
@@ -125,61 +103,22 @@ def parse_os_release(text):
     return selected
 
 
-def _run_query(argv, timeout=QUERY_TIMEOUT, byte_limit=MAX_BYTES):
-    """Read a capped pipe, not an unbounded capture_output buffer (Linux only)."""
-    if not (0 < timeout <= 30 and 0 < byte_limit <= MAX_BYTES):
-        raise CollectionError("invalid_query_bounds")
-    if not argv or not _trusted_system_path(argv[0], executable=True):
-        raise CollectionError("untrusted_program")
-    process = None
-    selector = selectors.DefaultSelector()
+def _query(recipe_id):
+    """The text a package query printed, through readonly_runner; None when no listed root-owned tool exists. dpkg-query,
+    rpm, snap and flatpak print UTF-8; other bytes are refused. A refusal, a failure status or undecodable output raises
+    CollectionError with a categorical code (never the tool's text)."""
     try:
-        process = subprocess.Popen(
-            list(argv), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, env=dict(_QUERY_ENV), cwd="/",
-            close_fds=True, shell=False,
-        )
-        selector.register(process.stdout, selectors.EVENT_READ)
-        deadline = time.monotonic() + timeout
-        collected = bytearray()
-        while selector.get_map():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise CollectionError("query_timeout")
-            for key, _ in selector.select(min(remaining, 0.2)):
-                chunk = os.read(key.fileobj.fileno(), min(65536, byte_limit - len(collected) + 1))
-                if not chunk:
-                    selector.unregister(key.fileobj)
-                else:
-                    collected.extend(chunk)
-                    if len(collected) > byte_limit:
-                        raise CollectionError("query_output_limit")
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise CollectionError("query_timeout")
-        try:
-            code = process.wait(timeout=remaining)
-        except subprocess.TimeoutExpired:
-            raise CollectionError("query_timeout") from None
-        if code != 0:
-            raise CollectionError("query_exit_nonzero")
-        try:
-            return collected.decode("utf-8", errors="strict")
-        except UnicodeError:
-            raise CollectionError("query_encoding") from None
-    except OSError:
-        raise CollectionError("query_unavailable") from None
-    finally:
-        selector.close()
-        if process is not None:
-            if process.poll() is None:
-                process.kill()  # Only the exact process created above; never a host updater.
-                try:
-                    process.wait(timeout=1)
-                except subprocess.TimeoutExpired:
-                    pass
-            if process.stdout is not None:
-                process.stdout.close()
+        found = readonly_runner.run_recipe(recipe_id)
+    except pc_records.Refusal as error:
+        if error.code == "runner-executable":
+            return None
+        raise CollectionError(_RUNNER_ERRORS.get(error.code, "query_unavailable")) from None
+    if not found["ok"]:
+        raise CollectionError("query_exit_nonzero")
+    try:
+        return found["stdout"].decode("utf-8", errors="strict")
+    except UnicodeError:
+        raise CollectionError("query_encoding") from None
 
 
 def _package(name, version, architecture, manager, **extras):
@@ -219,6 +158,8 @@ def parse_rpm(text):
     rows, rejected = [], 0
     for line in text.splitlines():
         fields = line.split("\t")
+        if fields[0] == "gpg-pubkey" and fields[2:] == ["(none)", "(none)"]:
+            continue  # An imported signing key, which rpm lists like a package; it is not installed software.
         if len(fields) != 4 or not all(_token(value) for value in fields):
             rejected += 1
             continue
@@ -229,8 +170,10 @@ def parse_rpm(text):
 
 def parse_snap(text):
     rows, rejected = [], 0
+    if not text.strip():
+        return [], 0  # With no snaps installed, snap list prints nothing on stdout.
     lines = text.splitlines()
-    if not lines or lines[0].split() != ["Name", "Version", "Rev", "Tracking", "Publisher", "Notes"]:
+    if lines[0].split() != ["Name", "Version", "Rev", "Tracking", "Publisher", "Notes"]:
         return [], 1
     for line in lines[1:]:
         fields = line.split()
@@ -305,18 +248,18 @@ def collect():
         if wsl:
             result["limits"].append("WSL guest: Windows host, WSL package and guest distribution updates are separate and unassessed here.")
     specs = (
-        ("dpkg-query", ["--show", "--showformat=${binary:Package}\\t${Version}\\t${Architecture}\\t${db:Status-Abbrev}\\t${source:Package}\\n"], parse_dpkg),
-        ("rpm", ["--noplugins", "--rcfile", "/dev/null", "--macros", "/dev/null", "--dbpath", "/var/lib/rpm", "-qa", "--qf", "%{NAME}\\t%{EPOCHNUM}:%{VERSION}-%{RELEASE}\\t%{ARCH}\\t%{SOURCERPM}\\n"], parse_rpm),
-        ("snap", ["list"], parse_snap),
-        ("flatpak", ["list", "--system", "--columns=application,version,arch,branch"], parse_flatpak),
+        ("dpkg-query", "linux.dpkg_installed", parse_dpkg),
+        ("rpm", "linux.rpm_installed", parse_rpm),
+        ("snap", "linux.snap_list", parse_snap),
+        ("flatpak", "linux.flatpak_system", parse_flatpak),
     )
-    for manager, args, parser in specs:
-        program = _find_program(manager)
-        if program is None:
-            result["coverage"].append({"scope": manager, "state": "unavailable_or_untrusted"})
-            continue
+    for manager, recipe_id, parser in specs:
         try:
-            rows, rejected = parser(_run_query([program] + args))
+            text = _query(recipe_id)
+            if text is None:
+                result["coverage"].append({"scope": manager, "state": "unavailable_or_untrusted"})
+                continue
+            rows, rejected = parser(text)
             allowance = max(0, MAX_ROWS - len(result["observations"]))
             truncated = len(rows) > allowance
             result["observations"].extend(rows[:allowance])

@@ -1,10 +1,13 @@
-"""Fictional Linux metadata fixtures; never collect the current host inventory."""
+"""Fictional Linux metadata fixtures; never collect the current host inventory.
+
+Package queries go through readonly_runner, replaced here by fakes (its recipe call, or its host facts and process
+start), so every test runs on every OS. Fixture folders live under work/test-fixtures/ and are removed.
+"""
 
 import importlib.util
 from pathlib import Path, PurePosixPath
 import shutil
 import stat
-import subprocess
 import sys
 import uuid
 from types import SimpleNamespace
@@ -15,15 +18,19 @@ from unittest.mock import MagicMock, patch
 _MODULE = Path(__file__).resolve().parents[1] / "scripts" / "collect_linux.py"
 sys.path.insert(0, str(_MODULE.parent))
 import pc_records
+import readonly_runner
+from pc_records import Refusal
 _SPEC = importlib.util.spec_from_file_location("fixture_linux_collector", _MODULE)
 linux = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(linux)
 WORK = _MODULE.parents[1] / "work" / "test-fixtures" / "linux-collector"
+DPKG_ROW = b"example\t1.0-2vendor\tamd64\tii \texample-source\n"
 
 
-def inventory_session(test, platform):
+def inventory_session(test, platform, *, authorized=True):
     """A fresh engine session in its own fixture folder (removed after the test) whose whole-device,
-    metadata-only scope the fictional owner authorizes before evidence is registered."""
+    metadata-only scope the fictional owner authorizes before evidence is registered (unless authorized=False).
+    The one helper of both collector test modules."""
     # The engine core does not check the host platform (the CLI and the service refuse a non-native
     # real session), so this real session simulates a native host of the given platform.
     import workflow_core
@@ -35,27 +42,60 @@ def inventory_session(test, platform):
               "operations": ["metadata"], "local_content": [], "llm_content": [], "sensitive_exceptions": []}
     scope = {"roots": [], "purpose": "Fictional installed-software inventory", "assessment": access}
     session_id = engine.create_session(mode="real", platform=platform, scope=scope)["session_id"]
-    engine.authorize_scope(session_id, owner_quote="Read only installed-software metadata on this fictional device.",
-                           owner_message_id="fictional-owner-scope")
-    test.assertEqual(engine.read_session(session_id)["scope_authorization"]["scope_sha256"], pc_records.digest(scope))
+    if authorized:
+        engine.authorize_scope(session_id, owner_quote="Read only installed-software metadata on this fictional device.",
+                               owner_message_id="fictional-owner-scope-" + uuid.uuid4().hex)
+        test.assertEqual(engine.read_session(session_id)["scope_authorization"]["scope_sha256"], pc_records.digest(scope))
     return engine, scope, session_id
 
 
-def _run_controlled_pipe_fixture(program, *, timeout=linux.QUERY_TIMEOUT, byte_limit=linux.MAX_BYTES):
-    """Exercise pipe behavior with only the currently running test interpreter.
+def assert_inventory_needs_the_scope_decision(test, platform, content):
+    """Registering inventory before authorize_scope is refused (the engine's inventory-scope-unauthorized refusal,
+    test_engine_plans.InventoryEvidenceTests.test_real_inventory_needs_current_scope_authorization)."""
+    import workflow_core
+    engine, scope, session_id = inventory_session(test, platform, authorized=False)
+    before = engine.read_session(session_id)
+    with test.assertRaises(workflow_core.WorkflowRefusal) as caught:
+        engine.register_evidence(session_id, evidence_id="fictional-unauthorized-inventory", content=content, kind="inventory", scope=scope)
+    test.assertEqual(caught.exception.code, "inventory-scope-unauthorized")
+    test.assertEqual(engine.read_session(session_id), before)
 
-    Hosted CI can install that interpreter outside production's system-tool roots.
-    Its admission is mocked locally; the production policy remains independently
-    tested and is restored even when the fixture times out or exceeds its cap.
-    """
-    interpreter = sys.executable
-    def admit_fixture(candidate, executable=False):
-        return executable is True and candidate == interpreter
-    with patch.object(linux, "_trusted_system_path", side_effect=admit_fixture):
-        return linux._run_query(
-            [interpreter, "-I", "-S", "-B", "-c", program],
-            timeout=timeout, byte_limit=byte_limit,
-        )
+
+def recipes(outputs):
+    """A fake readonly_runner.run_recipe answering each recipe id from ``outputs`` (bytes, an exception, or absent:
+    no listed root-owned tool)."""
+    calls = []
+
+    def run_recipe(recipe_id):
+        calls.append(recipe_id)
+        value = outputs.get(recipe_id, Refusal("runner-executable", "No listed system tool owned by root was found"))
+        if isinstance(value, Exception):
+            raise value
+        code, data = value if isinstance(value, tuple) else (0, value)
+        return {"recipe": recipe_id, "exit_code": code, "ok": code == 0, "stdout": data}
+
+    run_recipe.calls = calls
+    return run_recipe
+
+
+def native(run_recipe, uname=None, os_release=None):
+    """Patches simulating a native Linux host: platform, os-release, kernel and the package queries."""
+    return (patch.object(linux.sys, "platform", "linux"),
+            patch.object(linux, "_read_os_release", side_effect=os_release) if isinstance(os_release, Exception)
+            else patch.object(linux, "_read_os_release", return_value=os_release or {"ID": "example", "VERSION_ID": "12", "PRETTY_NAME": "Example Linux 12"}),
+            patch.object(linux.os, "uname", return_value=uname or MagicMock(release="6.1.0-example", machine="x86_64"), create=True),
+            patch.object(linux.readonly_runner, "run_recipe", side_effect=run_recipe))
+
+
+def collect(run_recipe, **host):
+    patches = native(run_recipe, **host)
+    for item in patches:
+        item.start()
+    try:
+        return linux.collect()
+    finally:
+        for item in reversed(patches):
+            item.stop()
 
 
 class LinuxParserTests(unittest.TestCase):
@@ -119,6 +159,25 @@ class LinuxParserTests(unittest.TestCase):
         self.assertNotIn("publisher", rows[0])
         self.assertEqual(linux.parse_snap("unexpected output"), ([], 1))
 
+    def test_snap_with_nothing_installed_is_complete_coverage(self):
+        # snap list prints nothing on stdout when no snaps are installed.
+        for output in (b"", b"\n"):
+            with self.subTest(output=output):
+                facts = collect(recipes({"linux.snap_list": output}))
+                scope = next(row for row in facts["coverage"] if row["scope"] == "snap")
+                self.assertEqual((scope["state"], scope["records"], scope["rejected_rows"]), ("observed", 0, 0))
+
+    def test_rpm_signing_keys_are_not_packages_and_do_not_lower_coverage(self):
+        facts = collect(recipes({"linux.rpm_installed": b"example\t0:1.2-3.vendor\tx86_64\texample-1.2-3.src.rpm\n"
+                                                        b"gpg-pubkey\t0:abcdef12-5f000000\t(none)\t(none)\n"}))
+        scope = next(row for row in facts["coverage"] if row["scope"] == "rpm")
+        self.assertEqual((scope["state"], scope["records"], scope["rejected_rows"]), ("observed", 1, 0))
+        self.assertEqual([row["name"] for row in facts["observations"] if row["kind"] == "package"], ["example"])
+        # Only a key row's exact shape is passed over: the name alone hides nothing from the inventory.
+        self.assertEqual(linux.parse_rpm("gpg-pubkey\t0:abcdef12-5f000000\t(none)\n"), ([], 1))
+        rows, rejected = linux.parse_rpm("gpg-pubkey\t0:1.0-1\tx86_64\tgpg-pubkey-1.0-1.src.rpm\n")
+        self.assertEqual(([row["name"] for row in rows], rejected), (["gpg-pubkey"], 0))
+
     def test_flatpak_empty_version_is_unknown_not_latest(self):
         rows, rejected = linux.parse_flatpak("org.example.Runtime\t\tx86_64\t24.08\n")
         self.assertEqual(rejected, 0)
@@ -128,15 +187,11 @@ class LinuxParserTests(unittest.TestCase):
     def test_collector_feeds_inventory_evidence(self):
         """Simulated native collection becomes exact inventory evidence in a fresh engine session."""
         engine, scope, session_id = inventory_session(self, "linux")  # the authorized real session that receives the evidence
-        uname = MagicMock(release="6.1.0-example", machine="x86_64")
         observed = pc_records.utc_now()
-        with patch.object(linux.sys, "platform", "linux"), \
-             patch.object(linux, "_read_os_release", return_value={"ID": "example", "VERSION_ID": "12", "PRETTY_NAME": "Example Linux 12"}), \
-             patch.object(linux.os, "uname", return_value=uname, create=True), \
-             patch.object(linux, "_find_program", side_effect=lambda name: "/usr/bin/dpkg-query" if name == "dpkg-query" else None), \
-             patch.object(linux, "_run_query", return_value="example\t1.0-2vendor\tamd64\tii \texample-source\n"), \
-             patch.object(linux.pc_records, "utc_now", return_value=observed):
-            facts = linux.collect()
+        run_recipe = recipes({"linux.dpkg_installed": DPKG_ROW})
+        with patch.object(linux.pc_records, "utc_now", return_value=observed):
+            facts = collect(run_recipe)
+        self.assertEqual(run_recipe.calls, ["linux.dpkg_installed", "linux.rpm_installed", "linux.snap_list", "linux.flatpak_system"])
         self.assertEqual((facts["platform"], facts["collection_mode"], facts["observed_utc"], facts["errors"]),
                          ("linux", "real", observed, []))
         self.assertEqual([item["kind"] for item in facts["observations"]], ["operating_system", "kernel", "package"])
@@ -149,132 +204,76 @@ class LinuxParserTests(unittest.TestCase):
         row = engine.read_session(session_id)["evidence"]["fictional-linux-inventory"]
         self.assertEqual((row["kind"], row["sha256"], row["observed_utc"]), ("inventory", pc_records.digest(content), observed))
         self.assertEqual(pc_records.decode_strict((engine.work / session_id / row["path"]).read_bytes()), facts)
+        # Negative control: the same evidence is refused while the owner has not authorized the scope.
+        assert_inventory_needs_the_scope_decision(self, "linux", content)
 
 
 class LinuxSafetyTests(unittest.TestCase):
-    def test_pipe_fixture_admits_only_controlled_non_system_interpreter_and_restores_policy(self):
-        interpreter = "/opt/hostedtoolcache/Python/3.12.9/x64/bin/python3"
-        original_admission = linux._trusted_system_path
-        class LiteralSystemPath(PurePosixPath):
-            def resolve(self, strict=True):
-                return self
-            def stat(self):
-                raise AssertionError("This fictional non-system path must be rejected before stat")
-        with patch.object(linux, "Path", LiteralSystemPath):
-            self.assertFalse(original_admission(interpreter, executable=True))
-        def inspect_fixture(argv, **bounds):
-            self.assertEqual(argv, [interpreter, "-I", "-S", "-B", "-c", "print('fictional')"])
-            self.assertTrue(linux._trusted_system_path(interpreter, executable=True))
-            self.assertFalse(linux._trusted_system_path(interpreter, executable=False))
-            self.assertFalse(linux._trusted_system_path(interpreter + "-other", executable=True))
-            self.assertFalse(linux._trusted_system_path("/usr/bin/other", executable=True))
-            self.assertEqual(bounds, {"timeout": linux.QUERY_TIMEOUT, "byte_limit": linux.MAX_BYTES})
-            return "fictional\n"
-        with patch.object(sys, "executable", interpreter), \
-             patch.object(linux, "_run_query", side_effect=inspect_fixture):
-            self.assertEqual(_run_controlled_pipe_fixture("print('fictional')"), "fictional\n")
-        self.assertIs(linux._trusted_system_path, original_admission)
-        with patch.object(sys, "executable", interpreter), \
-             patch.object(linux, "_run_query", side_effect=linux.CollectionError("query_timeout")):
-            with self.assertRaisesRegex(linux.CollectionError, "query_timeout"):
-                _run_controlled_pipe_fixture("print('fictional')")
-        self.assertIs(linux._trusted_system_path, original_admission)
+    def test_queries_run_through_the_read_only_runner_with_its_fixed_environment(self):
+        from test_readonly_runner import FakeLauncher, FakeProbe, regular
+        probe = FakeProbe(files={"/usr/bin/dpkg-query": regular(), "/usr/bin/snap": regular(uid=1000)})
+        launcher = FakeLauncher(DPKG_ROW)
+        with patch.object(readonly_runner, "HostProbe", return_value=probe), patch.object(readonly_runner, "_launch", launcher):
+            facts = collect(readonly_runner.run_recipe)
+        call, = launcher.calls  # rpm and flatpak are absent and snap is not owned by root: none of them starts
+        self.assertEqual(call.argv, ("/usr/bin/dpkg-query", "--show",
+                                     "--showformat=${binary:Package}\\t${Version}\\t${Architecture}\\t${db:Status-Abbrev}\\t${source:Package}\\n"))
+        self.assertEqual((call.env, call.cwd, call.timeout, call.max_bytes),
+                         (readonly_runner.INVENTORY_ENV, "/", readonly_runner.INVENTORY_TIMEOUT_SECONDS, readonly_runner.INVENTORY_MAX_BYTES))
+        self.assertEqual(call.env["HOME"], "/dev/null")
+        self.assertEqual([row["state"] for row in facts["coverage"] if row["scope"] != "os_release"],
+                         ["observed", "unavailable_or_untrusted", "unavailable_or_untrusted", "unavailable_or_untrusted"])
+        self.assertEqual(facts["observations"][2]["name"], "example")
+
+    def test_runner_refusals_and_failures_become_categorical_errors(self):
+        run_recipe = recipes({"linux.dpkg_installed": Refusal("runner-timeout", "fictional"),
+                              "linux.rpm_installed": Refusal("runner-output-too-large", "fictional"),
+                              "linux.snap_list": (7, b"fictional private text"),
+                              "linux.flatpak_system": b"\xff\xfe not UTF-8"})
+        result = collect(run_recipe)
+        self.assertEqual(result["errors"], [{"scope": "dpkg-query", "code": "query_timeout"}, {"scope": "rpm", "code": "query_output_limit"},
+                                            {"scope": "snap", "code": "query_exit_nonzero"}, {"scope": "flatpak", "code": "query_encoding"}])
+        self.assertNotIn("fictional private text", str(result))
+        started = collect(recipes({"linux.dpkg_installed": Refusal("runner-start", "secret D:\\Fictional\\path")}))
+        self.assertEqual(started["errors"][0], {"scope": "dpkg-query", "code": "query_unavailable"})
+        self.assertNotIn("Fictional", str(started))
 
     def test_non_linux_rejected_before_any_host_read(self):
         with patch.object(linux.sys, "platform", "win32"), \
              patch.object(linux, "_read_os_release") as read, \
-             patch.object(linux, "_find_program") as find:
+             patch.object(linux.readonly_runner, "run_recipe") as run:
             with self.assertRaisesRegex(linux.CollectionError, "native_linux_required"):
                 linux.collect()
         read.assert_not_called()
-        find.assert_not_called()
+        run.assert_not_called()
 
-    def test_program_resolution_never_searches_user_path(self):
-        with patch.object(linux, "_trusted_system_path", return_value=False) as trusted:
-            self.assertIsNone(linux._find_program("dpkg-query"))
-            self.assertIsNone(linux._find_program("unapproved-tool"))
-        self.assertEqual([call.args[0].as_posix() for call in trusted.call_args_list],
-                         ["/usr/bin/dpkg-query", "/bin/dpkg-query", "/usr/sbin/dpkg-query"])
-
-    def test_trusted_program_rejects_world_writable_and_wrong_owner(self):
+    def test_os_release_file_must_be_root_owned_and_not_writable_by_others(self):
         metadata = {}
         class FixturePath(PurePosixPath):
             def resolve(self, strict=True):
                 return self
             def stat(self):
                 return metadata.get(str(self), SimpleNamespace(
-                    st_mode=(stat.S_IFREG | 0o755) if self.name == "example" else (stat.S_IFDIR | 0o755),
+                    st_mode=(stat.S_IFREG | 0o644) if self.name == "os-release" else (stat.S_IFDIR | 0o755),
                     st_uid=0))
         with patch.object(linux, "Path", FixturePath):
-            self.assertTrue(linux._trusted_system_path("/usr/bin/example", executable=True))
-            metadata["/usr/bin/example"] = SimpleNamespace(st_mode=stat.S_IFREG | 0o777, st_uid=0)
-            self.assertFalse(linux._trusted_system_path("/usr/bin/example", executable=True))
-            metadata["/usr/bin/example"] = SimpleNamespace(st_mode=stat.S_IFREG | 0o755, st_uid=1000)
-            self.assertFalse(linux._trusted_system_path("/usr/bin/example", executable=True))
+            self.assertTrue(linux._trusted_system_path("/etc/os-release"))
+            metadata["/etc/os-release"] = SimpleNamespace(st_mode=stat.S_IFREG | 0o666, st_uid=0)
+            self.assertFalse(linux._trusted_system_path("/etc/os-release"))
+            metadata["/etc/os-release"] = SimpleNamespace(st_mode=stat.S_IFREG | 0o644, st_uid=1000)
+            self.assertFalse(linux._trusted_system_path("/etc/os-release"))
             metadata.clear()
-            metadata["/usr"] = SimpleNamespace(st_mode=stat.S_IFDIR | 0o775, st_uid=0)
-            self.assertFalse(linux._trusted_system_path("/usr/bin/example", executable=True))
-            self.assertFalse(linux._trusted_system_path("/unapproved/example", executable=True))
-
-    def _fake_query(self, chunks, exit_code=0):
-        process = MagicMock()
-        process.poll.return_value = exit_code
-        process.wait.return_value = exit_code
-        key = MagicMock()
-        key.fileobj = process.stdout
-        selector = MagicMock()
-        selector.get_map.side_effect = [True] * len(chunks) + [False]
-        selector.select.return_value = [(key, linux.selectors.EVENT_READ)]
-        return process, selector
-
-    def test_query_has_hard_cap_and_no_raw_stderr_or_inherited_environment(self):
-        process, selector = self._fake_query([b"12345"])
-        with patch.object(linux, "_trusted_system_path", return_value=True), \
-             patch.object(linux.subprocess, "Popen", return_value=process) as popen, \
-             patch.object(linux.selectors, "DefaultSelector", return_value=selector), \
-             patch.object(linux.os, "read", return_value=b"12345"):
-            with self.assertRaisesRegex(linux.CollectionError, "query_output_limit"):
-                linux._run_query(["/usr/bin/dpkg-query", "--show"], byte_limit=4)
-        options = popen.call_args.kwargs
-        self.assertFalse(options["shell"])
-        self.assertEqual(options["stderr"], subprocess.DEVNULL)
-        self.assertEqual(options["env"]["HOME"], "/dev/null")
-        self.assertNotIn("LD_PRELOAD", options["env"])
-        self.assertNotIn("HTTP_PROXY", options["env"])
-
-    def test_query_nonzero_is_categorical_and_stdout_not_returned(self):
-        process, selector = self._fake_query([b"sensitive-like fictional output", b""], exit_code=7)
-        with patch.object(linux, "_trusted_system_path", return_value=True), \
-             patch.object(linux.subprocess, "Popen", return_value=process), \
-             patch.object(linux.selectors, "DefaultSelector", return_value=selector), \
-             patch.object(linux.os, "read", side_effect=[b"fictional private text", b""]):
-            with self.assertRaisesRegex(linux.CollectionError, "query_exit_nonzero") as caught:
-                linux._run_query(["/usr/bin/example"])
-        self.assertEqual(str(caught.exception), "query_exit_nonzero")
-
-    def test_query_timeout_kills_only_its_own_spawned_process(self):
-        process, selector = self._fake_query([b"unused"])
-        process.poll.return_value = None
-        with patch.object(linux, "_trusted_system_path", return_value=True), \
-             patch.object(linux.subprocess, "Popen", return_value=process), \
-             patch.object(linux.selectors, "DefaultSelector", return_value=selector), \
-             patch.object(linux.time, "monotonic", side_effect=[0.0, 9.0]):
-            with self.assertRaisesRegex(linux.CollectionError, "query_timeout"):
-                linux._run_query(["/usr/bin/example"])
-        process.kill.assert_called_once_with()
+            metadata["/etc"] = SimpleNamespace(st_mode=stat.S_IFDIR | 0o775, st_uid=0)
+            self.assertFalse(linux._trusted_system_path("/etc/os-release"))
+            metadata.clear()
+            metadata["/etc/os-release"] = SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_uid=0)
+            self.assertFalse(linux._trusted_system_path("/etc/os-release"))
+            self.assertFalse(linux._trusted_system_path("/var/tmp/os-release"))
 
     def test_collect_wsl_metadata_and_partial_coverage_are_not_security_clearance(self):
         uname = MagicMock(release="5.15.0-example-microsoft-standard-WSL2", machine="x86_64")
-        def query(argv):
-            if "dpkg-query" in argv[0]:
-                return "example\t1.0-2vendor\tamd64\tii \texample\nmalformed\n"
-            raise AssertionError("Unexpected fixture command")
-        with patch.object(linux.sys, "platform", "linux"), \
-             patch.object(linux, "_read_os_release", return_value={"ID": "example", "VERSION_ID": "12"}), \
-             patch.object(linux.os, "uname", return_value=uname, create=True), \
-             patch.object(linux, "_find_program", side_effect=lambda name: "/usr/bin/dpkg-query" if name == "dpkg-query" else None), \
-             patch.object(linux, "_run_query", side_effect=query):
-            result = linux.collect()
+        run_recipe = recipes({"linux.dpkg_installed": b"example\t1.0-2vendor\tamd64\tii \texample\nmalformed\n"})
+        result = collect(run_recipe, uname=uname, os_release={"ID": "example", "VERSION_ID": "12"})
         self.assertEqual(result["platform"], "linux")
         self.assertTrue(result["observed_utc"].endswith("Z"))
         self.assertEqual(result["observations"][1]["environment"], "wsl_guest")
@@ -284,32 +283,13 @@ class LinuxSafetyTests(unittest.TestCase):
         self.assertEqual(result["observations"][2]["security_applicability"], "not_assessed")
 
     def test_collector_error_does_not_echo_private_error_details(self):
-        uname = MagicMock(release="6.0.0-example", machine="x86_64")
-        with patch.object(linux.sys, "platform", "linux"), \
-             patch.object(linux, "_read_os_release", side_effect=linux.CollectionError("os_release_unavailable")), \
-             patch.object(linux.os, "uname", return_value=uname, create=True), \
-             patch.object(linux, "_find_program", return_value="/usr/bin/example"), \
-             patch.object(linux, "_run_query", side_effect=linux.CollectionError("query_exit_nonzero")):
-            result = linux.collect()
+        run_recipe = recipes({recipe_id: (2, b"fictional private stderr-like text") for recipe_id in
+                              ("linux.dpkg_installed", "linux.rpm_installed", "linux.snap_list", "linux.flatpak_system")})
+        result = collect(run_recipe, uname=MagicMock(release="6.0.0-example", machine="x86_64"),
+                         os_release=linux.CollectionError("os_release_unavailable"))
         self.assertEqual(len(result["errors"]), 5)
         self.assertTrue(all(set(item) == {"scope", "code"} for item in result["errors"]))
-
-
-@unittest.skipUnless(sys.platform.startswith("linux"), "only on linux: native pipe fixture of the Linux collector; no host inventory")
-class LinuxPipeFixtureTests(unittest.TestCase):
-    """Only spawn this test interpreter with fixed fictional-output programs."""
-
-    def test_native_pipe_reads_fictional_output(self):
-        result = _run_controlled_pipe_fixture("print('fictional-package 1.0')")
-        self.assertEqual(result, "fictional-package 1.0\n")
-
-    def test_native_pipe_enforces_cap(self):
-        with self.assertRaisesRegex(linux.CollectionError, "query_output_limit"):
-            _run_controlled_pipe_fixture("print('x' * 100000)", byte_limit=100)
-
-    def test_native_pipe_timeout_terminates_only_fixture_process(self):
-        with self.assertRaisesRegex(linux.CollectionError, "query_timeout"):
-            _run_controlled_pipe_fixture("import time; time.sleep(2)", timeout=0.05)
+        self.assertNotIn("private", str(result["errors"]))
 
 
 if __name__ == "__main__":

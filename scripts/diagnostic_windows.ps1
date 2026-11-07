@@ -1,16 +1,19 @@
-# Fixed read-only Windows diagnostic recipes. Dot-source to define the functions; nothing is collected then.
-# The caller starts the helper only as
+# Fixed read-only Windows diagnostic recipes: update context and event metadata (the OS version and the capacity
+# recipes run in-process in scripts/diagnostic_windows.py). Dot-source to define the functions; nothing is collected
+# then. The service (scripts/diagnostic_windows.py) starts the helper only as
 #   <GetSystemDirectoryW>\WindowsPowerShell\v1.0\powershell.exe -NoProfile -NonInteractive -File diagnostic_windows.ps1
-#     -RequestPath <request file> [-FixturePath <fictional facts file>] [-CoordinatorAuthorized]
-# with an explicit environment whose PSModulePath is <GetSystemDirectoryW>\WindowsPowerShell\v1.0\Modules only and
-# that has no PSExecutionPolicyPreference (the caller removes an inherited one: it would override the machine's
-# policy), and never with an execution-policy bypass. The script repeats the module path as its first statement,
-# without a cmdlet (a cmdlet would load its module from the inherited path first), refuses a start that still carries
-# PSExecutionPolicyPreference or -ExecutionPolicy, checks that every loaded module comes from $PSHOME, uses no command
-# that loads a module before that, and names each cmdlet it needs with its module. Under the Restricted or AllSigned
-# policy (the default on Windows clients) the start fails: the recipe is reported as held, and neither
-# -ExecutionPolicy nor a policy change is ever used. -CoordinatorAuthorized is only the caller's claim; the host's
-# command approval and the owner supply the authority. The request is read with the strict record reader below.
+#     -RequestPath <request file> -CoordinatorAuthorized
+# (the test suites pass -FixturePath <fictional facts file> instead of -CoordinatorAuthorized)
+# with an environment built from scratch (SystemRoot, WINDIR, and PSModulePath set to
+# <GetSystemDirectoryW>\WindowsPowerShell\v1.0\Modules only; never PSExecutionPolicyPreference, which would override
+# the machine's policy), and never with an execution-policy bypass. The script repeats the module path as its first
+# statement, without a cmdlet (a cmdlet would load its module from the inherited path first), refuses a start that
+# still carries PSExecutionPolicyPreference or -ExecutionPolicy, checks that every loaded module comes from $PSHOME,
+# uses no command that loads a module before that, and names each cmdlet it needs with its module. Under the
+# Restricted or AllSigned policy (the default on Windows clients) the start fails: the recipe is reported as held, and
+# neither -ExecutionPolicy nor a policy change is ever used. The service passes -CoordinatorAuthorized only for an
+# approved real-session diagnostic action; without it nothing is collected. The request is read with the strict
+# record reader below.
 [CmdletBinding()]
 param([string]$RequestPath,[string]$FixturePath,[switch]$CoordinatorAuthorized)
 if ($RequestPath) {
@@ -28,7 +31,7 @@ function Assert-SystemModules {
 }
 
 function Get-WindowsDiagnosticRecipes {
- @('windows.os_version','windows.system_capacity','windows.update_context','windows.system_event_metadata','windows.update_event_metadata')
+ @('windows.update_context','windows.system_event_metadata','windows.update_event_metadata')
 }
 
 function Test-DiagnosticKeys($Value,[string[]]$Keys) {
@@ -155,12 +158,6 @@ function Test-DiagnosticInteger($Value,[long]$Minimum,[long]$Maximum) {
 
 function Test-WindowsDiagnosticFacts([string]$Recipe,$Facts) {
  switch -Exact ($Recipe) {
-  'windows.os_version' {
-   return ((Test-DiagnosticKeys $Facts @('version','build','architecture')) -and $Facts.version -is [string] -and $Facts.version -cmatch '\A[0-9]{1,5}(\.[0-9]{1,6}){1,3}\z' -and $Facts.build -is [string] -and $Facts.build -cmatch '\A[0-9]{1,8}\z' -and $Facts.architecture -cin @('x64','arm64','x86','unknown'))
-  }
-  'windows.system_capacity' {
-   return ((Test-DiagnosticKeys $Facts @('total_bytes','available_bytes')) -and (Test-DiagnosticInteger $Facts.total_bytes 0 ([long]::MaxValue)) -and (Test-DiagnosticInteger $Facts.available_bytes 0 $Facts.total_bytes))
-  }
   'windows.update_context' {
    if (-not (Test-DiagnosticKeys $Facts @('updates')) -or $Facts.updates -isnot [array] -or @($Facts.updates).Count -gt 50) { return $false }
    foreach ($update in @($Facts.updates)) { if (-not (Test-DiagnosticKeys $update @('kb_id','installed_utc')) -or $update.kb_id -isnot [string] -or $update.kb_id -cnotmatch '\AKB[0-9]{4,10}\z' -or ($null -ne $update.installed_utc -and ($update.installed_utc -isnot [string] -or $update.installed_utc -cnotmatch '\A[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\z'))) { return $false } }
@@ -168,13 +165,31 @@ function Test-WindowsDiagnosticFacts([string]$Recipe,$Facts) {
   }
   { $_ -in @('windows.system_event_metadata','windows.update_event_metadata') } {
    if (-not (Test-DiagnosticKeys $Facts @('events')) -or $Facts.events -isnot [array] -or @($Facts.events).Count -gt 50) { return $false }
-   $providers=@('Microsoft-Windows-WindowsUpdateClient','Microsoft-Windows-Kernel-Power','EventLog','Microsoft-Windows-WHEA-Logger','disk','Ntfs','volmgr')
+   $providers=@('Microsoft-Windows-WindowsUpdateClient','Microsoft-Windows-Kernel-Power','EventLog','Microsoft-Windows-WHEA-Logger','disk','Ntfs','Microsoft-Windows-Ntfs','volmgr')
    foreach ($event in @($Facts.events)) { if (-not (Test-DiagnosticKeys $event @('event_id','provider','level','observed_utc')) -or -not (Test-DiagnosticInteger $event.event_id 1 65535) -or $event.provider -cnotin $providers -or -not (Test-DiagnosticInteger $event.level 1 5) -or $event.observed_utc -isnot [string] -or $event.observed_utc -cnotmatch '\A[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\z') { return $false } }
    if ($Recipe -eq 'windows.update_event_metadata' -and @($Facts.events | Where-Object { $_.provider -cne 'Microsoft-Windows-WindowsUpdateClient' }).Count -ne 0) { return $false }
    return $true
   }
  }
  return $false
+}
+
+function Get-DiagnosticEventFilter([string]$Recipe,[datetime]$Now,[int]$Window) {
+ # Get-WinEvent reads StartTime and EndTime as local time, whatever their Kind says.
+ $filter=@{StartTime=$Now.AddHours(-$Window).ToLocalTime();EndTime=$Now.ToLocalTime();Level=@(1,2,3)}
+ if ($Recipe -eq 'windows.update_event_metadata') { $filter.LogName='Microsoft-Windows-WindowsUpdateClient/Operational';$filter.ProviderName='Microsoft-Windows-WindowsUpdateClient' }
+ else { $filter.LogName='System';$filter.ProviderName=@('Microsoft-Windows-Kernel-Power','EventLog','Microsoft-Windows-WHEA-Logger','disk','Ntfs','Microsoft-Windows-Ntfs','volmgr');$filter.Id=@(7,11,15,17,18,19,20,41,51,55,57,98,129,140,153,157,161,6008) }
+ return $filter
+}
+
+function ConvertTo-DiagnosticUpdateRow($Update) {
+ $stamp=$null
+ if ($Update.InstalledOn -is [datetime]) { $stamp=$Update.InstalledOn.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ",[Globalization.CultureInfo]::InvariantCulture) }
+ return @{kb_id=[string]$Update.HotFixID;installed_utc=$stamp}
+}
+
+function ConvertTo-DiagnosticEventRow($Row) {
+ return @{event_id=[int]$Row.Id;provider=[string]$Row.ProviderName;level=[int]$Row.Level;observed_utc=$Row.TimeCreated.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ",[Globalization.CultureInfo]::InvariantCulture)}
 }
 
 function Invoke-WindowsDiagnostic {
@@ -199,10 +214,8 @@ function Invoke-WindowsDiagnostic {
  # Event context always needs explicit selected bounds, even though defaults are bounded.
  if ($isEvents -and ($seen.Count -ne 2)) { throw 'diagnostic:explicit-event-scope-required' }
  $now=[DateTime]::UtcNow
- $result=[ordered]@{schema='patchcairn.diagnostics';schema_version=1;kind='adapter_result';request_id=$Request.request_id;platform='windows';recipe_id=$Request.recipe_id;mode=$Request.mode;status='held';observed_utc=$now.ToString("yyyy-MM-ddTHH:mm:ss.ffffffZ");facts=@{};limitations=@();provenance=@()}
+ $result=[ordered]@{schema='patchcairn.diagnostics';schema_version=1;kind='adapter_result';request_id=$Request.request_id;platform='windows';recipe_id=$Request.recipe_id;mode=$Request.mode;status='held';observed_utc=$now.ToString("yyyy-MM-ddTHH:mm:ss.ffffffZ",[Globalization.CultureInfo]::InvariantCulture);facts=@{};limitations=@();provenance=@()}
  $provenance=@{
-  'windows.os_version'='https://learn.microsoft.com/en-us/windows/win32/cimwin32prov/win32-operatingsystem'
-  'windows.system_capacity'='https://learn.microsoft.com/en-us/windows/win32/cimwin32prov/win32-operatingsystem'
   'windows.update_context'='https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.management/get-hotfix'
   'windows.system_event_metadata'='https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.diagnostics/get-winevent'
   'windows.update_event_metadata'='https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.diagnostics/get-winevent'
@@ -220,30 +233,16 @@ function Invoke-WindowsDiagnostic {
  try {
   $facts=@{}
   switch -Exact ($Request.recipe_id) {
-   'windows.os_version' {
-    $os=CimCmdlets\Get-CimInstance -ClassName Win32_OperatingSystem -Property Version,BuildNumber -ErrorAction Stop
-    $architecture='unknown'
-    try { $native=[Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString();if ($native -ceq 'X64') { $architecture='x64' } elseif ($native -ceq 'Arm64') { $architecture='arm64' } elseif ($native -ceq 'X86') { $architecture='x86' } } catch { $architecture='unknown' }
-    $facts=@{version=[string]$os.Version;build=[string]$os.BuildNumber;architecture=$architecture}
-    $result.limitations=@('Version context does not establish support, update completeness or security remediation.')
-   }
-   'windows.system_capacity' {
-    $os=CimCmdlets\Get-CimInstance -ClassName Win32_OperatingSystem -Property TotalVisibleMemorySize,FreePhysicalMemory -ErrorAction Stop
-    $facts=@{total_bytes=([long]$os.TotalVisibleMemorySize*1024L);available_bytes=([long]$os.FreePhysicalMemory*1024L)}
-    $result.limitations=@('Memory availability is a momentary observation; it does not identify the cause of a slowdown.')
-   }
    'windows.update_context' {
-    $updates=@(Microsoft.PowerShell.Management\Get-HotFix -ErrorAction Stop | Where-Object { $_.HotFixID -cmatch '\AKB[0-9]{4,10}\z' } | Microsoft.PowerShell.Utility\Sort-Object -Property HotFixID | Microsoft.PowerShell.Utility\Select-Object -First 50 | ForEach-Object { $stamp=$null;if ($_.InstalledOn -is [datetime]) { $stamp=$_.InstalledOn.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ") };@{kb_id=[string]$_.HotFixID;installed_utc=$stamp} })
+    $updates=@(Microsoft.PowerShell.Management\Get-HotFix -ErrorAction Stop | Where-Object { $_.HotFixID -cmatch '\AKB[0-9]{4,10}\z' } | Microsoft.PowerShell.Utility\Sort-Object -Property HotFixID | Microsoft.PowerShell.Utility\Select-Object -First 50 | ForEach-Object { ConvertTo-DiagnosticUpdateRow $_ })
     $facts=@{updates=$updates};$result.limitations=@('Only up to 50 CBS-reported hotfix records are shown. This is not complete update history or evidence that no restart or update is pending.')
    }
    { $_ -in @('windows.system_event_metadata','windows.update_event_metadata') } {
-    $filter=@{StartTime=$now.AddHours(-$window);EndTime=$now;Level=@(1,2,3)}
-    if ($Request.recipe_id -eq 'windows.update_event_metadata') { $filter.LogName='Microsoft-Windows-WindowsUpdateClient/Operational';$filter.ProviderName='Microsoft-Windows-WindowsUpdateClient' }
-    else { $filter.LogName='System';$filter.ProviderName=@('Microsoft-Windows-Kernel-Power','EventLog','Microsoft-Windows-WHEA-Logger','disk','Ntfs','volmgr');$filter.Id=@(7,11,15,17,18,19,20,41,51,55,57,98,129,140,153,157,161,6008) }
+    $filter=Get-DiagnosticEventFilter $Request.recipe_id $now $window
     # Do not access Message, Properties, ToXml, UserId or MachineName.
     try { $rows=@(Microsoft.PowerShell.Diagnostics\Get-WinEvent -FilterHashtable $filter -MaxEvents $maximum -ErrorAction Stop) }
     catch { if ($_.FullyQualifiedErrorId -like 'NoMatchingEventsFound*') { $rows=@() } else { throw } }
-    $events=@($rows | ForEach-Object { @{event_id=[int]$_.Id;provider=[string]$_.ProviderName;level=[int]$_.Level;observed_utc=$_.TimeCreated.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")} })
+    $events=@($rows | ForEach-Object { ConvertTo-DiagnosticEventRow $_ })
     $facts=@{events=$events};$result.limitations=@('Selected bounded event metadata only. Messages and payloads were not accessed. Missing events do not prove a healthy system or establish a cause.')
    }
   }

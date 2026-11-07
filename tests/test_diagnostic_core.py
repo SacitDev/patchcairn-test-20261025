@@ -1,4 +1,4 @@
-"""Fictional diagnostic records only; all fixtures remain in owned work/."""
+"""Fictional diagnostic records only; all fixtures remain in owned work/ and are removed (a link or junction first)."""
 from __future__ import annotations
 import copy
 from datetime import datetime, timedelta, timezone
@@ -6,15 +6,19 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
+import shutil
 import sys
 import unittest
 from unittest import mock
+from urllib.parse import urlsplit
 import uuid
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).absolute().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
-from diagnostic_core import DiagnosticRefusal, sanitize_text, validate_adapter_result
+import diagnostic_core
+from diagnostic_core import DiagnosticRefusal, sanitize_text, validate_adapter_result, validate_request
 from workflow_service import DiagnosticStore
 import pc_records
 from clock_helpers import start_forward_only_clock, utc_now
@@ -26,10 +30,16 @@ PRIVATE_CAPABILITY_HOLDS = frozenset({
 })
 
 
+def remove_link(path):
+    """Remove a symbolic link or junction itself, never what it points to."""
+    if path.is_symlink() or getattr(os.path, "isjunction", lambda _: False)(path):
+        os.rmdir(path) if os.name == "nt" else path.unlink()
+
+
 class DiagnosticCoreTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        # Capability probe only; a missing capability skips each test with a tagged reason (D-023).
+        # Capability probe only; a missing capability skips each test with a tagged reason.
         cls.private_hold = None
         if os.name == "posix":
             probe = ROOT / "work" / ("dc-probe-" + uuid.uuid4().hex)
@@ -39,6 +49,8 @@ class DiagnosticCoreTests(unittest.TestCase):
                 if exc.code not in PRIVATE_CAPABILITY_HOLDS:
                     raise
                 cls.private_hold = exc.code
+            finally:
+                shutil.rmtree(probe, ignore_errors=True)
 
     def setUp(self):
         if self.private_hold:
@@ -46,6 +58,7 @@ class DiagnosticCoreTests(unittest.TestCase):
         start_forward_only_clock(self)
         self.root = ROOT / "work" / ("dc-" + uuid.uuid4().hex)
         self.root.mkdir(parents=True)
+        self.addCleanup(shutil.rmtree, self.root)
         self.store = DiagnosticStore(self.root)
         self.receipt = self.store.create_request(platform="macos", recipe_id="macos.os_version",
                     symptom="Fictional application could not start.", scope=["os_metadata"])
@@ -184,7 +197,7 @@ class DiagnosticCoreTests(unittest.TestCase):
                 validate_adapter_result(request, bad)
 
     def test_result_time_tolerates_a_small_clock_step_but_not_a_future_date(self):
-        # WSL2 and NTP can step the clock back between two reads (#80); pc_records' tolerance applies.
+        # WSL2 and NTP can step the clock back between two reads; pc_records' tolerance applies.
         request = self.store.create_request(platform="windows", recipe_id="windows.update_event_metadata", symptom="Fictional error", scope=[])["record"]
         result = self.adapter()
         for key in ("request_id", "platform", "recipe_id"):
@@ -202,7 +215,7 @@ class DiagnosticCoreTests(unittest.TestCase):
                         validate_adapter_result(request, result)
 
     def test_result_before_its_request_is_a_clock_step_or_refused(self):
-        # D-056: ordering keeps no tolerance; a gap within pc_records' future-skew bound is reported as a clock step.
+        # Ordering keeps no tolerance; a gap within pc_records' future-skew bound is reported as a clock step.
         request = self.store.create_request(platform="windows", recipe_id="windows.update_event_metadata", symptom="Fictional error", scope=[])["record"]
         result = self.adapter()
         for key in ("request_id", "platform", "recipe_id"):
@@ -275,14 +288,19 @@ class DiagnosticCoreTests(unittest.TestCase):
             _winapi.CreateJunction(str(target), str(link))
         else:
             link.symlink_to(target, target_is_directory=True)
+        self.addCleanup(remove_link, link)  # runs before the tree is removed
         with self.assertRaises(DiagnosticRefusal):
             DiagnosticStore(link)
+        remove_link(link)
+        self.assertFalse(os.path.lexists(link))
+        self.assertTrue(target.is_dir())
 
 
 class DiagnosticPrivacyTests(unittest.TestCase):
     def fixture_root(self):
         root = ROOT / "work" / ("dp-" + uuid.uuid4().hex[:16])
         root.mkdir(parents=True)
+        self.addCleanup(shutil.rmtree, root)
         return root
 
     def test_namespace_refusal_precedes_private_record_writer(self):
@@ -361,6 +379,94 @@ class DiagnosticPrivacyTests(unittest.TestCase):
             with self.assertRaises(PrivateWorkspaceError):
                 store.read_record(receipt["record"]["request_id"], receipt["record_id"])
             opened.assert_not_called()
+
+
+class RecipeTableTests(unittest.TestCase):
+    """The read-only recipe table: official sources, held health checks, the helper marks and the inventory queries."""
+
+    def request(self, recipe_id, platform):
+        return {"schema": diagnostic_core.SCHEMA, "schema_version": 1, "kind": "request", "request_id": "diag-" + uuid.uuid4().hex,
+                "platform": platform, "recipe_id": recipe_id, "mode": "fixture", "symptom": "Fictional error E42.", "scope": [],
+                "observed_utc": pc_records.utc_now()}
+
+    def result(self, request, **changes):
+        result = {key: request[key] for key in ("schema", "schema_version", "request_id", "platform", "recipe_id", "mode")}
+        result.update(kind="adapter_result", status="held", observed_utc=pc_records.utc_now(), facts={},
+                      limitations=["Fictional held result."], provenance=list(diagnostic_core.TABLE[request["recipe_id"]].sources))
+        result.update(changes)
+        return result
+
+    def test_every_requestable_recipe_is_read_only_with_an_official_source(self):
+        table = diagnostic_core.TABLE
+        self.assertEqual(diagnostic_core.RECIPES, {recipe_id: row.platform for recipe_id, row in table.items()})
+        for recipe_id, row in table.items():
+            with self.subTest(recipe=recipe_id):
+                self.assertEqual(recipe_id.split(".")[0], row.platform)
+                self.assertIn(row.run, {"runner", "in_process", "helper", "inventory"})
+                if row.run == "inventory":
+                    self.assertFalse(row.held)
+                    with self.assertRaises(DiagnosticRefusal):
+                        validate_request(self.request(recipe_id, row.platform))
+                    continue
+                request = validate_request(self.request(recipe_id, row.platform))
+                self.assertTrue(row.sources)
+                for url in row.sources:
+                    parts = urlsplit(url)
+                    self.assertEqual(parts.scheme, "https")
+                    self.assertTrue(parts.hostname in diagnostic_core.SOURCES or url == table["macos.root_capacity"].sources[0], url)
+                # The result checker admits each source exactly as the recipe gives it.
+                self.assertEqual(validate_adapter_result(request, self.result(request))["provenance"], list(row.sources))
+                self.assertEqual(row.run == "runner" and not row.held, recipe_id in diagnostic_core.ARGV)
+
+    def test_unverified_and_elevated_health_checks_hold_with_their_reason(self):
+        self.assertEqual(set(diagnostic_core.HELD), {"linux.dpkg_audit", "linux.rpm_verify", "windows.dism_check_health", "windows.sfc_verify_only"})
+        for recipe_id in ("windows.dism_check_health", "windows.sfc_verify_only"):
+            self.assertIn("needs an administrator prompt, which PatchCairn never opens", diagnostic_core.HELD[recipe_id])
+        for recipe_id in ("linux.dpkg_audit", "linux.rpm_verify"):
+            self.assertIn("without administrator rights is not verified yet", diagnostic_core.HELD[recipe_id])
+        for recipe_id, reason in diagnostic_core.HELD.items():
+            with self.subTest(recipe=recipe_id):
+                self.assertEqual(sanitize_text(reason, limit=1024), reason)  # a limitation keeps it unchanged
+                self.assertNotIn(recipe_id, diagnostic_core.ARGV)
+                request = self.request(recipe_id, diagnostic_core.RECIPES[recipe_id])
+                self.assertEqual(validate_adapter_result(request, self.result(request))["status"], "held")
+                with self.assertRaises(DiagnosticRefusal):  # a held recipe has no observed facts
+                    validate_adapter_result(request, self.result(request, status="observed", facts={"events": []}))
+
+    def test_helper_recipes_are_marked_and_the_rest_need_no_powershell(self):
+        self.assertEqual(diagnostic_core.HELPER_RECIPES, {"windows.update_context", "windows.system_event_metadata", "windows.update_event_metadata"})
+        self.assertEqual({recipe_id for recipe_id, row in diagnostic_core.TABLE.items() if row.run == "in_process"},
+                         {"windows.os_version", "windows.system_capacity"})
+        self.assertEqual(set(diagnostic_core.INVENTORY_RECIPES), {
+            "linux.dpkg_installed", "linux.rpm_installed", "linux.snap_list", "linux.flatpak_system", "macos.sw_vers", "macos.machine",
+            "macos.arm64_capable", "macos.translated", "macos.developer_dir", "macos.receipts"})
+        with self.assertRaises(TypeError):
+            diagnostic_core.ARGV["linux.kernel_version"] = (("/opt/fictional/uname",), ())
+
+    def test_every_event_provider_the_helper_asks_for_passes_both_allow_lists(self):
+        # Ntfs events 98 and 140 are written by Microsoft-Windows-Ntfs; the older Ntfs provider writes 55.
+        helper = (ROOT / "scripts" / "diagnostic_windows.ps1").read_text(encoding="utf-8")
+
+        def names(variable):
+            return re.findall(r"'([^']+)'", re.search(re.escape(variable) + r"=@\(([^)]*)\)", helper).group(1))
+
+        asked, allowed = names("$filter.ProviderName"), names("$providers")
+        self.assertLessEqual({"Ntfs", "Microsoft-Windows-Ntfs"}, set(asked))
+        self.assertLessEqual(set(asked), set(allowed))
+        request = self.request("windows.system_event_metadata", "windows")
+        for provider in allowed:
+            with self.subTest(provider=provider):
+                facts = {"events": [{"event_id": 140, "provider": provider, "level": 3, "observed_utc": "2026-01-01T00:00:00Z"}]}
+                self.assertEqual(validate_adapter_result(request, self.result(request, status="observed", facts=facts))["facts"], facts)
+
+    def test_only_a_held_result_names_a_known_hold(self):
+        request = self.request("windows.update_context", "windows")
+        for hold in sorted(diagnostic_core.HOLDS):
+            self.assertEqual(validate_adapter_result(request, self.result(request, hold=hold))["hold"], hold)
+        failed = self.result(request, status="failed", hold="windows-script-policy")
+        for bad in (self.result(request, hold="fictional-hold"), self.result(request, hold=["windows-script-policy"]), failed):
+            with self.subTest(hold=bad["hold"], status=bad["status"]), self.assertRaises(DiagnosticRefusal):
+                validate_adapter_result(request, bad)
 
 
 if __name__ == "__main__":
