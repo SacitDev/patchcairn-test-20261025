@@ -33,7 +33,7 @@ import engine_plans
 from workflow_core import JOBS, WorkflowEngine, WorkflowRefusal, PrivacyCapabilityHold, digest, encoded
 import pc_records
 from clock_helpers import start_forward_only_clock
-from work_fixtures import remove_tree
+from work_fixtures import PRIVATE_CAPABILITY_HOLDS, remove_tree
 
 WORK = ROOT / "work" / "wf"
 
@@ -48,6 +48,8 @@ def posix_private_storage_capability(parent):
         private_workspace.ensure_private_directory(directory, create=True)
         private_workspace.write_private_new(directory / "fixture.bin", b"Fictional permission-capability fixture")
     except private_workspace.PrivateWorkspaceError as error:
+        if error.code not in PRIVATE_CAPABILITY_HOLDS:
+            raise
         return False, error.code
     for path, expected in ((directory, 0o700), (directory / "fixture.bin", 0o600)):
         info = path.stat()
@@ -252,7 +254,7 @@ class WorkflowFixture(unittest.TestCase):
         try:
             self.engine = WorkflowEngine(self.root, verify_artifact=self.verify_artifact)
         except PrivacyCapabilityHold as error:
-            if os.name == "posix":
+            if os.name == "posix" and error.code in PRIVATE_CAPABILITY_HOLDS:
                 self.skipTest("only on posix: actual workspace POSIX private-storage capability unavailable: " + str(error))
             raise
         self.scope = {"roots": ["fictional-selected-folder"], "purpose": "Fictional fixture only; no host collection"}
@@ -572,7 +574,6 @@ class WorkflowTests(WorkflowFixture):
         # The journal is written under its byte cap alone, so it must read back with more events than one list may
         # hold by default (about 33 MB here, under the 64 MB cap).
         directory = self.engine.journal.directory(self.sid)
-        self.addCleanup((directory / "session.json").unlink, missing_ok=True)
         bundle = engine_journal.decode_record((directory / "session.json").read_bytes(), max_bytes=engine_journal.JOURNAL_MAX_BYTES)
         state, events = bundle["state"], bundle["events"]
         while len(events) < pc_records.DEFAULT_MAX_ITEMS:
@@ -728,9 +729,10 @@ class AdmissionMessageTests(unittest.TestCase):
                   "Native private engine storage admission held: private-path-invalid"),
                  (private_workspace.PrivateWorkspaceError("private-dacl-unavailable", "the folder's access list cannot be read"), PrivacyCapabilityHold,
                   "Native private storage is unavailable: private-dacl-unavailable (the folder's access list cannot be read)"),
-                 # The Linux file-system check refused for a reason it does not name: still no owner-only storage here.
-                 (private_workspace.PrivateWorkspaceError("private-linux-filesystem-refused"), PrivacyCapabilityHold,
-                  "Native private storage is unavailable: private-linux-filesystem-refused"),
+                 # The Linux file-system check refused for a reason it does not name: it stops with its code, never as a
+                 # missing capability that a test probe would skip.
+                 (private_workspace.PrivateWorkspaceError("private-linux-filesystem-refused"), WorkflowRefusal,
+                  "Native private engine storage admission held: private-linux-filesystem-refused"),
                  (private_workspace.PrivateWorkspaceError("private-darwin-acl-not-empty"), WorkflowRefusal,
                   "Native private engine storage admission held: private-darwin-acl-not-empty"))
         for error, kind, message in cases:

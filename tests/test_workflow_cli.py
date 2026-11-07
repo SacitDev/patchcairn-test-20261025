@@ -24,7 +24,7 @@ import patchcairn_service as service_cli
 from workflow_service import ServiceRefusal
 from test_packages import FakeChild, FakeTerminal, fake_route, remove_fixture_roots
 from test_service_updates import harness
-from work_fixtures import remove_tree
+from work_fixtures import PRIVATE_CAPABILITY_HOLDS, remove_tree
 
 
 def older_folder_message(folder):
@@ -119,6 +119,8 @@ class WorkflowCliTests(unittest.TestCase):
             try:
                 WorkflowEngine(probe)
             except PrivacyCapabilityHold as error:
+                if error.code not in PRIVATE_CAPABILITY_HOLDS:
+                    raise
                 cls.storage_available, cls.storage_reason = False, str(error)
             finally:
                 remove_tree(probe)

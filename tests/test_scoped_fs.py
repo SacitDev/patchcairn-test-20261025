@@ -11,7 +11,6 @@ import ctypes
 import errno
 import os
 from pathlib import Path
-import shutil
 import stat
 import subprocess
 import sys
@@ -24,6 +23,7 @@ sys.dont_write_bytecode = True
 ROOT = Path(__file__).absolute().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 import scoped_fs as fs
+from work_fixtures import remove_tree
 
 
 class ContractTests(unittest.TestCase):
@@ -416,7 +416,7 @@ class PosixTests(unittest.TestCase):
     def setUp(self):
         self.base = ROOT / "work" / "test-fixtures" / "filesystem" / ("fixture-" + uuid.uuid4().hex)
         self.base.mkdir(parents=True)
-        self.addCleanup(shutil.rmtree, self.base)
+        self.addCleanup(remove_tree, self.base)
         self.source = self.base / "selected"
         self.source.mkdir()
         self.target = self.base / "quarantine"
@@ -767,7 +767,7 @@ class PosixRootTests(unittest.TestCase):
     def setUp(self):
         self.base = ROOT / "work" / "test-fixtures" / "filesystem" / ("posix-root-" + uuid.uuid4().hex)
         (self.base / "selected").mkdir(parents=True)
-        self.addCleanup(shutil.rmtree, self.base)
+        self.addCleanup(remove_tree, self.base)
         self.root = fs.PosixRoot(str(self.base / "selected"))
         self.addCleanup(self.root.close)
 
@@ -1005,7 +1005,7 @@ class PosixRootTests(unittest.TestCase):
         say why (its evidence is the macos-latest CI legs)."""
         folder = self.base / "selected" / "acl-folder"
         folder.mkdir(mode=0o700)
-        # Runs before the fixture's rmtree (cleanups run last added first): the entry denies delete to the owner too.
+        # Runs before the fixture's removal (cleanups run last added first): the entry denies delete to the owner too.
         self.addCleanup(subprocess.run, ["chmod", "-N", str(folder)], check=True, capture_output=True)
         subprocess.run(["chmod", "+a", "everyone deny delete", str(folder)], check=True, capture_output=True, encoding="utf-8")
         descriptor = os.open(folder, os.O_RDONLY | os.O_DIRECTORY)
@@ -1098,7 +1098,7 @@ class ReservedNameOnRealFoldersTests(unittest.TestCase):
     def setUp(self):
         self.base = ROOT / "work" / "test-fixtures" / "filesystem" / ("reserved-" + uuid.uuid4().hex)
         self.base.mkdir(parents=True)
-        self.addCleanup(shutil.rmtree, self.base)
+        self.addCleanup(remove_tree, self.base)
         patches = (mock.patch.object(fs.sys, "platform", "darwin"), mock.patch.object(fs, "_rename_function", lambda: refusing_rename(errno.ENOTSUP)),
                    mock.patch.object(fs.darwin_privacy, "assert_no_extended_acl_fd"))
         for patch in patches:
@@ -1148,7 +1148,7 @@ class ExfatImageTests(unittest.TestCase):
         """A small ``filesystem`` image under this test's own work folder, attached with no Finder window; its mount point."""
         base = ROOT / "work" / "test-fixtures" / "filesystem" / ("image-" + uuid.uuid4().hex)
         (base / "mounted").mkdir(parents=True)
-        self.addCleanup(shutil.rmtree, base)
+        self.addCleanup(remove_tree, base)
         image = base / "fictional.dmg"
         subprocess.run(["/usr/bin/hdiutil", "create", "-size", "16m", "-fs", filesystem, "-volname", "PATCHCAIRN", str(image)],
                        check=True, capture_output=True, timeout=120)
@@ -1185,7 +1185,7 @@ class PosixRemovalTests(unittest.TestCase):
         self.folder = self.base / "removals" / "r1"
         (self.base / "selected").mkdir(parents=True)
         self.folder.mkdir(parents=True, mode=0o700)
-        self.addCleanup(shutil.rmtree, self.base)
+        self.addCleanup(remove_tree, self.base)
         self.root = fs.PosixRoot(str(self.base / "selected"))
         self.addCleanup(self.root.close)
         self.removal = fs.PosixRoot(str(self.folder))

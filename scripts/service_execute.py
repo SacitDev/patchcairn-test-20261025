@@ -21,7 +21,7 @@ import pc_records
 import scoped_base
 import scoped_fs
 import storage_contract
-from workflow_core import WorkflowEngine, WorkflowRefusal, digest, older_folder, no_links, STORAGE_ADAPTER
+from workflow_core import WorkflowEngine, WorkflowRefusal, digest, older_folder, no_links
 from storage_ops import StorageService, StorageRefusal, plan_sha256, restorable
 from storage_policy import MAX_FILE_BYTES
 from scoped_fs import ScopedFSError
@@ -206,7 +206,7 @@ class ExecuteMixin:
                 raise ServiceRefusal("Unsupported fixed storage adapter")
             chosen = [] if backup_destination is None else [str(backup_destination)]
             protections = sorted(set(self.protected_roots()) | set(protected_roots or []) | set(chosen))
-            payload = {"schema": STORAGE_ADAPTER, "schema_version": pc_records.SCHEMA_VERSION, "operation": adapter_id,
+            payload = {"schema": storage_contract.PAYLOAD, "schema_version": pc_records.SCHEMA_VERSION, "operation": adapter_id,
                        "storage_plan": copy.deepcopy(storage_plan), "storage_plan_sha256": plan_sha256(storage_plan),
                        "output_root": str(output_root), "mode": state["mode"], "protected_roots": protections}
             if restore_probe_destination is not None:
@@ -318,7 +318,7 @@ class ExecuteMixin:
         """The engine's admission, then the effect boundary (entered.json), then ``effect``, an ``_effect_<id>`` method,
         with the effect arguments. A pause or stop the admission refuses finishes the operation "failed" with no boundary
         and no effect, with ``paused_receipt`` when the caller gives one. The effect's listed failures finish it as "unknown"
-        with a categorical receipt; others propagate."""
+        with a categorical receipt; others, and a clock-step refusal, propagate and leave the step open."""
         try:
             self.engine.admit_effect(session_id, operation_id=operation["operation_id"])
         except WorkflowRefusal as error:
@@ -331,6 +331,8 @@ class ExecuteMixin:
         try:
             return effect(session_id, state, operation, action, payload, path, intent, **effect_arguments)
         except (StorageRefusal, ScopedFSError, DiagnosticRefusal, OSError, ValueError) as exc:
+            if getattr(exc, "code", None) == "clock-step":  # the step stays open and the refusal reaches the caller
+                raise
             # A move/write can finish before its receipt. Error text may
             # contain private paths. Preserve only a categorical failure.
             return self._finish(self.engine.read_session(session_id), operation, outcome="unknown",

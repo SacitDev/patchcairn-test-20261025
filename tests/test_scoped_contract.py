@@ -17,7 +17,6 @@ import io
 import itertools
 import os
 from pathlib import Path
-import shutil
 import stat
 import struct
 import sys
@@ -1446,7 +1445,7 @@ class PosixRootContractTests(RootContract, unittest.TestCase):
         self.case = FIXTURES / ("posix-contract-" + uuid.uuid4().hex)
         (self.case / "root").mkdir(parents=True)
         (self.case / "outside").mkdir()
-        self.addCleanup(shutil.rmtree, self.case)
+        self.addCleanup(remove_tree, self.case)
         (self.case / "outside" / "Probe").write_bytes(b"")
         if (self.case / "outside" / "PROBE").exists():
             self.absent_capabilities = frozenset({"alias", "case-pair"})

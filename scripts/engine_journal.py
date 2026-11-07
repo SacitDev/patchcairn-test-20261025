@@ -25,7 +25,7 @@ SHA = pc_records.SHA256
 SERVICE_RECORD = "patchcairn.service"
 ASSESSMENT_ACCESS, ASSESSMENT_SUMMARY, ASSESSMENT_VERIFICATION = ("patchcairn.assessment.access", "patchcairn.assessment.summary",
                                                                   "patchcairn.assessment.verification")
-FIXTURE_ADAPTER, DIAGNOSTIC_ADAPTER, STORAGE_ADAPTER = "patchcairn.fixture.adapter", "patchcairn.diagnostic.adapter", "patchcairn.storage.adapter"
+FIXTURE_ADAPTER, DIAGNOSTIC_ADAPTER = "patchcairn.fixture.adapter", "patchcairn.diagnostic.adapter"
 RECOVERY_RETENTION, RECOVERY_BINDING, QUARANTINE_RECOVERY = "patchcairn.recovery.retention", "patchcairn.recovery.binding", "patchcairn.quarantine.recovery"
 PACKAGE, BOOT_OBSERVATION = "patchcairn.package", "patchcairn.boot.observation"
 # The fields of a package payload (an update or repair step): those every payload has, those of a run PatchCairn starts
@@ -102,8 +102,9 @@ def utc_time(value):
 
 def fresh(value, *, after=None, seconds=900):
     """pc_records.fresh as a WorkflowRefusal. A time ``value`` no more than pc_records' tolerance for clock steps before
-    ``after`` is refused as a clock step (diagnostic_core.stepped_back), not as out of order: the engine and the service
-    stamp both times in one flow, and a time a caller gives cannot be told apart from them, so it is read the same way."""
+    ``after`` (diagnostic_core.stepped_back) is refused with code clock-step and a message that names the gap, not a
+    cause: a small step back of the computer's clock gives such a gap, and so does a time a caller gives that really
+    comes just before ``after``. Either way nothing is stored, and observing again settles it."""
     try:
         checked(pc_records.fresh, value, after=after, seconds=seconds)
     except WorkflowRefusal as error:
@@ -137,8 +138,11 @@ _READERS = {name: pc_records.register_reader(name, _reader(name)) for name in RE
 
 
 def typed_record(value, name):
-    """Return ``value`` if it is a record of the engine family ``name`` with exactly its fields."""
-    return (pc_records.READERS[name] if name in _OWN_READERS else _READERS[name])(value)
+    """Return ``value`` if it is a record of the engine family ``name`` with exactly its fields; another family is refused."""
+    reader = pc_records.READERS.get(name) if name in _OWN_READERS else _READERS.get(name)
+    if reader is None:
+        raise WorkflowRefusal("Not a record family the engine reads: " + repr(name), code="schema-unregistered")
+    return reader(value)
 
 
 def ids(value, name="identifiers", *, allow_empty=True):

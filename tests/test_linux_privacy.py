@@ -6,7 +6,6 @@ import ctypes
 import os
 from pathlib import Path
 import re
-import shutil
 import stat
 import sys
 import types
@@ -18,6 +17,7 @@ sys.dont_write_bytecode = True
 ROOT = Path(__file__).absolute().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 import linux_privacy as privacy
+from work_fixtures import remove_tree
 
 
 def info(*, inode=101, directory=True, **changes):
@@ -457,7 +457,7 @@ def mount_type(path):
 def fixture_folder(test):
     folder = ROOT / "work" / "test-fixtures" / "filesystem" / ("privacy-fs-" + uuid.uuid4().hex)
     folder.mkdir(parents=True, mode=0o700)
-    test.addCleanup(shutil.rmtree, folder)
+    test.addCleanup(remove_tree, folder)
     return folder
 
 

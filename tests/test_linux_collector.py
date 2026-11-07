@@ -6,7 +6,6 @@ start), so every test runs on every OS. Fixture folders live under work/test-fix
 
 import importlib.util
 from pathlib import Path, PurePosixPath
-import shutil
 import stat
 import sys
 import uuid
@@ -20,6 +19,7 @@ sys.path.insert(0, str(_MODULE.parent))
 import pc_records
 import readonly_runner
 from pc_records import Refusal
+from work_fixtures import remove_tree
 _SPEC = importlib.util.spec_from_file_location("fixture_linux_collector", _MODULE)
 linux = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(linux)
@@ -36,7 +36,7 @@ def inventory_session(test, platform, *, authorized=True):
     import workflow_core
     root = WORK / ("fictional-engine-" + uuid.uuid4().hex)
     root.mkdir(parents=True)
-    test.addCleanup(shutil.rmtree, root)
+    test.addCleanup(remove_tree, root)
     engine = workflow_core.WorkflowEngine(root)
     access = {"schema": "patchcairn.assessment.access", "schema_version": 1, "target": "whole_device",
               "operations": ["metadata"], "local_content": [], "llm_content": [], "sensitive_exceptions": []}

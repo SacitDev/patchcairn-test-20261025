@@ -33,7 +33,8 @@ def _hold(code, message=None):
 
 # The refusals that mean this computer, drive or file system cannot give owner-only storage at all: the checks, or the
 # system calls they need, are missing or fail; the drive is not a fixed local one; or the file system ignores owners or
-# is refused as a whole. Every other code refuses one path: unsafe permissions, a link, an existing or a missing name.
+# cannot keep them. Every other code refuses one path (unsafe permissions, a NULL DACL too, a link, an existing or a
+# missing name), and so does a Linux or macOS refusal this module does not recognise: it stops PatchCairn with its code.
 CAPABILITY_CODES = frozenset({
     "private-platform-unavailable", "private-windows-api-unavailable", "private-token-unavailable", "private-descriptor-unavailable",
     "private-file-metadata-unavailable", "private-canonical-path-unavailable", "private-lock-unavailable", "private-fixed-local-volume-required",
@@ -43,10 +44,10 @@ CAPABILITY_CODES = frozenset({
     "private-darwin-acl-read-unavailable", "private-darwin-acl-release-unavailable", "private-darwin-acl-state-unavailable",
     "private-darwin-fs-capability-unavailable", "private-darwin-fs-abi-unavailable", "private-darwin-fs-api-unavailable",
     "private-darwin-fs-close-unavailable", "private-darwin-fs-descriptor-unavailable", "private-darwin-fs-path-unavailable",
-    "private-darwin-fs-query-unavailable", "private-darwin-fs-unsupported-filesystem", "private-darwin-fs-ownership-ignored", "private-darwin-fs-refused",
+    "private-darwin-fs-query-unavailable", "private-darwin-fs-unsupported-filesystem", "private-darwin-fs-ownership-ignored",
     "private-linux-filesystem-capability-unavailable", "private-linux-abi-unavailable", "private-linux-close-unavailable",
     "private-linux-descriptor-unavailable", "private-linux-filesystem-unavailable", "private-linux-foreign-filesystem",
-    "private-linux-identity-unavailable", "private-linux-libc-unavailable", "private-linux-path-unavailable", "private-linux-filesystem-refused",
+    "private-linux-identity-unavailable", "private-linux-libc-unavailable", "private-linux-path-unavailable",
 })
 
 

@@ -28,6 +28,7 @@ TESTS = Path(__file__).absolute().parent
 ROOT = TESTS.parent
 sys.path.insert(0, str(TESTS))
 import run_tests  # noqa: E402
+from work_fixtures import remove_tree  # noqa: E402
 
 PLATFORMS = ("windows", "linux", "macos")
 HERE = {"win32": "windows", "darwin": "macos"}.get(sys.platform, "linux")
@@ -76,7 +77,7 @@ def fixture_dir(test):
     """A new folder under work/test-fixtures/ that only this test owns, removed when the test ends."""
     path = ROOT / "work" / "test-fixtures" / f"skip-audit-{uuid.uuid4().hex}"
     path.mkdir(parents=True)
-    test.addCleanup(shutil.rmtree, path)
+    test.addCleanup(remove_tree, path)
     return path
 
 

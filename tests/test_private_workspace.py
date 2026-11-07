@@ -9,8 +9,8 @@ from contextlib import contextmanager
 import errno
 import os
 from pathlib import Path, PurePosixPath
+import ast
 import re
-import shutil
 import stat
 import sys
 import unittest
@@ -24,7 +24,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import pc_paths
 import private_workspace as private
 import win32_files
-from work_fixtures import remove_tree
+from work_fixtures import PRIVATE_CAPABILITY_HOLDS, remove_tree
 
 FIXTURES = ROOT / "work" / "test-fixtures"
 NAME_RULE_MESSAGE = '" is one PatchCairn does not accept (a reserved Windows name, too long, or an unsupported character)'
@@ -127,7 +127,8 @@ class WindowsPrivateWorkspaceTests(unittest.TestCase):
         shared = self.node_with_descriptor("null-dacl", "D:NO_ACCESS_CONTROL")
         with self.assertRaises(private.PrivateWorkspaceError) as caught:
             private.ensure_private_directory(shared)
-        self.assertTrue(caught.exception.code == "private-dacl-unavailable-or-null")
+        self.assertTrue(caught.exception.code == "private-dacl-null")
+        self.assertFalse(private.capability_missing(caught.exception))  # this folder is refused, not the computer
 
     def test_inherit_only_broad_ace_and_unsupported_ace_refuse(self):
         for name, suffix in (
@@ -466,13 +467,15 @@ class PathRuleTests(unittest.TestCase):
 class PosixPrivateWorkspaceTests(unittest.TestCase):
     def test_private_modes_or_honest_non_enforcing_filesystem_hold(self):
         path = FIXTURES / ("posix-" + uuid.uuid4().hex)
-        self.addCleanup(shutil.rmtree, path, True)
         try:
             private.ensure_private_directory(path, create=True, parents=True)
         except private.PrivateWorkspaceError as error:
+            if os.path.lexists(path):  # made, then refused
+                self.addCleanup(remove_tree, path)
             self.assertTrue(error.code == "private-owner-or-mode-refused" or error.code.startswith(("private-darwin-acl-", "private-linux-")))
             self.assertFalse((path / "fictional.bin").exists())
             return
+        self.addCleanup(remove_tree, path)
         private.write_private_new(path / "fictional.bin", b"fictional POSIX private bytes")
         self.assertTrue(stat.S_IMODE(path.stat().st_mode) == 0o700)
         self.assertTrue(stat.S_IMODE((path / "fictional.bin").stat().st_mode) == 0o600)
@@ -498,7 +501,7 @@ class PublishTests(unittest.TestCase):
         try:
             private.ensure_private_directory(self.folder, create=True, parents=True)
         except private.PrivateWorkspaceError as error:
-            if os.name == "posix":
+            if os.name == "posix" and error.code in PRIVATE_CAPABILITY_HOLDS:
                 self.skipTest("only on posix: actual workspace POSIX private-storage capability unavailable: " + error.code)
             raise
         self.addCleanup(remove_tree, self.folder)
@@ -577,10 +580,11 @@ class RefusalTypeTests(unittest.TestCase):
 
     def test_a_missing_capability_is_told_apart_from_a_refused_path(self):
         missing = ("private-platform-unavailable", "private-persistent-acl-unavailable", "private-linux-foreign-filesystem",
-                   "private-darwin-fs-ownership-ignored", "private-linux-filesystem-refused", "private-darwin-fs-refused",
-                   "private-fixed-local-volume-required", "private-lock-unavailable")
-        refused = ("private-owner-or-mode-refused", "private-dacl-broad-or-unknown", "private-dacl-unsupported", "private-darwin-acl-not-empty",
-                   "private-darwin-acl-refused", "private-linux-path-changed", "private-directory-exists", "private-path-invalid", "private-lock-held",
+                   "private-darwin-fs-ownership-ignored", "private-fixed-local-volume-required", "private-lock-unavailable")
+        # A Linux or macOS refusal this module does not recognise stops PatchCairn with its code, like a refused path.
+        refused = ("private-owner-or-mode-refused", "private-dacl-broad-or-unknown", "private-dacl-unsupported", "private-dacl-null",
+                   "private-darwin-acl-not-empty", "private-darwin-acl-refused", "private-linux-path-changed", "private-directory-exists",
+                   "private-path-invalid", "private-lock-held", "private-linux-filesystem-refused", "private-darwin-fs-refused",
                    "private-unavailable-fictional")
         for codes, expected in ((missing, True), (refused, False)):
             for code in codes:
@@ -588,15 +592,44 @@ class RefusalTypeTests(unittest.TestCase):
                     self.assertIs(private.capability_missing(private.PrivateWorkspaceError(code, "fictional reason")), expected)
         self.assertIs(private.capability_missing(ValueError("private-platform-unavailable")), False)
 
+    # Every other private-* code the four modules give: each refuses one path (or is a refusal nobody recognised).
+    REFUSED_PATH_CODES = frozenset({
+        "private-boundary-escape", "private-bytes-required", "private-canonical-path-mismatch", "private-dacl-broad-or-unknown",
+        "private-dacl-inheritance-or-access-refused", "private-dacl-invalid", "private-dacl-not-exact", "private-dacl-null",
+        "private-dacl-unprotected", "private-dacl-unsupported", "private-darwin-acl-invalid", "private-darwin-acl-not-empty",
+        "private-darwin-acl-ordinary-path-required", "private-darwin-acl-path-changed", "private-darwin-acl-path-invalid",
+        "private-darwin-acl-refused", "private-darwin-fs-ordinary-path-required", "private-darwin-fs-path-changed",
+        "private-darwin-fs-path-invalid", "private-darwin-fs-refused", "private-directory-changed", "private-directory-create-refused",
+        "private-directory-exists", "private-directory-missing", "private-file-changed", "private-file-create-refused",
+        "private-file-flush-unresolved", "private-file-publish-unresolved", "private-file-write-unresolved", "private-link-or-type-refused",
+        "private-linux-filesystem-refused", "private-linux-ordinary-path-required", "private-linux-path-changed", "private-linux-path-invalid",
+        "private-local-path-required", "private-lock-held", "private-owner-or-acl-invalid", "private-owner-or-mode-refused",
+        "private-owner-refused", "private-path-access-refused", "private-path-invalid", "private-root-refused",
+    })
+
+    @staticmethod
+    def given_codes():
+        """The private-* codes read from the source: private_workspace's own, the Windows checks' unchanged, and the Linux
+        and macOS checks' renamed. The CAPABILITY_CODES assignment is left out, so the set cannot vouch for its own names."""
+        def source(module):
+            return (ROOT / "scripts" / (module + ".py")).read_text(encoding="utf-8")
+        text = source("private_workspace")
+        (node,) = [node for node in ast.parse(text).body if isinstance(node, ast.Assign)
+                   and any(isinstance(target, ast.Name) and target.id == "CAPABILITY_CODES" for target in node.targets)]
+        lines = text.splitlines()
+        text = "\n".join(lines[:node.lineno - 1] + lines[node.end_lineno:])
+        quoted = r'"(private-[a-z-]*[a-z])"'
+        codes = set(re.findall(quoted, text)) | set(re.findall(quoted, source("win32_files")))
+        codes |= {"private-" + code for code in re.findall(r'"(darwin-(?:acl|fs)-[a-z-]*[a-z])"', source("darwin_privacy"))}
+        return codes | {"private-linux-" + code for code in re.findall(r'"linux-private-([a-z-]*[a-z])"', source("linux_privacy"))}
+
     def test_capability_codes_are_codes_this_module_gives(self):
-        # private_workspace gives its own codes, the Windows checks' codes unchanged, and the Linux and macOS checks' codes
-        # renamed; a code renamed in any of them must leave no stale name in the set.
-        def given(module, pattern):
-            return set(re.findall(pattern, (ROOT / "scripts" / (module + ".py")).read_text(encoding="utf-8")))
-        codes = given("private_workspace", r'"(private-[a-z-]*[a-z])"') | given("win32_files", r'"(private-[a-z-]*[a-z])"')
-        codes |= {"private-" + code for code in given("darwin_privacy", r'"(darwin-(?:acl|fs)-[a-z-]*[a-z])"')}
-        codes |= {"private-linux-" + code for code in given("linux_privacy", r'"linux-private-([a-z-]*[a-z])"')}
-        self.assertLessEqual(private.CAPABILITY_CODES, codes)
+        given = self.given_codes()
+        self.assertLessEqual(private.CAPABILITY_CODES, given)  # no stale or misspelt name in the set
+        self.assertFalse(private.CAPABILITY_CODES | {"private-fictional-unavailable"} <= given)  # and a name nothing gives is caught
+        # The other way: every code given is sorted on purpose, as a missing capability or as one refused path.
+        self.assertEqual(given - private.CAPABILITY_CODES, self.REFUSED_PATH_CODES)
+        self.assertLessEqual(PRIVATE_CAPABILITY_HOLDS - {"private-owner-or-mode-refused"}, private.CAPABILITY_CODES)
 
 
 if __name__ == "__main__":

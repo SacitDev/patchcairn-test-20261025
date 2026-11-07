@@ -126,8 +126,10 @@ def parse_time(value):
     return _shared(pc_records.parse_utc, value)
 
 
-# A backward step of the computer's clock between two times PatchCairn stamped in one flow.
-CLOCK_STEP_MESSAGE = "The computer's clock moved back while PatchCairn was working; observe again."
+# A time just before the one it must follow (stepped_back). It names the gap, not a cause: a small step back of the
+# computer's clock gives one, and so does a time given that really comes first.
+CLOCK_STEP_MESSAGE = (f"This time is up to {pc_records.FUTURE_SKEW_SECONDS:g} seconds before the step it must follow, as happens "
+                      "when the computer's clock is set back; observe again.")
 
 
 def stepped_back(observed, after):

@@ -12,7 +12,6 @@ import hashlib
 import itertools
 from pathlib import Path
 import re
-import shutil
 import sys
 import unicodedata
 import unittest
@@ -28,6 +27,7 @@ import pc_records
 import report
 import workflow_core
 from clock_helpers import start_forward_only_clock
+from work_fixtures import remove_tree
 
 WORK = ROOT / "work" / "test-fixtures"
 TEMPLATE = ROOT / "templates" / "report.html"
@@ -162,7 +162,7 @@ class ReportTests(unittest.TestCase):
     def engine(self):
         root = WORK / ("rp-" + uuid.uuid4().hex[:12])
         root.mkdir(parents=True)
-        self.addCleanup(shutil.rmtree, root)
+        self.addCleanup(remove_tree, root)
         return root, workflow_core.WorkflowEngine(root, verify_artifact=lambda binding: None)
 
     def driven_session(self):

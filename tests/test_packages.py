@@ -15,7 +15,6 @@ import ntpath
 import os
 import re
 import shlex
-import shutil
 from pathlib import Path, PurePosixPath
 import stat
 import sys
@@ -40,6 +39,7 @@ from clock_helpers import utc_now  # noqa: E402
 from test_service_state import PROSE, SessionFixtures  # noqa: E402
 from workflow_core import WorkflowRefusal  # noqa: E402
 from workflow_service import ServiceRefusal  # noqa: E402
+from work_fixtures import remove_tree  # noqa: E402
 
 FIXTURES = ROOT / "tests" / "fixtures" / "packages"
 LOCAL_APPDATA = "D:\\PatchCairnTest\\LocalData"
@@ -203,7 +203,9 @@ def fixture_root():
 
 def remove_fixture_roots():
     while FIXTURE_ROOTS:
-        shutil.rmtree(FIXTURE_ROOTS.pop(), ignore_errors=True)
+        root = FIXTURE_ROOTS.pop()
+        if os.path.lexists(root):  # a test may have used none of its root
+            remove_tree(root)
 
 
 def tearDownModule():

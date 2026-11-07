@@ -16,6 +16,8 @@ import uuid
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).absolute().parent.parent
+sys.path.insert(0, str(ROOT / "tests"))  # -I leaves the script's own folder off the path
+from work_fixtures import remove_tree  # noqa: E402
 spec = importlib.util.spec_from_file_location("patchcairn_site_builder", ROOT / "scripts/build_site.py")
 site = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(site)
@@ -71,18 +73,12 @@ class SiteTests(unittest.TestCase):
     def setUp(self) -> None:
         self.fixture = TEST_BOUNDARY / ("fictional-" + uuid.uuid4().hex)
         self.fixture.mkdir()
+        self.addCleanup(remove_tree, self.fixture)
         for name, data in self.public_inputs.items():
             target = self.fixture / name
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(data)
         self.output = self.fixture / "work/site/output"
-
-    def tearDown(self) -> None:
-        # A fixed owned fixture only; resolve before recursive removal on Windows.
-        resolved = self.fixture.resolve()
-        if resolved.parent != TEST_BOUNDARY.resolve() or self.fixture.is_symlink():
-            raise AssertionError("Refuse cleanup outside the exact owned fixture")
-        shutil.rmtree(resolved)
 
     def build(self, **kwargs) -> dict:
         return site.build_site("work/site/output", root=self.fixture, **kwargs)

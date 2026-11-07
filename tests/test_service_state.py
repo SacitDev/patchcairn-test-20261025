@@ -26,12 +26,7 @@ from workflow_service import WorkflowService, ServiceRefusal, native_platform, v
 from storage_ops import StorageService
 from scoped_fs import ScopedFSError, ScopedRoot
 from private_workspace import PrivateWorkspaceError, ensure_private_directory, ensure_private_file, write_private_new
-from work_fixtures import remove_tree
-
-PRIVATE_CAPABILITY_HOLDS = frozenset({
-    "private-owner-or-mode-refused", "private-darwin-acl-capability-unavailable", "private-platform-unavailable",
-    "private-linux-foreign-filesystem", "private-linux-abi-unavailable", "private-linux-libc-unavailable", "private-linux-descriptor-unavailable",
-})
+from work_fixtures import PRIVATE_CAPABILITY_HOLDS, remove_tree
 
 def broad_namespace_fixture(namespace):
     """Make a new fixture folder broad when this host created it private: POSIX mode 0755 (an attack fixture, never
@@ -63,6 +58,8 @@ def capability_probe():
         try:
             WorkflowEngine(probe)
         except PrivacyCapabilityHold as exc:
+            if exc.code not in PRIVATE_CAPABILITY_HOLDS:
+                raise
             private_hold = str(exc)
             return native_move_supported, private_hold
         finally:

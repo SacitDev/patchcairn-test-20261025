@@ -11,7 +11,6 @@ import errno
 import os
 from pathlib import Path, PurePosixPath
 import plistlib
-import shutil
 import stat
 import subprocess
 import sys
@@ -29,6 +28,7 @@ import darwin_privacy as privacy
 import private_workspace as private
 import scoped_fs
 import storage_policy
+from work_fixtures import remove_tree
 
 
 def info(**changes):
@@ -601,7 +601,7 @@ class NativeMacTests(unittest.TestCase):
     def test_macos_volume_identity_is_the_uuid_diskutil_reports(self):
         folder = ROOT / "work" / "test-fixtures" / ("volume-" + uuid.uuid4().hex)
         folder.mkdir(parents=True)
-        self.addCleanup(shutil.rmtree, folder)
+        self.addCleanup(remove_tree, folder)
         identity = scoped_fs.volume_identity(str(folder))
         self.assertRegex(identity, r"\Amacos-volume:[0-9a-f-]{36}\Z")
         listing = subprocess.run(["/usr/sbin/diskutil", "info", "-plist", str(folder)], check=True, capture_output=True, timeout=120)

@@ -18,7 +18,7 @@ ROOT = Path(__file__).absolute().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 from scoped_fs import ScopedFSError
 from private_workspace import PrivateWorkspaceError, ensure_private_directory, write_private_new
-from work_fixtures import remove_tree
+from work_fixtures import PRIVATE_CAPABILITY_HOLDS, remove_tree
 import storage_contract
 import storage_policy
 from storage_ops import StorageRefusal, StorageService, canonical, plan_sha256, storage_capabilities
@@ -42,7 +42,7 @@ def fixture_directory(test):
     except PrivateWorkspaceError as exc:
         if os.path.lexists(path):
             remove_tree(path)
-        if os.name != "posix":
+        if os.name != "posix" or exc.code not in PRIVATE_CAPABILITY_HOLDS:
             raise
         raise unittest.SkipTest("only on posix: the actual filesystem cannot establish the required private namespace: " + exc.code) from exc
     test.addCleanup(remove_tree, path)
@@ -166,10 +166,11 @@ class StoragePrivacyAdmissionTests(unittest.TestCase):
         except PrivateWorkspaceError:
             # /mnt/c can report 0777 after a requested 0700 creation. A real
             # refusal is the required result; do not chmod, remount or move it.
+            if output.exists():
+                self.addCleanup(remove_tree, output)
             with self.assertRaisesRegex(StorageRefusal, "cannot use its work folder here"):
                 StorageService(output_root=output, quiet_workspace=True)
             if output.exists():
-                self.addCleanup(remove_tree, output)
                 self.assertEqual(list(output.iterdir()), [])
         else:
             self.addCleanup(remove_tree, output)

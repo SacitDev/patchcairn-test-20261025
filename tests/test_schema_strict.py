@@ -233,6 +233,9 @@ class RefusalBaseTests(unittest.TestCase):
                    "scope": ["os_metadata"], "observed_utc": "yesterday"}
         cases = ((lambda: workflow_core.typed_record({"schema": "patchcairn.boot.observation", "schema_version": "1"}, "patchcairn.boot.observation"),
                   workflow_core.WorkflowRefusal, "schema-version"),
+                 # A family the engine does not read (the storage payload is storage_contract's) is refused, not a KeyError.
+                 (lambda: workflow_core.typed_record({"schema": storage_contract.PAYLOAD, "schema_version": 1}, storage_contract.PAYLOAD),
+                  workflow_core.WorkflowRefusal, "schema-unregistered"),
                  (lambda: storage_ops.canonical({"text": "\ud800"}), storage_ops.StorageRefusal, "invalid-record"),
                  (lambda: diagnostic_core.validate_request(request), diagnostic_core.DiagnosticRefusal, "utc-time"))
         for call, cls, code in cases:

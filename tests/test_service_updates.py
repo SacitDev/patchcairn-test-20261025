@@ -18,7 +18,6 @@ import io
 import json
 import os
 from pathlib import Path, PureWindowsPath
-import select
 import shlex
 import signal
 import subprocess
@@ -1439,7 +1438,7 @@ class ChildTests(unittest.TestCase):
     def test_ctrl_c_in_a_real_terminal_still_returns_the_childs_exit(self):
         # A real pseudo-terminal: Ctrl-C reaches the whole foreground group, as at sudo's password prompt. The terminal is
         # made by a fresh interpreter with one thread, so its fork is safe; its forked child is the fixture parent.
-        done = subprocess.run([sys.executable, "-I", "-S", "-c", PTY_SCRIPT, str(ROOT / "scripts")], capture_output=True, timeout=120)
+        done = subprocess.run([sys.executable, "-I", "-S", "-B", "-c", PTY_SCRIPT, str(ROOT / "scripts")], capture_output=True, timeout=120)
         self.assertEqual(done.returncode, 0, done.stderr.decode("utf-8", "replace"))
         self.assertIn(b"ctrl-c sent", done.stdout, done.stdout)
         self.assertIn(b"exit=", done.stdout, "the parent died with its child, so no exit would have been recorded")

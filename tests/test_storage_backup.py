@@ -590,7 +590,7 @@ class SettlementTests(BackupFixture, unittest.TestCase):
         self.assertEqual(caught.exception.code, "private-owner-or-mode-refused")
         self.assertTrue(partial.is_file())
 
-    def test_a_folder_name_not_from_backup_names_is_refused_before_anything_is_written(self):
+    def test_a_malformed_folder_name_is_refused_before_anything_is_written(self):
         plan = self.plan()
         names, before = self.service.backup_names(plan=plan), sorted(os.listdir(self.output))
         for folder in ("fictional-backup", "../" + names["folder"], names["folder"][:-len("backup")] + "Fictional-backup"):
@@ -598,7 +598,7 @@ class SettlementTests(BackupFixture, unittest.TestCase):
                 self.service.create_backup(plan=plan, expected_plan_sha256=plan_sha256(plan), names={**names, "folder": folder})
         self.assertEqual(sorted(os.listdir(self.output)), before)
 
-    def test_an_attempt_record_naming_another_folder_is_refused_and_its_partial_stays(self):
+    def test_an_attempt_record_with_a_malformed_folder_name_is_refused_and_its_partial_stays(self):
         plan, attempt, partial = self.interrupted()
         record = self.output / f"attempt-backup-{plan_sha256(plan)}.json"
         for folder in ("fictional-backup", "../" + attempt["folder"], attempt["folder"] + "/r001", 42):

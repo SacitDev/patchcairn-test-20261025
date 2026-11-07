@@ -9,7 +9,6 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-import shutil
 import stat
 import sys
 from types import SimpleNamespace
@@ -25,11 +24,8 @@ import diagnostic_windows as windows  # noqa: E402
 import pc_records  # noqa: E402
 from diagnostic_core import DiagnosticRefusal  # noqa: E402
 from private_workspace import PrivateWorkspaceError, ensure_private_directory  # noqa: E402
+from work_fixtures import PRIVATE_CAPABILITY_HOLDS, remove_tree  # noqa: E402
 
-PRIVATE_CAPABILITY_HOLDS = frozenset({
-    "private-owner-or-mode-refused", "private-darwin-acl-capability-unavailable", "private-platform-unavailable",
-    "private-linux-foreign-filesystem", "private-linux-abi-unavailable", "private-linux-libc-unavailable", "private-linux-descriptor-unavailable",
-})
 SYSTEM = r"C:\Windows\System32"
 POWERSHELL = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
 ENVIRONMENT = {"SystemRoot": r"C:\Windows", "WINDIR": r"C:\Windows", "PSModulePath": r"C:\Windows\System32\WindowsPowerShell\v1.0\Modules"}
@@ -98,13 +94,15 @@ class WindowsDiagnosticTests(unittest.TestCase):
     def setUp(self):
         # The helper's request file goes into the operation's private folder, as in the service.
         self.folder = ROOT / "work" / "test-fixtures" / ("diagnostic-windows-" + uuid.uuid4().hex)
-        self.addCleanup(shutil.rmtree, self.folder, ignore_errors=True)
         try:
             ensure_private_directory(self.folder, create=True, parents=True)
         except PrivateWorkspaceError as exc:
+            if os.path.lexists(self.folder):
+                remove_tree(self.folder)
             if os.name != "posix" or exc.code not in PRIVATE_CAPABILITY_HOLDS:
                 raise
             self.skipTest("only on posix: the selected filesystem cannot enforce a new private folder: " + exc.code)
+        self.addCleanup(remove_tree, self.folder)
 
     def request(self, recipe_id="windows.update_context", mode="real", scope=()):
         return {"schema": diagnostic_core.SCHEMA, "schema_version": 1, "kind": "request", "request_id": "diag-" + uuid.uuid4().hex,

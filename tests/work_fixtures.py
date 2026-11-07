@@ -12,11 +12,9 @@ import shutil
 import stat
 import uuid
 
-from private_workspace import PrivateWorkspaceError, ensure_private_directory
-
 ROOT = Path(__file__).absolute().parent.parent
-# The refusals with which a POSIX computer says it cannot give a new folder owner-only access: a missing capability that
-# skips a test with its reason, never a failure of the code under test.
+# The refusals on which a POSIX test probe skips: this computer cannot give a new folder owner-only access.
+# private-owner-or-mode-refused skips too: a folder the probe has just made gets it only from a file system that ignores modes.
 PRIVATE_CAPABILITY_HOLDS = frozenset({
     "private-owner-or-mode-refused", "private-darwin-acl-capability-unavailable", "private-platform-unavailable",
     "private-linux-foreign-filesystem", "private-linux-abi-unavailable", "private-linux-libc-unavailable", "private-linux-descriptor-unavailable",
@@ -32,11 +30,11 @@ def _extended(path):
 
 
 def remove_tree(path):
-    """Remove the fixture folder ``path`` and everything in it. A read-only file or folder (Windows) is made writable and
-    removed again; a link is never followed to make its target writable. Every other failure, a missing ``path``
-    included, is raised."""
+    """Remove the fixture folder ``path`` and everything in it. On Windows a read-only file or folder is made writable and
+    removed again; a link is never followed to do that. On POSIX, where the parent folder decides, nothing is retried.
+    Every other failure, a missing ``path`` included, is raised."""
     def writable_then_retry(function, name, error):
-        if function not in (os.unlink, os.remove, os.rmdir) or os.path.islink(name) or os.path.isjunction(name):
+        if os.name != "nt" or function not in (os.unlink, os.remove, os.rmdir) or os.path.islink(name) or os.path.isjunction(name):
             raise error
         os.chmod(name, stat.S_IWRITE)
         function(name)
@@ -48,6 +46,7 @@ def private_hold():
     refused it with. A probe only: any other refusal is raised, never turned into a skip; the probe folder is removed."""
     if os.name != "posix":
         return None
+    from private_workspace import PrivateWorkspaceError, ensure_private_directory
     probe = ROOT / "work" / ("private-probe-" + uuid.uuid4().hex)
     try:
         ensure_private_directory(probe, create=True, parents=True)

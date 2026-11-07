@@ -32,7 +32,7 @@ import engine_schedule
 import engine_text
 import engine_updates
 from engine_journal import (BACKEND, DIAGNOSTIC_ADAPTER, EVIDENCE_MAX_BYTES, EVIDENCE_MAX_NODES, JOURNAL_MAX_BYTES, QUARANTINE_RECOVERY, RECORD_FIELDS,
-                            RECOVERY_BINDING, RECOVERY_RETENTION, SERVICE_RECORD, STORAGE_ADAPTER, Journal, PrivacyCapabilityHold, WorkflowRefusal,
+                            RECOVERY_BINDING, RECOVERY_RETENTION, SERVICE_RECORD, Journal, PrivacyCapabilityHold, WorkflowRefusal,
                             atomic_replace, decode_record, exact_fields, no_links, older_folder, older_format_message, read_record_bytes,
                             record_identifier, restart_state, typed_record, utc_time)
 # The label tables sit next to JOBS and CHECKPOINTS so the service reads them here, never from an engine module.

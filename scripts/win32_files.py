@@ -711,8 +711,8 @@ def security_snapshot(handle):
                            ctypes.byref(dacl), None, ctypes.byref(descriptor)):
         raise PrivacyRefusal("private-dacl-unavailable-or-null")
     try:
-        if not descriptor.value or not dacl.value:
-            raise PrivacyRefusal("private-dacl-unavailable-or-null")
+        if not descriptor.value or not dacl.value:  # a NULL DACL lets everyone in: this object is refused, not the computer
+            raise PrivacyRefusal("private-dacl-null" if descriptor.value else "private-dacl-unavailable-or-null")
         control, revision = WORD(), DWORD()
         if not API.GetSecurityDescriptorControl(descriptor, ctypes.byref(control), ctypes.byref(revision)):
             raise PrivacyRefusal("private-dacl-unavailable")
