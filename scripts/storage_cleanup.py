@@ -1,13 +1,16 @@
-"""Quarantine, quarantine restore and purge of exact files, mixed into storage_ops.StorageService (see its trust model)."""
+"""Quarantine, quarantine restore and purge of exact files, mixed into storage_ops.StorageService (see its trust model),
+and release_set, the one deletion path of kept backups and recovery files."""
 from __future__ import annotations
 
 import os
 from contextlib import ExitStack
 from pathlib import Path
+import stat
 
 import pc_records
-from scoped_fs import capabilities
-from private_workspace import PrivateWorkspaceError, ensure_private_file
+from scoped_base import read_only
+from scoped_fs import ScopedFSError, ScopedRoot, admit_destination, capabilities
+from private_workspace import PrivateWorkspaceError, ensure_private_file, relative_parts
 from storage_policy import (HASH_RE, MAX_ARCHIVE_BYTES, MAX_FILE_BYTES, StorageRefusal, bound_plan, canonical,
                             checked_absolute, checked_record, content_permission, decode_storage, new_plan, selection,
                             storage_value, within)
@@ -164,13 +167,13 @@ class StorageCleanup:
                 # PatchCairn's own quarantine folder: an unknown link, special file or name is never "not included".
                 raise StorageRefusal("Unknown, missing or changed quarantine files; recovery review is required")
             expected = sorted([row["quarantine_record"] for row in receipt["records"]], key=lambda row: row["relative_path"])
-            if ([{**row, "sha256": None} for row in actual]
-                    != [{**row, "sha256": None} for row in expected]):
+            if ([{**row, "sha256": None, "device": None} for row in actual]
+                    != [{**row, "sha256": None, "device": None} for row in expected]):
                 raise StorageRefusal("Unknown, missing or changed quarantine files; recovery review is required")
             for row in receipt["records"]:
                 self._private_windows_quarantine_file(self.output_root / row["quarantine_record"]["relative_path"])
                 observed = output.inspect(row["quarantine_record"]["relative_path"], hash_file=True, max_bytes=MAX_FILE_BYTES)
-                if observed != row["quarantine_record"]:
+                if {**observed, "device": None} != {**row["quarantine_record"], "device": None}:
                     raise StorageRefusal("Quarantine content changed")
         return relative
 
@@ -239,3 +242,81 @@ class StorageCleanup:
                        "physical_free_space_gain_bytes": None}
             self._write_json(output, f"outcome-purge-{expected_plan_sha256}.json", outcome)
             return outcome
+
+
+def release_set(targets, *, keep=(), never=(), destinations=(), attempt):
+    """Permanently delete exactly the files ``targets`` names: the one deletion path of kept backups and recovery files.
+
+    ``targets`` maps each exact absolute path text to its recorded SHA-256, or None. Only files are deleted, each through
+    its pinned parent folder: never a link, never by recursion, folder, pattern or protection root. A target is kept and
+    listed with its reason when ``keep`` (the paths the remaining rows still list) names it, when it lies inside one of
+    the ``never`` folders (the engine's and the service's control records) or its place cannot be decided, when its
+    recorded hash is None, when it is not an ordinary writable file, or when it cannot be checked or deleted; a changed
+    file fails the hash check on the delete handle and is kept. A target is absent only when os.lstat raises
+    FileNotFoundError or NotADirectoryError. ``keep`` and ``never`` match names ignoring case, so a doubt keeps the file.
+    A folder inside one of ``destinations`` (chosen backup drives) is opened as a backup destination, any other as a
+    selected folder. ``attempt(delete, absent, kept)`` is called once with the exact lists before the first deletion.
+    Returns {"removed": [paths], "absent": [paths], "kept": [{"path", "reason"}]}.
+    """
+    def folded(path):
+        return tuple(part.casefold() for part in Path(path).parts)
+
+    if not isinstance(targets, dict) or not callable(attempt):
+        raise StorageRefusal("Exact release targets and an attempt recorder are required")
+    for text, sha in targets.items():
+        if (not isinstance(text, str) or not Path(text).is_absolute() or str(Path(text)) != text or ".." in Path(text).parts
+                or sha is not None and not (isinstance(sha, str) and HASH_RE.fullmatch(sha))):
+            raise StorageRefusal("Each release target is an exact absolute path with its recorded SHA-256 or None")
+    listed = {folded(path) for path in keep}
+    roots = [(str(root), folded(root)) for root in never]
+    delete, absent, kept = [], [], []
+    for text in sorted(targets):
+        try:
+            protected = relative_parts(text, Path(text).anchor) is None or any(
+                relative_parts(text, root) is not None or folded(text)[:len(parts)] == parts for root, parts in roots)
+        except OSError:
+            protected = True
+        reason = "still-listed" if folded(text) in listed else "control-record" if protected else None
+        if reason is None:
+            try:
+                mode = os.lstat(text).st_mode
+            except (FileNotFoundError, NotADirectoryError):
+                absent.append(text)
+                continue
+            except OSError:
+                reason = "cannot-check"
+            else:
+                reason = "not-a-file" if not stat.S_ISREG(mode) else "no-recorded-hash" if targets[text] is None else None
+        if reason is None:
+            delete.append(text)
+        else:
+            kept.append({"path": text, "reason": reason})
+    attempt(list(delete), list(absent), [dict(row) for row in kept])
+    folders, removed = {}, []
+    for text in delete:
+        folders.setdefault(str(Path(text).parent), []).append(text)
+    for parent, paths in folders.items():
+        try:
+            if any(relative_parts(parent, root) is not None for root in destinations):
+                folder = admit_destination(parent, non_private_destination=True)
+            else:
+                folder = ScopedRoot(parent, quiet_workspace=True)
+        except ScopedFSError as error:
+            kept.extend({"path": text, "reason": error.code} for text in paths)
+            continue
+        with folder:
+            for text in paths:
+                name = Path(text).name
+                try:
+                    record = folder.inspect(name)
+                    if record["kind"] != "file" or read_only(record):
+                        raise ScopedFSError("not-a-file" if record["kind"] != "file" else "read-only", "The release target was not deleted")
+                    folder.remove_file(name, expected={**record, "sha256": targets[text]})
+                except ScopedFSError as error:
+                    if error.code == "missing-entry":
+                        absent.append(text)
+                    else:
+                        kept.append({"path": text, "reason": error.code})
+                    continue
+                removed.append(text)
+    return {"removed": removed, "absent": absent, "kept": kept}

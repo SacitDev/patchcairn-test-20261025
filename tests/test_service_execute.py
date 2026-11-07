@@ -9,8 +9,10 @@ import copy
 from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 import inspect
+import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import types
 import unittest
@@ -22,10 +24,12 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from workflow_core import WorkflowEngine, WorkflowRefusal, digest
 import pc_records
 from workflow_service import WorkflowService, ServiceRefusal, verify_storage_artifact
-from storage_ops import StorageRefusal
+from storage_ops import StorageRefusal, StorageService
 from scoped_fs import ScopedFSError
 from private_workspace import PrivateWorkspaceError, ensure_private_directory, write_private_new
+import scoped_base
 import storage_contract
+from storage_policy import MAX_FILE_BYTES
 from service_execute import EXECUTE, STORAGE
 from service_reconcile import RECONCILE
 from test_service_state import ServiceFixtures, SessionFixtures, PROSE, PRIVATE_CAPABILITY_HOLDS, broad_namespace_fixture
@@ -42,11 +46,14 @@ class PauseBeforeEffectTests(ServiceFixtures):
             for status in ("paused", "stopped"):
                 with self.subTest(adapter_id=adapter_id, status=status):
                     service, state, operation, events, written, arguments = self.prepared()
+                    service.elevation_probe = lambda: False
+                    arguments.pop("owner_consent_evidence_id")
                     action, payload = service._binding.return_value
                     action["adapter_id"] = adapter_id
                     payload.clear()
                     payload.update(operation=adapter_id, fictional=True)
-                    storage = mock.Mock(name="storage")
+                    storage = mock.MagicMock(name="storage")  # a backup target holds its storage service in a with statement
+                    storage.__enter__.return_value = storage
                     service._storage_preconditions = mock.Mock(return_value=storage)
                     effect_name = "_effect_" + EXECUTE[adapter_id].removeprefix("_execute_")
                     effect = mock.Mock(name=effect_name)
@@ -69,7 +76,7 @@ class PauseBeforeEffectTests(ServiceFixtures):
                     self.assertIsNotNone(responses[0][3])
                     self.assertIs(result, responses[0][3])
                     effect.assert_not_called()
-                    self.assertEqual(storage.mock_calls, [])
+                    self.assertEqual(storage.method_calls, [])
                     self.assertEqual(set(written), {"intent.json"})
                     self.assertEqual(operation["outcome"], "failed")
                     if adapter_id in STORAGE:
@@ -90,7 +97,7 @@ class BindingTests(ServiceFixtures):
         service._lock = mock.Mock(side_effect=nullcontext)
         state = {"status": "active", "stage": "apply"}
         service._state = mock.Mock(return_value=state)
-        arguments = dict(action_id="dispatched", plan_sha256="a" * 64, precondition_evidence_ids=["proof"], owner_consent_evidence_id=None,
+        arguments = dict(action_id="dispatched", plan_sha256="a" * 64, precondition_evidence_ids=["proof"],
                          diagnostic_fixture_runner=None, diagnostic_fixture_result=None)
         for adapter_id in [*EXECUTE, "fixture.unlisted"]:
             payload = {"fictional_payload": adapter_id}
@@ -115,19 +122,30 @@ class BindingTests(ServiceFixtures):
                 service.engine.begin_operation.assert_not_called()
 
     def test_run_effect_order_and_unknown_mapping(self):
-        # _run_adapter: begin, intent, the session re-read, the effect boundary (entered.json), then the effect. A pause
-        # before the boundary finishes "failed" with no boundary and no effect; a listed failure after the boundary finishes
-        # "unknown" with a categorical receipt (no error text); any other error propagates and records nothing.
+        # _run_adapter: begin, intent, the session re-read, the engine's admission, the effect boundary (entered.json), then
+        # the effect. A pause before the admission, or one the admission refuses, finishes "failed" with no boundary and no
+        # effect; a listed failure after the boundary finishes "unknown" with a categorical receipt (no error text); any other
+        # error propagates and records nothing.
         start = ["begin-operation", "engine-preflight", "intent", "status-1"]
-        cases = (("succeeds", None, start + ["entered.json", "effect"]),
-                 ("refusal", pc_records.Refusal("fictional-code", "Fictional private detail"), start + ["entered.json", "effect", "status-2", "finish"]),
-                 ("os-error", OSError(5, "Fictional private detail"), start + ["entered.json", "effect", "status-2", "finish"]),
-                 ("other-error", KeyError("Fictional private detail"), start + ["entered.json", "effect"]),
-                 ("paused", None, start + ["finish"]))
+        admitted = start + ["admit", "entered.json", "effect"]
+        cases = (("succeeds", None, admitted),
+                 ("refusal", pc_records.Refusal("fictional-code", "Fictional private detail"), admitted + ["status-2", "finish"]),
+                 ("os-error", OSError(5, "Fictional private detail"), admitted + ["status-2", "finish"]),
+                 ("other-error", KeyError("Fictional private detail"), admitted),
+                 ("paused", None, start + ["finish"]),
+                 ("admission-refused", None, start + ["admit", "status-2", "finish"]))
         for label, error, expected in cases:
             with self.subTest(case=label):
                 service, state, operation, events, written, arguments = self.prepared()
+                service.elevation_probe = lambda: False
                 action, payload = service._binding.return_value
+
+                def admit(session_id, *, operation_id):
+                    events.append("admit")
+                    self.assertEqual((session_id, operation_id), (state["session_id"], operation["operation_id"]))
+                    if label == "admission-refused":
+                        raise WorkflowRefusal("Fictional pause", code="effect-paused")
+                service.engine.admit_effect = admit
                 if label == "paused":
                     def reread(*args):
                         events.append("status-" + str(service.engine.read_session.call_count))
@@ -149,8 +167,8 @@ class BindingTests(ServiceFixtures):
                 else:
                     result = run()
                 self.assertEqual(events, expected)
-                if label == "paused":
-                    self.assertEqual(result["outcome"], "failed")
+                if label in ("paused", "admission-refused"):
+                    self.assertEqual((result["outcome"], result["receipt"]["adapter_invoked"]), ("failed", False))
                     self.assertNotIn("entered.json", written)
                     continue
                 self.assertEqual(written["entered.json"]["kind"], "effect_boundary")
@@ -165,6 +183,82 @@ class BindingTests(ServiceFixtures):
                         "failure_code": "fictional-code" if label == "refusal" else None,
                         "instruction": "Preserve exact intent, native attempt/mapping and outputs; inspect actual state before any new plan."})
                     self.assertNotIn("private", str(result))
+
+    def test_a_paused_effect_finishes_with_the_caller_s_receipt_when_it_gives_one(self):
+        for given, expected in (({"fictional_receipt": True}, {"fictional_receipt": True}),
+                                (None, {"adapter_invoked": False, "reason": "Owner pause/stop reached before the first adapter effect"})):
+            with self.subTest(given=given):
+                service, state, operation, _events, written, _arguments = self.prepared()
+                service.engine.admit_effect = mock.Mock(side_effect=WorkflowRefusal("Fictional pause", code="effect-paused"))
+                effect = mock.Mock()
+                result = service._run_effect("session-drain", state, operation, *service._binding.return_value, self.fixture_root(), {}, effect,
+                                             paused_receipt=given, fictional_argument=True)
+                self.assertEqual((result["outcome"], result["receipt"]), ("failed", expected))
+                effect.assert_not_called()
+                self.assertEqual(written, {})
+
+    def test_an_admission_refused_for_any_other_reason_starts_nothing_and_finishes_nothing(self):
+        # A closed step, or another writer holding the session lock: the refusal propagates, because no pause happened.
+        for code in ("effect-closed", "workflow-refusal"):
+            with self.subTest(code=code):
+                service, state, _operation, events, written, arguments = self.prepared()
+                service.elevation_probe = lambda: False
+                action, payload = service._binding.return_value
+                service.engine.admit_effect = mock.Mock(side_effect=WorkflowRefusal("Fictional refusal", code=code))
+                effect = mock.Mock()
+                with self.assertRaises(WorkflowRefusal) as caught:
+                    service._run_adapter(state["session_id"], state, action, payload, effect, **arguments)
+                self.assertEqual(caught.exception.code, code)
+                effect.assert_not_called()
+                self.assertNotIn("entered.json", written)
+                self.assertNotIn("finish", events)
+
+
+class AdmissionTests(SessionFixtures):
+    """The engine's admission, driven through the real engine and service: nothing fakes the session it reads."""
+
+    def requested_after_begin(self, request):
+        """Run an approved backup with the owner's ``request`` landing after _begin_adapter read the session as active, so
+        that only the admission can see it: nothing starts, and the operation finishes failed with no effect boundary."""
+        action, _native = self.backup_action()
+        sha = self.approve(action)
+        begin = self.service._begin_adapter
+
+        def requested(*args, **kwargs):
+            begun = begin(*args, **kwargs)
+            request(self.sid)
+            return begun
+        with mock.patch.object(self.service, "_begin_adapter", side_effect=requested), mock.patch.object(StorageService, "create_backup") as create:
+            result = self.execute(action, sha)
+        create.assert_not_called()
+        self.assertEqual((result["outcome"], result["receipt"]["adapter_invoked"]), ("failed", False))
+        (operation,) = self.state()["operations"].values()
+        self.assertEqual(operation["outcome"], "failed")
+        self.assertFalse((self.service._operation_dir(self.sid, operation["operation_id"]) / "entered.json").exists())
+
+    def test_a_pause_after_begin_stops_the_effect_at_the_admission(self):
+        self.requested_after_begin(self.engine.pause)
+        self.assertEqual(self.state()["status"], "paused")
+
+    def test_a_stop_after_begin_stops_the_effect_at_the_admission(self):
+        self.requested_after_begin(self.engine.stop)
+        self.assertEqual(self.state()["status"], "stopped")
+
+    def test_an_admitted_effect_records_the_admission_before_its_boundary(self):
+        action, _native = self.backup_action()
+        sha = self.approve(action)
+        seen = []
+        immutable = self.service._immutable
+
+        def boundary(path, value):
+            if path.name == "entered.json":
+                (operation,) = self.state()["operations"].values()
+                seen.append(operation["authorization"].get("admitted_utc"))
+            return immutable(path, value)
+        with mock.patch.object(self.service, "_immutable", side_effect=boundary):
+            self.assertEqual(self.execute(action, sha)["outcome"], "succeeded")
+        self.assertEqual(len(seen), 1)
+        self.assertIsNotNone(seen[0])
 
 
 class PrepareTests(ServiceFixtures):
@@ -205,6 +299,139 @@ class PrepareTests(ServiceFixtures):
             payload = {"operation": pc_records.ADAPTER_STORAGE_PURGE, "mode": "fixture", "storage_plan": purge, **changes}
             with self.subTest(executed=changes), self.assertRaises(ServiceRefusal):
                 WorkflowService._storage(service, {"mode": "fixture"}, payload)
+
+    def test_chosen_destination_is_copied_into_the_payload_and_the_protected_roots(self):
+        chosen = str(self.fixture_root() / "chosen-drive")
+        backup = {"kind": "backup", "files": [{"size": 5}]}
+        service = object.__new__(WorkflowService)
+        state = {"mode": "fixture"}
+        service._lock, service._state = mock.Mock(side_effect=nullcontext), mock.Mock(return_value=state)
+        service.protected_roots, service._storage = mock.Mock(return_value=["fixture-root"]), mock.Mock()
+        service._action = mock.Mock(return_value={"action_id": "prepared", "recovery_evidence_ids": []})
+        service.prepare_storage_action("session-fixture", action_id="prepared", adapter_id=pc_records.ADAPTER_STORAGE_BACKUP_CREATE,
+                                       storage_plan=backup, output_root=str(ROOT / "work" / "fictional-output"), backup_destination=chosen, **PROSE)
+        payload = service._action.call_args.kwargs["payload"]
+        self.assertEqual(payload["backup_destination"], chosen)
+        self.assertEqual(payload["protected_roots"], sorted(["fixture-root", chosen]))
+        self.assertNotIn("backup_destination", self.prepared(pc_records.ADAPTER_STORAGE_BACKUP_CREATE, backup))
+
+    def test_storage_admits_the_chosen_destination_in_addition_to_the_owned_output(self):
+        root = self.fixture_root()
+        chosen, source = str(root / "work" / "chosen-drive"), str(root / "work" / "selected")
+        service = object.__new__(WorkflowService)
+        service.root = root
+        service._owned = mock.Mock(side_effect=lambda value, **kwargs: Path(value))
+        service.protected_roots, service._retention = mock.Mock(return_value=[]), mock.Mock(return_value=[])
+        service._admit_backup_destination = mock.Mock(return_value="admitted-root")
+        state = {"mode": "fixture", "platform": "windows", "settings": {"scope": {"roots": [source]}}}
+        plan = {"kind": "backup", "inventory": {"roots": [{"path": source}]}}
+
+        def payload(operation=pc_records.ADAPTER_STORAGE_BACKUP_CREATE, destination=chosen, protected=(chosen,)):
+            return {"operation": operation, "storage_plan": plan, "storage_plan_sha256": digest(plan), "output_root": str(root / "work" / "output"),
+                    "mode": "fixture", "protected_roots": list(protected), "backup_destination": destination}
+        with mock.patch("service_execute.StorageService") as lower:
+            self.assertIs(service._storage(state, payload()), lower.return_value)
+            self.assertEqual(lower.call_args.kwargs["backup_destination"], "admitted-root")
+            service._admit_backup_destination.assert_called_once_with(state, payload())
+            service._owned.assert_any_call(str(root / "work" / "output"), state=state, existing=True)
+            outside, inside = str(root / "chosen-drive"), str(root / "work" / "output" / "inside")
+            for refused in (payload(protected=()), payload(destination=outside, protected=(outside,)), payload(destination=inside, protected=(inside,))):
+                with self.subTest(refused=refused["backup_destination"]), self.assertRaises(ServiceRefusal):
+                    service._storage(state, refused)
+        self.assertEqual(service._admit_backup_destination.call_count, 1)
+
+    def test_a_chosen_destination_is_told_apart_from_the_output_root_and_confined_in_a_fixture(self):
+        # The one rule for a fixture's "other drive": below the work folder, apart from the output root. A real session's
+        # is outside the work folder, on a drive with an identity.
+        root = self.fixture_root()
+        work, output = root / "work", root / "work" / "output"
+        service = object.__new__(WorkflowService)
+        service.root, service.volume_lookup = root, mock.Mock(return_value="fixture-volume")
+
+        def payload(path):
+            return {"backup_destination": str(path), "output_root": str(output)}
+        self.assertIsNone(service._destination_root({"mode": "fixture"}, payload(work / "chosen-drive")))
+        service.volume_lookup.assert_not_called()
+        for refused in (root / "chosen-drive", output, output / "inside", work, work / "x" / ".." / "y"):
+            with self.subTest(fixture=refused), self.assertRaises(ServiceRefusal):
+                service._destination_root({"mode": "fixture"}, payload(refused))
+        self.assertEqual(service._destination_root({"mode": "real"}, payload(root / "chosen-drive")), "fixture-volume")
+        for refused in (work / "chosen-drive", output / "inside"):
+            with self.subTest(real=refused), self.assertRaises(ServiceRefusal):
+                service._destination_root({"mode": "real"}, payload(refused))
+
+    def test_each_admitted_root_has_one_owner_that_closes_it(self):
+        # prepare_storage_action closes the service it asked for on every path; _storage_preconditions closes it only when a
+        # check fails, because otherwise the target that receives it does.
+        backup = {"kind": "backup", "files": [{"size": 5}]}
+        for failure in (None, StorageRefusal("Fictional precondition")):
+            with self.subTest(prepare=failure):
+                storage = mock.Mock(name="storage")
+                storage.check_preconditions.side_effect = failure
+                with mock.patch.object(WorkflowService, "_storage", return_value=storage), \
+                        mock.patch.object(WorkflowService, "_action", return_value={"action_id": "prepared", "recovery_evidence_ids": []}):
+                    service = object.__new__(WorkflowService)
+                    state = {"mode": "fixture"}
+                    service._lock, service._state = mock.Mock(side_effect=nullcontext), mock.Mock(return_value=state)
+                    service.protected_roots = mock.Mock(return_value=[])
+                    run = lambda: service.prepare_storage_action("session-fixture", action_id="prepared", adapter_id=pc_records.ADAPTER_STORAGE_BACKUP_CREATE,
+                                                                 storage_plan=backup, output_root=str(ROOT / "work" / "fictional-output"), **PROSE)
+                    if failure is None:
+                        run()
+                    else:
+                        with self.assertRaises(StorageRefusal):
+                            run()
+                storage.close.assert_called_once_with()
+            with self.subTest(preconditions=failure):
+                storage = mock.Mock(name="storage")
+                storage.check_preconditions.side_effect = failure
+                service = object.__new__(WorkflowService)
+                service._storage = mock.Mock(return_value=storage)
+                action = {"adapter_id": pc_records.ADAPTER_STORAGE_BACKUP_CREATE}
+                run = lambda: service._storage_preconditions({}, action, {"storage_plan": backup, "storage_plan_sha256": "a" * 64},
+                                                             diagnostic_fixture_runner=None, diagnostic_fixture_result=None)
+                if failure is None:
+                    self.assertIs(run(), storage)
+                    storage.close.assert_not_called()
+                else:
+                    with self.assertRaises(StorageRefusal):
+                        run()
+                    storage.close.assert_called_once_with()
+
+
+class RestoreLimitTests(SessionFixtures):
+    """The optional restore test restores in memory, so a backup above its limits is refused before anything begins, and
+    never runs into the limit after the backup is written. Bounded: fictional files of at most 42 MiB, mostly zeros."""
+
+    def planned(self, names, suffix):
+        storage = self.storage()
+        plan = storage.plan_backup(inventory=storage.assess_storage(roots=[str(self.source)]), selected=names,
+                                   destination=str(self.output / (suffix + ".zip")), content_read_authorized=True, required_recovery=True)
+        return dict(action_id="backup-" + suffix, adapter_id="storage.backup_create", storage_plan=plan, output_root=str(self.output), **PROSE)
+
+    def assert_refused_with_a_test_and_planned_without(self, names):
+        with self.assertRaises(ServiceRefusal) as caught:
+            self.service.prepare_storage_action(self.sid, restore_probe_destination=str(self.output / "large-probe"), **self.planned(names, "large"))
+        self.assertEqual(caught.exception.code, "restore-size-unavailable")
+        self.assertIn("without the restore test", str(caught.exception))
+        self.assertEqual(self.state()["operations"], {})
+        self.assertEqual(self.service.prepare_storage_action(self.sid, **self.planned(names, "no-test"))["action_id"], "backup-no-test")
+
+    def test_one_file_above_the_restore_limit_is_refused_before_the_backup(self):
+        write_private_new(self.source / "large.bin", bytes(MAX_FILE_BYTES + 1))
+        self.assert_refused_with_a_test_and_planned_without(["r001/large.bin"])
+
+    def test_an_archive_that_can_pass_the_restore_limit_is_refused_before_the_backup(self):
+        size = 14 * 1024 * 1024
+        for index in range(3):
+            write_private_new(self.source / f"part-{index}.bin", bytes(size))
+        self.assertLessEqual(size, MAX_FILE_BYTES)
+        self.assertGreater(3 * size, scoped_base.MAX_CONTROL_BYTES)
+        self.assert_refused_with_a_test_and_planned_without([f"r001/part-{index}.bin" for index in range(3)])
+
+    def test_a_backup_within_the_limits_keeps_its_restore_test(self):
+        action, _plan = self.backup_action(probe=True)
+        self.assertEqual(action["action_id"], "backup-one")
 
 
 class WorkflowServiceTests(SessionFixtures):
@@ -299,7 +526,7 @@ class WorkflowServiceTests(SessionFixtures):
 class ServicePrivacyTests(ServiceFixtures):
     def test_namespace_refusal_precedes_marker_or_retention_write(self):
         root = self.fixture_root()
-        with mock.patch("service_execute.ensure_private_directory", side_effect=PrivateWorkspaceError("fixture-private-hold")), mock.patch("service_state.write_private_new") as writer:
+        with mock.patch("service_execute.ensure_private_directory", side_effect=PrivateWorkspaceError("fixture-private-hold")), mock.patch("service_state.publish_private_new") as writer:
             with self.assertRaises(PrivateWorkspaceError):
                 WorkflowService(self.fake_engine(root))
             writer.assert_not_called()
@@ -363,7 +590,7 @@ class ServicePrivacyTests(ServiceFixtures):
 
 class DispatchTests(SessionFixtures):
     def test_every_adapter_has_execute_and_reconcile(self):
-        # PLAN 3.3, D-071: both tables name every adapter id; each target is a private WorkflowService method defined in
+        # Both tables name every adapter id; each target is a private WorkflowService method defined in
         # its family's module and looked up on the object; a target whose whole body is the held refusal holds before
         # anything is written or begun. The held set is read from the code, so a family leaf that writes a body drops out.
         modules = {"backup": "service_backup", "restore": "service_restore", "cleanup": "service_cleanup", "retention": "service_retention",
@@ -381,7 +608,7 @@ class DispatchTests(SessionFixtures):
                     self.assertEqual(method.__module__, modules[pc_records.ADAPTERS[adapter_id]["family"]])
             held[kind] = sorted(adapter_id for adapter_id, method in methods.items() if method.__code__.co_names == (f"_{kind}_held",))
         refusals = {"execute": "No fixed service adapter exists for this action",
-                    "reconcile": "External/diagnostic outcomes require their actual bounded callback evidence"}
+                    "reconcile": "This step's outcome needs its own recorded evidence; nothing was changed"}
         state = self.state()
         files = sorted((path, path.stat().st_size) for path in self.root.rglob("*"))
         operation = {"operation_id": "held-operation", "action_id": "held-action", "plan_sha256": "a" * 64, "outcome": None}
@@ -404,12 +631,14 @@ class DispatchTests(SessionFixtures):
         # Dispatch looks the target up on the object, so a patch on the method intercepts it with the arguments forwarded
         # unchanged; an id outside a table keeps the same refusal, and no KeyError escapes either dispatch.
         service = object.__new__(WorkflowService)
+        service.elevation_probe = lambda: False
         service._lock = mock.Mock(side_effect=nullcontext)
         service._state = mock.Mock(return_value={"status": "active", "stage": "apply"})
         service.engine = types.SimpleNamespace(pending_items=mock.Mock(return_value=False), begin_operation=mock.Mock())
-        arguments = dict(action_id="dispatched", plan_sha256="a" * 64, precondition_evidence_ids=["proof"], owner_consent_evidence_id=None,
+        arguments = dict(action_id="dispatched", plan_sha256="a" * 64, precondition_evidence_ids=["proof"],
                          diagnostic_fixture_runner=None, diagnostic_fixture_result=None)
-        for adapter_id in (pc_records.ADAPTER_STORAGE_BACKUP_CREATE, "fixture.unlisted"):
+        # Ids that name a method of the service if a dispatch ever built names from ids instead of reading its table.
+        for adapter_id in (pc_records.ADAPTER_STORAGE_BACKUP_CREATE, "fixture.unlisted", "_binding", "__init__", "storage"):
             action, payload = {"action_id": "dispatched", "adapter_id": adapter_id}, {"fictional": True}
             intent = {"action": action, "payload": payload}
             service._binding = mock.Mock(return_value=(action, payload))
@@ -433,7 +662,9 @@ class DispatchTests(SessionFixtures):
     def held_execution(self, action, sha):
         """Execute an approved action whose family is not written yet: the target's refusal, no begin, no file written."""
         proof = self.precondition(action, sha)
-        # Paths and file sizes: a folder's own size moves when the service's lock folder comes and goes inside it.
+        with self.service._lock():  # the lock's own private file stays once it exists; it is no change of this action's
+            pass
+
         def listing():
             return sorted((path, path.stat().st_size if path.is_file() else None) for path in self.root.rglob("*"))
         files, revision = listing(), self.state()["revision"]
@@ -456,14 +687,15 @@ class DispatchTests(SessionFixtures):
 
     def test_every_storage_plan_kind_binds_generically(self):
         # Every storage plan kind binds through the engine's one storage branch: a retention-forget plan registers and is
-        # approved, and executing it holds in the service until its family code is written. A permanent deletion whose
-        # family is not built yet (retention release) cannot even be planned: its count has no source to come from.
+        # approved, and executing it is refused by the retention checks before anything begins, because the rows it
+        # names are not the registry's. A release plan that lists no released rows cannot even be planned: its count
+        # has no source to come from.
         records = {"fixture": True, "entries": [{"name": "fictional-kept-backup"}]}
         def action_for(adapter_id, kind, **deletion):
             plan = {"schema": "patchcairn.storage", "schema_version": 1, "kind": kind, "records": records, "fixture": True}
             payload = {"schema": "patchcairn.storage.adapter", "schema_version": 1, "operation": adapter_id, "storage_plan": plan,
-                       "storage_plan_sha256": digest(plan), "output_root": str(self.output), "mode": "fixture",
-                       "protected_roots": [str(self.output)], **deletion}
+                       "storage_plan_sha256": digest(plan), "output_root": str(self.service.work), "mode": "fixture",
+                       "protected_roots": self.service.protected_roots(), **deletion}
             return self.service._action(self.state(), action_id="kept-" + kind.replace("_", "-"), adapter_id=adapter_id, kind=kind,
                                         payload=payload, native_plan=plan, inventory=records, **PROSE)
         release = action_for(pc_records.ADAPTER_STORAGE_RETENTION_RELEASE, "retention_release", delete_count=1, delete_bytes=0)
@@ -475,7 +707,12 @@ class DispatchTests(SessionFixtures):
             sha = self.approve(action)
         except WorkflowRefusal as error:
             self.fail("the retention-forget plan did not register: " + error.code)
-        self.held_execution(action, sha)
+        proof = self.precondition(action, sha)
+        with mock.patch.object(self.engine, "begin_operation") as begin, self.assertRaises(ServiceRefusal) as caught:
+            self.service.execute_action(self.sid, action_id=action["action_id"], plan_sha256=sha, precondition_evidence_ids=[proof])
+        self.assertEqual(caught.exception.code, "kept-rows-changed")
+        begin.assert_not_called()
+        self.assertEqual(self.state()["operations"], {})
 
     def test_storage_table_names_delete_selected_and_remove_originals(self):
         # Both permanent deletions have their storage rows (engine action kind, outcome-file name), so their family code
@@ -498,9 +735,254 @@ class DispatchTests(SessionFixtures):
                 begin.assert_not_called()
 
 
-class CompositionTests(unittest.TestCase):
+class OverlapTests(ServiceFixtures):
+    """An overlap check in _storage: a path equal to a reserved quarantine output overlaps it (within is inclusive)."""
+
+    def test_a_source_equal_to_a_reserved_quarantine_output_overlaps_it(self):
+        root = self.fixture_root()
+        reserved = root / "work" / "reserved"
+        service = object.__new__(WorkflowService)
+        service.root = root
+        service._owned = mock.Mock(side_effect=lambda value, **kwargs: Path(value))
+        service.protected_roots = mock.Mock(return_value=[])
+        service._retention = mock.Mock(return_value=[{"quarantine_binding": {"output_root": str(root / "work" / "elsewhere")}}])
+        state = {"mode": "fixture", "platform": "windows", "settings": {"scope": {"roots": [str(reserved)]}}}
+        plan = {"kind": "backup", "inventory": {"roots": [{"path": str(reserved)}]}}
+        payload = {"operation": pc_records.ADAPTER_STORAGE_BACKUP_CREATE, "storage_plan": plan, "storage_plan_sha256": digest(plan),
+                   "output_root": str(root / "work" / "output"), "mode": "fixture", "protected_roots": []}
+        with mock.patch("service_execute.StorageService") as lower:
+            self.assertIs(service._storage(state, payload), lower.return_value)
+            for output in (str(reserved), str(reserved / "inner")):
+                service._retention.return_value = [{"quarantine_binding": {"output_root": output}}]
+                with self.subTest(reserved=output), self.assertRaisesRegex(ServiceRefusal, "Reserved quarantine evidence"):
+                    service._storage(state, payload)
+
+
+class ElevationTests(SessionFixtures):
+    """The elevation refusal with an injected probe, so it runs the same on every operating system."""
+
+    def test_every_change_is_refused_while_elevated_and_assessment_is_not(self):
+        service = object.__new__(WorkflowService)
+        for answer in (True, None, 1):
+            service.elevation_probe = mock.Mock(return_value=answer)
+            for adapter_id, facts in pc_records.ADAPTERS.items():
+                with self.subTest(answer=answer, adapter_id=adapter_id):
+                    if facts["family"] == "assessment":
+                        self.assertIsNone(service._refuse_while_elevated(adapter_id))
+                    else:
+                        with self.assertRaises(ServiceRefusal) as caught:
+                            service._refuse_while_elevated(adapter_id)
+                        self.assertEqual(caught.exception.code, "process-elevated")
+        service.elevation_probe = mock.Mock(return_value=False)
+        for adapter_id in pc_records.ADAPTERS:
+            self.assertIsNone(service._refuse_while_elevated(adapter_id))
+
+    def test_elevated_backup_is_refused_before_anything_begins(self):
+        action, _native = self.backup_action()
+        sha = self.approve(action)
+        self.service.elevation_probe = mock.Mock(return_value=True)
+        with mock.patch.object(self.engine, "begin_operation") as begin, self.assertRaises(ServiceRefusal) as caught:
+            self.execute(action, sha)
+        self.assertEqual(caught.exception.code, "process-elevated")
+        begin.assert_not_called()
+        self.assertEqual(self.state()["operations"], {})
+        self.assertFalse((self.output / "one.zip").exists())
+        self.service.elevation_probe = lambda: False
+        self.assertEqual(self.execute(action, sha)["outcome"], "succeeded")
+
+    def test_elevated_reconcile_of_a_retention_action_is_refused_before_it_reads_anything(self):
+        service = object.__new__(WorkflowService)
+        service.elevation_probe = mock.Mock(return_value=True)
+        service.engine = types.SimpleNamespace(read_session=mock.Mock(side_effect=AssertionError("nothing is read while elevated")))
+        for adapter_id in (pc_records.ADAPTER_STORAGE_RETENTION_RELEASE, pc_records.ADAPTER_STORAGE_SESSION_RELEASE,
+                           pc_records.ADAPTER_STORAGE_RETENTION_FORGET):
+            with self.subTest(adapter_id=adapter_id), self.assertRaises(ServiceRefusal) as caught:
+                getattr(service, RECONCILE[adapter_id])("session-fixture", {"outcome": None}, {}, {"operation": adapter_id},
+                                                        operation_id="operation-fixture")
+            self.assertEqual(caught.exception.code, "process-elevated")
+
+    def test_every_reconcile_target_that_can_change_anything_is_refused_while_elevated(self):
+        # The shared reconcile path refuses before it enters any target but assessment's, on what the operation's own intent names.
+        for adapter_id, name in RECONCILE.items():
+            with self.subTest(adapter_id=adapter_id):
+                service = object.__new__(WorkflowService)
+                service.elevation_probe = mock.Mock(return_value=True)
+                service._lock = lambda: nullcontext()
+                intent = {"action": {"adapter_id": adapter_id}, "payload": {"operation": adapter_id}}
+                service.inspect_operation = mock.Mock(return_value={"operation": {"outcome": None}, "intent": intent})
+                target = mock.Mock(return_value="reconciled")
+                setattr(service, name, target)
+                if pc_records.ADAPTERS[adapter_id]["family"] == "assessment":
+                    self.assertEqual(service.reconcile_operation("session-fixture", operation_id="operation-fixture"), "reconciled")
+                else:
+                    with self.assertRaises(ServiceRefusal) as caught:
+                        service.reconcile_operation("session-fixture", operation_id="operation-fixture")
+                    self.assertEqual(caught.exception.code, "process-elevated")
+                    target.assert_not_called()
+
+    def test_only_a_package_step_takes_a_tests_reconcile_fakes(self):
+        # probe and reader reach the three package targets, as given; any other step refuses them before its target runs.
+        package = {pc_records.ADAPTER_PACKAGE_UPGRADE, pc_records.ADAPTER_PACKAGE_REINSTALL, pc_records.ADAPTER_SYSTEM_REPAIR}
+        fake_probe, fake_reader = object(), object()
+        for adapter_id, name in RECONCILE.items():
+            with self.subTest(adapter_id=adapter_id):
+                service = object.__new__(WorkflowService)
+                service.elevation_probe = mock.Mock(return_value=False)
+                service._lock = lambda: nullcontext()
+                intent = {"action": {"adapter_id": adapter_id}, "payload": {"operation": adapter_id}}
+                service.inspect_operation = mock.Mock(return_value={"operation": {"outcome": None}, "intent": intent})
+                target = mock.Mock(return_value="reconciled")
+                setattr(service, name, target)
+                if adapter_id in package:
+                    self.assertEqual(service.reconcile_operation("session-fixture", operation_id="operation-fixture", probe=fake_probe,
+                                                                 reader=fake_reader), "reconciled")
+                    self.assertEqual(target.call_args.kwargs, {"operation_id": "operation-fixture", "probe": fake_probe, "reader": fake_reader})
+                    continue
+                for fakes in ({"probe": fake_probe}, {"reader": fake_reader}):
+                    with self.assertRaises(ServiceRefusal) as caught:
+                        service.reconcile_operation("session-fixture", operation_id="operation-fixture", **fakes)
+                    self.assertEqual(caught.exception.code, "reconcile-fakes")
+                target.assert_not_called()
+                self.assertEqual(service.reconcile_operation("session-fixture", operation_id="operation-fixture"), "reconciled")
+
+    def test_an_elevated_process_can_still_inspect_a_backup_it_may_not_settle(self):
+        class Stopped(BaseException):
+            pass
+        action, _native = self.backup_action()
+        sha = self.approve(action)
+        with mock.patch.object(StorageService, "create_backup", side_effect=Stopped()), self.assertRaises(Stopped):
+            self.execute(action, sha)
+        (operation,) = self.state()["operations"].values()
+        self.service.elevation_probe = mock.Mock(return_value=True)
+        with mock.patch.object(StorageService, "settle_backup") as settle, self.assertRaises(ServiceRefusal) as caught:
+            self.service.reconcile_operation(self.sid, operation_id=operation["operation_id"])
+        self.assertEqual(caught.exception.code, "process-elevated")
+        settle.assert_not_called()
+        inspected = self.service.inspect_operation(self.sid, operation_id=operation["operation_id"])
+        self.assertEqual(inspected["operation"]["operation_id"], operation["operation_id"])
+        self.service.elevation_probe = lambda: False
+        self.assertEqual(self.service.reconcile_operation(self.sid, operation_id=operation["operation_id"])["outcome"], "failed")
+
+    def test_a_retired_adapter_id_counts_as_a_change(self):
+        service = object.__new__(WorkflowService)
+        service.elevation_probe = mock.Mock(return_value=True)
+        with self.assertRaises(ServiceRefusal) as caught:
+            service._refuse_while_elevated("system.fictional_retired_route")
+        self.assertEqual(caught.exception.code, "process-elevated")
+
+    def test_probe_is_a_constructor_keyword_kept_as_a_public_attribute(self):
+        import scoped_fs
+        probe = mock.Mock(return_value=False)
+        self.assertIs(WorkflowService(self.engine, elevation_probe=probe).elevation_probe, probe)
+        self.assertIs(WorkflowService(self.engine).elevation_probe, scoped_fs.process_is_elevated)
+        with self.assertRaises(ServiceRefusal):
+            WorkflowService(self.engine, elevation_probe=False)
+
+
+class CliStartTests(ServiceFixtures):
+    """patchcairn_service.py: the start check, the ticket line, the catalog and the read-only views."""
+
+    def test_service_cli_refuses_without_isolated_flags(self):
+        cli = str(ROOT / "scripts" / "patchcairn_service.py")
+        # Bytes, not text: a child's console encoding is its own (the catalog's dash is not ASCII).
+        for flags in ([], ["-I"], ["-S"]):
+            with self.subTest(flags=flags):
+                refused = subprocess.run([sys.executable, *flags, "-B", cli, "catalog"], capture_output=True, timeout=120, cwd=str(ROOT))
+                self.assertEqual(refused.returncode, 2)
+                self.assertEqual(refused.stdout, b"")
+                self.assertIn(b"-I -S -B", refused.stderr)
+        started = subprocess.run([sys.executable, "-I", "-S", "-B", cli, "catalog"], capture_output=True, timeout=120, cwd=str(ROOT))
+        self.assertEqual((started.returncode, started.stderr), (0, b""))
+        self.assertIn(b"Developed by Michael", started.stdout)
+        source = (ROOT / "scripts" / "patchcairn_service.py").read_text(encoding="utf-8")
+        main = ast.parse(source).body[-1]
+        self.assertEqual(ast.unparse(main.test), "__name__ == '__main__'")
+        self.assertEqual(ast.unparse(main.body[0].test), "not (sys.flags.isolated and sys.flags.no_site)")
+
+    def test_run_ticket_line_calls_run_ticket_with_the_ticket(self):
+        import patchcairn_service as cli
+        with mock.patch.object(cli, "WorkflowEngine") as engine_type, mock.patch.object(WorkflowService, "__init__", return_value=None) as built, \
+                mock.patch.object(WorkflowService, "run_ticket", create=True, return_value={"outcome": "succeeded", "receipt": {"result": "updated"}}) as run, \
+                mock.patch("builtins.print") as shown:
+            self.assertEqual(cli.main(["--service-work", "work/selected-services", "run", "--ticket", "ticket-fixture"]), 0)
+        built.assert_called_once_with(engine_type.return_value, work_relative="work/selected-services")
+        run.assert_called_once_with(ticket_id="ticket-fixture")
+        self.assertIn("Updated; the new version was checked", shown.call_args.args[0])
+        with mock.patch("builtins.print"), mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+            cli.main(["run"])
+
+    def test_catalog_names_the_ticket_launcher_and_no_installer_handoffs(self):
+        import patchcairn_service as cli
+        with mock.patch("builtins.print") as shown:
+            self.assertEqual(cli.main(["--json", "catalog"]), 0)
+        data = json.loads(shown.call_args.args[0])
+        self.assertEqual(data["ticket_launcher"], "run --ticket")
+        self.assertFalse({"external_handoff_catalog", "held_external_catalog", "external_execution"} & set(data))
+        with mock.patch("builtins.print") as shown:
+            cli.main(["catalog"])
+        text = shown.call_args.args[0]
+        self.assertIn("ticket-bound launcher", text)
+        self.assertNotIn("handoff", text.lower())
+        self.assertNotIn("assistant", text.lower())
+        tree = ast.parse((ROOT / "scripts" / "patchcairn_service.py").read_text(encoding="utf-8"))
+        imported = {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)}
+        imported |= {alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names}
+        self.assertEqual(imported & {path.stem for path in (ROOT / "scripts").glob("*.py")}, {"workflow_core", "workflow_service", "storage_ops"})
+
+    def test_report_and_retention_subcommands_are_views(self):
+        import patchcairn_service as cli
+        service = mock.Mock()
+        service.session_report.return_value = ROOT / "work" / "services" / "reports" / "session-fixture-view.html"
+        service.retention_rows.return_value = [{"name": "retention-fixture", "kind": "backup", "session_id": "session-fixture",
+                                                "location": "fixture-location", "bytes": 2048, "created_utc": "2026-10-26T12:00:00Z",
+                                                "volume_identity": None, "originals_removed": None},
+                                               {"name": "retention-other", "kind": "reservation", "session_id": "session-fixture",
+                                                "location": "other-location", "bytes": None, "created_utc": "2026-10-26T12:00:01Z",
+                                                "volume_identity": None, "originals_removed": None}]
+        with mock.patch.object(cli, "WorkflowEngine"), mock.patch.object(cli, "WorkflowService", return_value=service), \
+                mock.patch("builtins.print") as shown:
+            self.assertEqual(cli.main(["report", "session-fixture"]), 0)
+            report = shown.call_args.args[0]
+            self.assertEqual(cli.main(["retention"]), 0)
+            listing = shown.call_args.args[0]
+        service.session_report.assert_called_once_with("session-fixture")
+        self.assertIn("a copy for reading, not evidence", report)
+        self.assertIn("anyone who can edit the file can change it", report)
+        self.assertIn("2,048 bytes", listing)
+        self.assertIn("size not recorded", listing)
+        self.assertIn("2 item(s), 2,048 bytes", listing)
+
+
+class CompositionTests(ServiceFixtures):
+    # The shared bodies a dispatch target may call; any other target is exactly the held refusal.
+    SHARED = {"_run_adapter", "_begin_adapter", "_run_effect", "_reconcile_storage", "_reconcile_retention", "_reconcile_package"}
+
+    def test_each_target_is_held_or_calls_a_shared_body(self):
+        found = []
+        for table, held in ((EXECUTE, "_execute_held"), (RECONCILE, "_reconcile_held")):
+            for adapter_id, name in table.items():
+                names = getattr(WorkflowService, name).__code__.co_names
+                if names != (held,) and not self.SHARED & set(names):
+                    found.append((adapter_id, name))
+        self.assertEqual(found, [])
+
+    def test_instance_attributes_and_mixins_do_not_shadow_methods(self):
+        mixins = WorkflowService.__mro__[1:-1]
+        for mixin in mixins:
+            self.assertFalse({"__getattr__", "__getattribute__"} & set(vars(mixin)), mixin.__name__)
+        root = self.fixture_root()
+        try:
+            service = WorkflowService(self.fake_engine(root))
+        except PrivateWorkspaceError as exc:
+            if os.name == "posix" and exc.code in PRIVATE_CAPABILITY_HOLDS:
+                self.skipTest("only on posix: private namespace unavailable; native refusal covered separately")
+            raise
+        names = {name for mixin in mixins for name in vars(mixin)}
+        self.assertTrue({"engine", "root", "work", "diagnostics", "elevation_probe", "volume_lookup"} <= set(vars(service)))
+        self.assertEqual(set(vars(service)) & names, set())
+
     def test_mixins_define_disjoint_names_and_one_init(self):
-        # D-070, D-071: WorkflowService is one class built from mixins, and a name defined twice resolves silently by
+        # WorkflowService is one class built from mixins, and a name defined twice resolves silently by
         # method order; so no two mixins share a non-dunder name, the composed class adds none of its own, and only
         # ExecuteMixin, which builds the service's state, defines __init__.
         mixins = WorkflowService.__mro__[1:-1]
@@ -515,30 +997,39 @@ class CompositionTests(unittest.TestCase):
         self.assertEqual([mixin.__name__ for mixin in mixins if "__init__" in vars(mixin)], ["ExecuteMixin"])
 
     def test_only_the_dispatch_reaches_the_targets(self):
-        # D-071: G11 refuses service._x, not self._x inside a mixin. So no function names a target except through the tables,
-        # only a target calls the shared steps that rely on execute_action's and reconcile_operation's checks (_run_adapter is
-        # the begin step followed by the effect step), and each adapter's _effect_<id> is named only by its own target.
+        # The architecture check refuses service._x, not self._x inside a mixin. So no function names a target except through
+        # the tables, only a target calls the shared steps that rely on execute_action's and reconcile_operation's checks
+        # (_run_adapter is the begin step followed by the effect step), and each adapter's _effect_<id> is named only by its
+        # own target.
         targets = set(EXECUTE.values()) | set(RECONCILE.values())
         execute = set(EXECUTE.values())
+        # The package ticket run (UpdatesMixin.run_ticket) is the one other caller of _run_effect and of the effects of the
+        # three adapters it starts: the two package adapters and the system repair.
         callers = {"_storage_preconditions": execute, "_run_adapter": execute, "_begin_adapter": execute | {"_run_adapter"},
-                   "_run_effect": execute | {"_run_adapter"}, "_reconcile_storage": set(RECONCILE.values())}
-        callers.update({"_effect_" + name.removeprefix("_execute_"): {name} for name in execute})
+                   "_run_effect": execute | {"_run_adapter", "run_ticket"}, "_reconcile_storage": set(RECONCILE.values()),
+                   "_reconcile_retention": {RECONCILE[adapter_id] for adapter_id, facts in pc_records.ADAPTERS.items()
+                                            if facts["family"] == "retention"}}
+        ticketed = {EXECUTE[pc_records.ADAPTER_PACKAGE_UPGRADE], EXECUTE[pc_records.ADAPTER_PACKAGE_REINSTALL], EXECUTE[pc_records.ADAPTER_SYSTEM_REPAIR]}
+        callers.update({"_effect_" + name.removeprefix("_execute_"): {name} | ({"run_ticket"} if name in ticketed else set()) for name in execute})
         found = []
         for path in sorted((ROOT / "scripts").glob("*.py")):
             for function in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
                 if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    # run_ticket counts only as UpdatesMixin's, in service_updates.py.
+                    caller = function.name if function.name != "run_ticket" or path.name == "service_updates.py" else path.name + ":run_ticket"
                     for node in ast.walk(function):
-                        if isinstance(node, ast.Attribute) and (node.attr in targets or function.name not in callers.get(node.attr, {function.name})):
+                        if isinstance(node, ast.Attribute) and (node.attr in targets or caller not in callers.get(node.attr, {caller})):
                             found.append((path.name, node.lineno, function.name, node.attr))
                         elif (isinstance(node, ast.Constant) and isinstance(node.value, str)
-                              and (node.value in targets or function.name not in callers.get(node.value, {function.name}))):
+                              and (node.value in targets or caller not in callers.get(node.value, {caller}))):
                             found.append((path.name, node.lineno, function.name, node.value))
         self.assertEqual(found, [])
 
     def test_storage_targets_run_their_preconditions_before_they_begin(self):
         # Each STORAGE target calls the storage preconditions itself (the exact storage binding, its live native content and a
         # purge's recovery), so a target that begins an operation, through _run_adapter or _begin_adapter, must first call
-        # _storage_preconditions unconditionally: as the value of a statement of its own body, before any statement that begins.
+        # _storage_preconditions unconditionally: as the value of a statement of its own body, or the context of a with statement
+        # there (which then closes the storage service it returns), before any statement that begins.
         names = {EXECUTE[adapter_id] for adapter_id in STORAGE}
         definitions = {}
         for path in sorted((ROOT / "scripts").glob("*.py")):
@@ -549,12 +1040,20 @@ class CompositionTests(unittest.TestCase):
 
         def calls(node, name):
             return any(isinstance(item, ast.Call) and isinstance(item.func, ast.Attribute) and item.func.attr == name for item in ast.walk(node))
+
+        def flattened(body):
+            for statement in body:
+                if isinstance(statement, ast.With):
+                    yield from (item.context_expr for item in statement.items)
+                    yield from flattened(statement.body)
+                else:
+                    yield statement.value if isinstance(statement, (ast.Assign, ast.Expr)) else statement
         missing = []
         for name, (target,) in sorted(definitions.items()):
-            begins = [index for index, statement in enumerate(target.body) if calls(statement, "_run_adapter") or calls(statement, "_begin_adapter")]
-            checked = [index for index, statement in enumerate(target.body)
-                       if isinstance(statement, (ast.Assign, ast.Expr)) and isinstance(statement.value, ast.Call)
-                       and isinstance(statement.value.func, ast.Attribute) and statement.value.func.attr == "_storage_preconditions"]
+            statements = list(flattened(target.body))
+            begins = [index for index, statement in enumerate(statements) if calls(statement, "_run_adapter") or calls(statement, "_begin_adapter")]
+            checked = [index for index, statement in enumerate(statements) if isinstance(statement, ast.Call)
+                       and isinstance(statement.func, ast.Attribute) and statement.func.attr == "_storage_preconditions"]
             if begins and not (checked and checked[0] < begins[0]):
                 missing.append(name)
         self.assertEqual(missing, [])
