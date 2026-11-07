@@ -232,7 +232,8 @@ def check_selection(route, record):
         wanted = select(record) if callable(select) else None
     except (KeyError, TypeError):
         wanted = None
-    if wanted != (record.get("recipe"), record.get("run_kind")) or (record.get("run_kind") != "settings" and record.get("recipe") not in route["run"]["recipes"]):
+    if (wanted != (record.get("recipe"), record.get("run_kind"))
+            or (record.get("run_kind") != "settings" and record.get("recipe") not in route["run"]["recipes"])):
         raise Refusal("package-recipe", "The route does not run that recipe this way for this operation and package")
 
 
@@ -331,7 +332,8 @@ def _brew_env_file(probe, run, path):
         return None
     except (OSError, ValueError):
         pass
-    raise Refusal("brew-env", "A Homebrew settings file (brew.env) is a link, too large or unreadable, so PatchCairn could not check its settings; the item holds")
+    raise Refusal("brew-env", "A Homebrew settings file (brew.env) is a link, too large or unreadable, so PatchCairn could not "
+                              "check its settings; the item holds")
 
 
 def _brew_env(probe, run):
@@ -545,7 +547,8 @@ def _posix_environment(manager):
 
 
 APT = MappingProxyType({
-    "manager": "apt", "platforms": ("linux",), "group": "system_drivers", "state": "built", "run_kind": "terminal", "flags": ("restart_likely", "adds_packages"),
+    "manager": "apt", "platforms": ("linux",), "group": "system_drivers", "state": "built", "run_kind": "terminal",
+    "flags": ("restart_likely", "adds_packages"),
     "discover": discover_with(_apt_listing, _apt_preflight),
     "plan": plan_with("apt", "system_drivers", "terminal", {"upgrade": "apt.upgrade", "reinstall": "apt.reinstall", "repair": "apt.configure"}),
     "drift": drift_with(_apt_preflight), "verify_recipes": ("apt.installed",), "verify": _apt_verify, "classify_exit": classify_with("apt"),
@@ -647,7 +650,8 @@ def _dnf_verify(payload, reads):
 
 
 DNF = MappingProxyType({
-    "manager": "dnf", "platforms": ("linux",), "group": "system_drivers", "state": "built", "run_kind": "terminal", "flags": ("restart_likely", "adds_packages"),
+    "manager": "dnf", "platforms": ("linux",), "group": "system_drivers", "state": "built", "run_kind": "terminal",
+    "flags": ("restart_likely", "adds_packages"),
     "discover": discover_with(_dnf_listing, _dnf_preflight),
     "plan": plan_with("dnf", "system_drivers", "terminal", {"upgrade": "dnf.upgrade", "reinstall": "dnf.reinstall"}),
     "drift": drift_with(_dnf_preflight), "verify_recipes": ("dnf.all_installed",), "verify": _dnf_verify, "classify_exit": classify_with("dnf"),
@@ -816,7 +820,8 @@ def dependency_edges(entries):
         arch = entry["preflight"].get("arch")
         return entry["manager"], f"{entry['id'].split(':')[0]}{'.' if entry['manager'] == 'dnf' else ':'}{arch}" if arch else entry["id"]
     owners = {identity(entry): entry["action_id"] for entry in entries}
-    named = {entry["action_id"]: {owners.get((entry["manager"], item.rsplit("@", 1)[0])) for item in entry.get("dependencies") or ()} - {None, entry["action_id"]}
+    named = {entry["action_id"]: {owners.get((entry["manager"], item.rsplit("@", 1)[0])) for item in entry.get("dependencies") or ()}
+             - {None, entry["action_id"]}
              for entry in entries}
     position, pending = {}, list(named)
     while pending:

@@ -279,7 +279,8 @@ class UpdatesMixin:
                 body = package_registry.payload(fragment, environment=environment)
                 inventory = {"manager": body["manager"], "id": body["id"], "run_folder": folder.name, "run_files": texts}
                 action = self._action(state, action_id=item["action_id"], adapter_id=adapter_id, kind=facts["kinds"][0], payload=body,
-                                      native_plan=body["preflight"], inventory=inventory, target=target, benefit=benefit, risk=risk, reversibility=reversibility,
+                                      native_plan=body["preflight"], inventory=inventory, target=target, benefit=benefit,
+                                      risk=risk, reversibility=reversibility,
                                       verification=verification, rendered_command=_shown_command(route, body, folder),
                                       requires_os_consent=_needs_os_consent(adapter_id, route))
                 # After _action, which checks the assistant's words: a text filter must not refuse a package that is named passwd.
@@ -628,7 +629,8 @@ class UpdatesMixin:
         completion: a replay must see a failed read as failed."""
         for recipe_id, found in launch["before"].items():
             write_private_new(path / ("before-" + recipe_id + ".out"), found["stdout"])
-        self._immutable(path / BEFORE_RECORD, service_value("service_outcome", mode=state["mode"], observed_utc=pc_records.utc_now(), binding=self._bound(operation),
+        self._immutable(path / BEFORE_RECORD, service_value("service_outcome", mode=state["mode"],
+                                                            observed_utc=pc_records.utc_now(), binding=self._bound(operation),
                                                             receipt={"reads": {recipe_id: {"ok": found.get("ok") is True, "exit_code": found.get("exit_code")}
                                                                                for recipe_id, found in launch["before"].items()},
                                                                      "restart_files": launch["restart_files"]}))

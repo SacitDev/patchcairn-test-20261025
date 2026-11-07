@@ -81,7 +81,7 @@ class WorkflowServiceTests(SessionFixtures):
         self.assertEqual((result["receipt"]["record"]["mode"], result["receipt"]["record"]["facts"]), ("fixture", observed["facts"]))
         operation = self.service._operation_dir(sid, result["operation_id"])
         self.assertFalse((operation / "handoff.json").exists())
-        self.assertFalse((operation / "helper-request.json").exists())
+        self.assertFalse((operation / "helper-input.json").exists())
         # The operation finished in its effect; no later callback can replace its result.
         with self.assertRaisesRegex(ServiceRefusal, "Only an active exact diagnostic handoff"):
             self.service.complete_diagnostic(sid, operation_id=result["operation_id"], adapter_result=observed, coordinator_observed=True)

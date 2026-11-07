@@ -662,7 +662,8 @@ def brew_at_target(kind, snap, target, bound):
     if kind != "formula":
         return snap.get("installed") == target
     linked = snap.get("linked_keg")
-    return target in (snap.get("installed") or []) and (linked == target or (linked is None and (snap.get("keg_only") is True or bound.get("linked_keg") is None)))
+    return target in (snap.get("installed") or []) and (
+        linked == target or (linked is None and (snap.get("keg_only") is True or bound.get("linked_keg") is None)))
 
 
 def verify_brew(entry, before, after_data):

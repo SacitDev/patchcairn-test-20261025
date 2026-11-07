@@ -99,7 +99,8 @@ def record_restart_pending(engine, session_id, *, operation_id, evidence_id, exp
 def record_boot_observation(engine, session_id, *, operation_id, evidence_id, expected_revision=None):
     """Release a step's restart. An outcome row that names this exact step, action and plan and holds a
     patchcairn.boot.observation record (last_boot_utc, boot_id, observed_utc, source) whose boot is later than the step's
-    start and every reading of its signal as set, with a boot_id none of those readings was taken in, sets restart_verification = {"boot_observed": True, "evidence_id", "sha256", "recorded_utc"}. A known
+    start and every reading of its signal as set, with a boot_id none of those readings was taken in, sets
+    restart_verification = {"boot_observed": True, "evidence_id", "sha256", "recorded_utc"}. A known
     boot_id is refused whatever time the record claims, and a reading without one where the step has one is held.
     finish_operation then records the step's result once. Once recorded, the same boot read again is a replay and changes
     nothing, and any other boot is refused."""

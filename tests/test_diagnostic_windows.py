@@ -126,7 +126,7 @@ class WindowsDiagnosticTests(unittest.TestCase):
         call, = launcher.calls
         self.assertEqual(call.argv, (POWERSHELL, "-NoProfile", "-NonInteractive", "-File", str(windows.HELPER),
                                      "-RequestPath", call.argv[6], "-CoordinatorAuthorized"))
-        self.assertEqual(Path(call.argv[6]).name, "helper-request.json")
+        self.assertEqual(Path(call.argv[6]).name, "helper-input.json")
         self.assertEqual(windows.HELPER, ROOT / "scripts" / "diagnostic_windows.ps1")
         self.assertEqual(call.env, ENVIRONMENT)
         self.assertNotIn("-ExecutionPolicy", call.argv)

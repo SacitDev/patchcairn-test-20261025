@@ -148,7 +148,7 @@ def _helper(request, result, folder, probe, launcher):
         return validate_adapter_result(request, result)
 
     system = probe.system_directory()
-    request_path = Path(folder) / "helper-request.json"
+    request_path = Path(folder) / "helper-input.json"
     argv, env = helper_start(system, request_path)
     try:
         if not stat.S_ISREG(probe.lstat(argv[0]).st_mode) or probe.reparse_tag(argv[0]) != 0:
