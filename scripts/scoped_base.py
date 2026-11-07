@@ -37,8 +37,13 @@ MAX_ENTRIES = pc_records.MAX_BACKUP_ENTRIES
 RECORD_KEYS = frozenset({"relative_path", "kind", "device", "inode", "mode", "size",
                          "mtime_ns", "ctime_ns", "nlink", "sha256", "attributes"})
 IDENTITY_KEYS = RECORD_KEYS - {"sha256"}
+# What still names a file created now after a crash and a restart: writing to it changes none of these. A backend's
+# identity_keys narrow them (a POSIX device number does not last), and its created_keys keep only what lasts. An inode
+# number can be used again once its file is deleted, so a file deleted and made again under one name can match: a POSIX
+# backend keeps none of them. An NTFS file id carries a sequence number, so a later file gets another one.
+CREATED_KEYS = frozenset({"kind", "device", "inode", "mode", "nlink"})
 # Why an entry is listed as "not included" instead of admitted.
-EXCLUDED_REASONS = ("link", "special", "hard-link", "not-portable", "path-too-long", "case-collision")
+EXCLUDED_REASONS = ("link", "special", "online-only", "hard-link", "not-portable", "path-too-long", "case-collision")
 # At most this many "not included" rows are kept; one final row with reason MORE_EXCLUDED counts the
 # rest, so a tree full of links cannot fill memory.
 MAX_EXCLUDED_ROWS = 1_000
@@ -111,7 +116,7 @@ def destination_facts(volume, *, non_private_destination, stable_ids):
     ``volume`` is "private" (a fixed drive whose file system keeps permissions), "non-private" (a removable
     drive, or a file system without permissions such as exFAT or vfat), "fat32" (non-private, files below
     4 GiB) or anything else (refused with destination-volume-unsupported). A non-private volume needs the
-    owner's typed acknowledgment ``non_private_destination=True``; without it the CapabilityHold
+    acknowledgment ``non_private_destination=True``, bound in the approved plan; without it the CapabilityHold
     non-private-destination-acknowledgment-required carries NON_PRIVATE_NOTE. ``stable_ids`` is True only
     if the file system keeps file ids across mounts (NTFS: yes; exFAT, vfat: no); "fat32" never does, so
     its identity keys are always UNSTABLE_ID_KEYS.
@@ -286,6 +291,8 @@ class RootBase(abc.ABC):
     # A root on a file system without stable file ids (FAT, exFAT) narrows this, for example to
     # {"relative_path", "kind", "size"}; the SHA-256 is still compared.
     identity_keys = IDENTITY_KEYS
+    # What of CREATED_KEYS lasts for this backend's files (see CREATED_KEYS); empty where a later file can take the same id.
+    created_keys = CREATED_KEYS
     # Admission facts (plan RR2-4). A source keeps these defaults; a backup destination sets the values
     # destination_facts() returns.
     destination = False
@@ -365,6 +372,13 @@ class RootBase(abc.ABC):
     @abc.abstractmethod
     def free_bytes(self) -> int:
         """Bytes available to this process on the root's volume."""
+
+    def created_identity(self, record: dict) -> dict | None:
+        """The facts of the new file's ``record`` that name it after a crash and a restart (CREATED_KEYS within created_keys
+        and identity_keys); None where its file id does not last or can be given to a later file (POSIX, FAT, exFAT), so
+        nothing tells it from a file made later under its name."""
+        keys = CREATED_KEYS & self.created_keys & self.identity_keys
+        return {key: record[key] for key in keys} if "inode" in keys else None
 
     def admit_new(self, relative: str, expected_bytes: int) -> None:
         """Refuse, before anything is written, what open_new(relative) would refuse for the name or the path

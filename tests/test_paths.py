@@ -520,19 +520,23 @@ class JunkRootTests(unittest.TestCase):
         # A junk root of any other shape is ignored, so AppData stays protected.
         for shape in (profile("windows", "AppData", "Local"), profile("windows", "AppData", "Local", "Temp", "Sub"),
                       profile("windows", "AppData", "LocalLow", "Temp"), profile("windows", "Local", "Temp"), "relative\\AppData\\Local\\Temp",
-                      "/home/example/AppData/Local/Temp", None):
+                      "/srv/example/AppData/Local/Temp", None):
             with self.subTest(shape=shape):
                 self.assertTrue(pc_paths.protected_root(self.TEMP + "\\build-1", junk_root=shape))
                 self.assertTrue(pc_paths.protected("x.tmp", root=self.TEMP, junk_root=shape))
 
     def test_roaming_or_other_appdata_never_admitted_even_when_passed(self):
-        other_user = "C:\\" + "Users" + "\\other\\AppData\\Local\\Temp"
+        other_user = "C:\\Profiles\\other\\AppData\\Local\\Temp"
         for path in (profile("windows", "AppData", "Roaming", "Example"), profile("windows", "AppData", "Local", "Packages"),
                      profile("windows", "AppData", "Local"), profile("windows", "AppData"), other_user + "\\build-1",
                      "D:" + self.TEMP[2:] + "\\build-1"):
             with self.subTest(path=path):
                 self.assertTrue(pc_paths.protected_root(path, junk_root=self.TEMP))
         self.assertTrue(pc_paths.protected("Roaming\\Example\\x", root=profile("windows", "AppData"), junk_root=self.TEMP))
+        # Another user's Temp, which differs from the junk root only in the user-name folder, is not exempt.
+        mine, theirs = "C:\\Profiles\\example\\AppData\\Local\\Temp", "C:\\Profiles\\other\\AppData\\Local\\Temp"
+        self.assertFalse(pc_paths.protected_root(mine + "\\build-1", junk_root=mine))
+        self.assertTrue(pc_paths.protected_root(theirs + "\\build-1", junk_root=mine))
         # A junk root whose shape is right but that names Roaming is not Local\Temp.
         roaming = profile("windows", "AppData", "Roaming", "Temp")
         self.assertTrue(pc_paths.protected_root(roaming + "\\x", junk_root=roaming))
@@ -553,9 +557,9 @@ class JunkRootTests(unittest.TestCase):
         self.assertTrue(pc_paths.protected_root(self.TEMP + "X\\build", junk_root=self.TEMP))
         self.assertTrue(pc_paths.protected_root(self.TEMP + "\\b", junk_root=profile("windows", "AppDataX", "Local", "Temp")))
         # A look-alike that Unicode case folding would equate (U+212A KELVIN SIGN folds to "k") is another folder.
-        kate = "C:\\" + "Users" + "\\kate\\AppData\\Local\\Temp"
+        kate = "C:\\Profiles\\kate\\AppData\\Local\\Temp"
         self.assertFalse(pc_paths.protected_root(kate + "\\b", junk_root=kate))
-        self.assertTrue(pc_paths.protected_root("C:\\" + "Users" + "\\\u212aate\\AppData\\Local\\Temp\\b", junk_root=kate))
+        self.assertTrue(pc_paths.protected_root("C:\\Profiles\\\u212aate\\AppData\\Local\\Temp\\b", junk_root=kate))
 
     def test_appdata_below_temp_stays_protected(self):
         # Only the AppData component at the junk root's own position is exempt.

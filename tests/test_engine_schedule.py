@@ -27,7 +27,7 @@ class RestartAccountingGuardTests(unittest.TestCase):
         due = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat().replace("+00:00", "Z")
         for outcome in (None, "unknown"):
             with self.subTest(outcome=outcome):
-                original = {"status": "active" if outcome is None else "held", "settings": {"timing": "scheduled"}, "schedule": {"schedule_id": "original-schedule"}, "operations": {"original-operation": {"outcome": outcome, "restart_verification": {"boot_observed": True}}}}
+                original = {"status": "active" if outcome is None else "held", "settings": {"timing": "scheduled"}, "schedule": {"schedule_id": "original-schedule"}, "operations": {"original-operation": {"outcome": outcome, "restart_pending": {"signal": "required", "source": "linux.reboot_required"}, "restart_verification": {"boot_observed": True}}}}
                 state = copy.deepcopy(original)
                 def inspect_change(session_id, event_type, mutate, expected_revision):
                     return mutate(state)

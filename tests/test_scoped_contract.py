@@ -584,7 +584,8 @@ class RootContract:
     def test_private_destination_keeps_privacy(self):
         root = self.destination("private")
         self.assertEqual((root.destination, root.private, root.privacy_note), (True, True, None))
-        self.assertEqual(root.identity_keys, scoped_base.IDENTITY_KEYS)
+        # Everything but the device number, which only a backend whose numbers last across a restart compares (POSIX: no).
+        self.assertEqual(root.identity_keys - {"device"}, scoped_base.IDENTITY_KEYS - {"device"})
 
     def test_acknowledged_destination_is_not_private(self):
         root = self.destination("removable-exfat", acknowledged=True)
@@ -1430,7 +1431,8 @@ class WindowsRootContractTests(RootContract, unittest.TestCase):
         folder = self.case / ("destination-" + uuid.uuid4().hex)
         folder.mkdir()
         return windows_scoped.admit_destination(str(folder), non_private_destination=non_private_destination,
-                                               volumes=lambda handle, drive: {"filesystem": filesystem, "drive_type": drive_type})
+                                               volumes=lambda handle, drive: {"filesystem": filesystem, "drive_type": drive_type,
+                                                                              "removable": drive_type != 3})
 
 
 @unittest.skipUnless(os.name == "posix", "only on posix: PosixRoot runs on POSIX descriptors")

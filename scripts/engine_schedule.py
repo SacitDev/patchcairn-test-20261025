@@ -7,6 +7,7 @@ from __future__ import annotations
 import copy
 from datetime import timedelta
 
+from engine_journal import restart_state
 from engine_journal import SHA, WorkflowRefusal, bounded_text, exact_fields, ids, outstanding_effects, record_identifier, require_writable, utc_time
 from engine_plans import owner_record
 import pc_records
@@ -61,7 +62,7 @@ def configure_schedule(engine, session_id, *, schedule, owner_quote, owner_messa
         require_writable(state)
         if state["settings"]["timing"] != "scheduled":
             raise WorkflowRefusal("Choose scheduled timing before recording a proposal")
-        if any(op["outcome"] in {None, "unknown"} and op.get("restart_verification", {}).get("boot_observed") is True for op in state["operations"].values()):
+        if any(op["outcome"] in {None, "unknown"} and restart_state(op) == "boot_observed" for op in state["operations"].values()):
             raise WorkflowRefusal("Actual restart observations are already recorded; record that operation's final receipt before changing its schedule. This "
                                   "new proposal was not accepted; pause subsequent work while accounting for the result")
         previous = state["schedule"]

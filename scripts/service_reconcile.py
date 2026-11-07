@@ -38,21 +38,33 @@ RECONCILE = {
     pc_records.ADAPTER_SYSTEM_FIRMWARE_UPDATE: "_reconcile_system_firmware_update",
     pc_records.ADAPTER_DIAGNOSTIC_COLLECT: "_reconcile_diagnostic_collect",
     pc_records.ADAPTER_FIXTURE_ASSESSMENT: "_reconcile_fixture_assessment",
-    pc_records.ADAPTER_SYSTEM_REVIEWED_EXTERNAL: "_reconcile_system_reviewed_external",
 }
+# The targets that read the computer through a test's fakes (probe, reader); every other adapter refuses them.
+TAKES_FAKES = frozenset({pc_records.ADAPTER_PACKAGE_UPGRADE, pc_records.ADAPTER_PACKAGE_REINSTALL, pc_records.ADAPTER_SYSTEM_REPAIR})
 
 
 class ReconcileMixin:
     """reconcile_operation and the shared storage reconciliation."""
 
-    def reconcile_operation(self, session_id, *, operation_id):
-        """Inspect actual native outcome; absence remains unknown and consumed."""
+    def reconcile_operation(self, session_id, *, operation_id, probe=None, reader=None):
+        """Inspect actual native outcome; absence remains unknown and consumed. ``probe`` and ``reader`` (the read-only launcher)
+        are a test's fakes for a package step's reads (TAKES_FAKES): a practice session's package step that needs reads is
+        refused without them, and any other step refuses them ("reconcile-fakes")."""
         with self._lock():
-            inspected = self.inspect_operation(session_id, operation_id=operation_id)
+            try:
+                inspected = self.inspect_operation(session_id, operation_id=operation_id)
+            except ServiceRefusal as error:
+                if error.code != "intent-incomplete":
+                    raise
+                return self._close_before_intent(session_id, operation_id)
             operation, intent = inspected["operation"], inspected["intent"]
             payload = intent["payload"]
+            self._refuse_while_elevated(intent["action"]["adapter_id"])
+            fakes = {key: value for key, value in (("probe", probe), ("reader", reader)) if value is not None}
+            if fakes and intent["action"]["adapter_id"] not in TAKES_FAKES:
+                raise ServiceRefusal("Only a package step's reconciliation reads through a test's fakes", code="reconcile-fakes")
             return getattr(self, RECONCILE.get(intent["action"]["adapter_id"], "_reconcile_held"))(
-                session_id, operation, intent, payload, operation_id=operation_id)
+                session_id, operation, intent, payload, operation_id=operation_id, **fakes)
 
     def _reconcile_storage(self, session_id, operation, intent, payload, *, operation_id):
         """A storage operation's native outcome and origin, verified again, called with reconcile_operation's lock held.

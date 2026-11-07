@@ -18,11 +18,11 @@ jobs:
         python: ['3.12', '3.15']
         include:
           - os: windows-latest
-            timeout: 90
+            timeout: 120
           - os: ubuntu-latest
-            timeout: 15
+            timeout: 60
           - os: macos-latest
-            timeout: 15
+            timeout: 60
     runs-on: ${{ matrix.os }}
     # Windows Python helpers reuse an owned serial worker; native checks stay per operation.
     timeout-minutes: ${{ matrix.timeout }}

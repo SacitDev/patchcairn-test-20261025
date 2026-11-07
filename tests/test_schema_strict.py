@@ -228,7 +228,7 @@ class RefusalBaseTests(unittest.TestCase):
         request = {"schema": "patchcairn.diagnostics", "schema_version": 1, "kind": "request", "request_id": "diag-" + "0" * 32,
                    "platform": "macos", "recipe_id": "macos.os_version", "mode": "fixture", "symptom": "Fictional E42",
                    "scope": ["os_metadata"], "observed_utc": "yesterday"}
-        cases = ((lambda: workflow_core.typed_record({"schema": "patchcairn.external.plan", "schema_version": "1"}, "patchcairn.external.plan"),
+        cases = ((lambda: workflow_core.typed_record({"schema": "patchcairn.boot.observation", "schema_version": "1"}, "patchcairn.boot.observation"),
                   workflow_core.WorkflowRefusal, "schema-version"),
                  (lambda: storage_ops.canonical({"text": "\ud800"}), storage_ops.StorageRefusal, "invalid-record"),
                  (lambda: diagnostic_core.validate_request(request), diagnostic_core.DiagnosticRefusal, "utc-time"))

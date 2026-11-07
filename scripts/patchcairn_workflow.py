@@ -28,12 +28,12 @@ def creation_platform(mode, requested):
 def human_message(result, *, storage_unavailable=False):
     if result["ok"] or result["code"] != "held":
         return result["message"]
-    lead = "I cannot confirm that this workspace can protect private session records. Ask the coordinator about supported private storage. " if storage_unavailable else "I could not continue this request because a required check needs attention. "
+    lead = "I cannot confirm that this workspace can protect private session records. PatchCairn stops here, and nothing was written. " if storage_unavailable else "I could not continue this request because a required check needs attention. "
     return (lead +
-            "Keep the existing evidence and ask the coordinator to explain the failed check. "
+            "Nothing new was started by this request. "
             "If earlier work was already running, its actual outcome still needs to be checked; this refusal does not tell us whether it finished or what effects it had. "
             "Next: use PatchCairn: status to review the selected session, then PatchCairn: options or PatchCairn: resolve for the next decision. "
-            "If no session has been selected, PatchCairn: help shows the available jobs. Do not retry an uncertain action.")
+            "If no session has been selected, PatchCairn: start shows the jobs. Do not retry an uncertain action.")
 
 
 def main(argv=None):
@@ -55,12 +55,14 @@ def main(argv=None):
     command = " ".join(args.command) if args.command else "PatchCairn: help"
     storage_unavailable = False
     try:
-        parsed = parse_command(command)
+        parsed = parse_command(command, in_session=bool(args.session))
         if not parsed["ok"]:
             result = {"schema_version": SCHEMA_VERSION, "ok": False, "code": parsed["code"], "message": parsed["message"], "session_id": args.session, "revision": None, "data": {}}
         elif not args.session and (parsed["command"] == "help" or parsed["command"] == "start" and not (parsed["arguments"] or args.job)):
             # Help needs neither a storage directory nor a registered session.
             result = {"schema_version": SCHEMA_VERSION, "ok": True, "code": "help", "message": initial_menu(), "session_id": None, "revision": None, "data": {}}
+        elif not args.session and parsed["command"] != "start":
+            result = {"schema_version": SCHEMA_VERSION, "ok": False, "code": "no_session", "message": "No job is open. PatchCairn: start shows the menu.", "session_id": None, "revision": None, "data": {}}
         else:
             selected_platform = creation_platform(args.mode, args.platform) if parsed["command"] == "start" and not args.session else args.platform
             engine = WorkflowEngine()
@@ -82,6 +84,9 @@ def main(argv=None):
         print(human_message(result, storage_unavailable=storage_unavailable))
         if result["session_id"]:
             print("\nSession: " + result["session_id"])
+        if result["data"].get("operation_id"):
+            # The step the check after a restart is for: patchcairn_service.py inspect-operation prints its command.
+            print("Operation: " + result["data"]["operation_id"])
     return 0 if result["ok"] else 2
 
 

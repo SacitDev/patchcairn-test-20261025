@@ -49,21 +49,16 @@ _DECIMAL_VERSION = re.compile(r"[0-9]+\.[0-9]+\Z")
 SCHEMAS = frozenset({
     "patchcairn.assessment.access", "patchcairn.assessment.summary", "patchcairn.assessment.verification",
     "patchcairn.diagnostic.adapter", "patchcairn.diagnostics", "patchcairn.fixture.adapter",
-    "patchcairn.external.adapter", "patchcairn.external.plan", "patchcairn.external.preflight",
-    "patchcairn.external.receipt", "patchcairn.external.recovery", "patchcairn.external.verification",
-    "patchcairn.installer.metadata", "patchcairn.publisher.signature", "patchcairn.quarantine.recovery",
-    "patchcairn.quarantine.reservation", "patchcairn.recovery.binding", "patchcairn.recovery.retention",
-    "patchcairn.restart.pending", "patchcairn.restart.verification", "patchcairn.service", "patchcairn.storage",
-    "patchcairn.storage.adapter", "patchcairn.windows.boot.observation",
+    "patchcairn.quarantine.recovery", "patchcairn.quarantine.reservation", "patchcairn.recovery.binding",
+    "patchcairn.recovery.retention", "patchcairn.service", "patchcairn.storage", "patchcairn.storage.adapter",
     "patchcairn.package", "patchcairn.schedule", "patchcairn.report", "patchcairn.review",
     "patchcairn.deletion.attempt", "patchcairn.deletion.receipt", "patchcairn.handoff.receipt", "patchcairn.firmware.receipt",
     "patchcairn.boot.observation",
 })
 # Names whose family is not written yet. They may not have a reader; each leaves this set when its
 # family's reader is registered, and the set is empty in a finished release.
-PLANNED_SCHEMAS = frozenset({"patchcairn.package", "patchcairn.schedule", "patchcairn.review", "patchcairn.deletion.attempt",
-                             "patchcairn.deletion.receipt", "patchcairn.handoff.receipt", "patchcairn.firmware.receipt",
-                             "patchcairn.boot.observation"})
+PLANNED_SCHEMAS = frozenset({"patchcairn.schedule", "patchcairn.deletion.attempt", "patchcairn.deletion.receipt",
+                             "patchcairn.handoff.receipt", "patchcairn.firmware.receipt"})
 CONTAINERS = frozenset({
     "engine_marker", "session_state", "session_creation", "response_envelope",
     "workflows_template", "tool_catalog", "toolkit_marker",
@@ -382,14 +377,14 @@ UPDATE_RESULTS = MappingProxyType({
 
 
 def _facts(family, kinds, *, acknowledgments=(), conditional=(), backup_receipt="none", policy_coverable=False,
-           scheduled_policy_coverable=False, os_consent="never", irreversible=False, transitional=False, conditional_decisions=(),
-           run_kinds=(), independent_failures=False):
+           scheduled_policy_coverable=False, os_consent="never", irreversible=False, conditional_decisions=(), run_kinds=(),
+           independent_failures=False):
     return MappingProxyType({
         "family": family, "kinds": kinds, "acknowledgments": acknowledgments, "conditional_acknowledgments": conditional,
         "backup_receipt": backup_receipt, "policy_coverable": policy_coverable,
         "scheduled_policy_coverable": scheduled_policy_coverable, "os_consent": os_consent,
-        "irreversible": irreversible, "transitional": transitional, "conditional_decisions": conditional_decisions,
-        "run_kinds": run_kinds, "independent_failures": independent_failures})
+        "irreversible": irreversible, "conditional_decisions": conditional_decisions, "run_kinds": run_kinds,
+        "independent_failures": independent_failures})
 
 
 ADAPTER_STORAGE_BACKUP_CREATE = "storage.backup_create"
@@ -409,7 +404,6 @@ ADAPTER_SYSTEM_UPDATE_HANDOFF = "system.update_handoff"
 ADAPTER_SYSTEM_FIRMWARE_UPDATE = "system.firmware_update"
 ADAPTER_DIAGNOSTIC_COLLECT = "diagnostic.collect"
 ADAPTER_FIXTURE_ASSESSMENT = "fixture.assessment"
-ADAPTER_SYSTEM_REVIEWED_EXTERNAL = "system.reviewed_external"
 
 # The closed adapter set and its facts, read-only for the whole process.
 # - "kinds": the engine action kinds an id may carry (today's mapping for the ids that exist today).
@@ -421,7 +415,6 @@ ADAPTER_SYSTEM_REVIEWED_EXTERNAL = "system.reviewed_external"
 #   or "always" (the operating system asks the owner every time).
 # - storage.retention_forget forgets folders that were deleted outside PatchCairn; its executor refuses
 #   if any target still exists, so it needs no loss acknowledgment.
-# - "transitional": today's local-installer route, kept only until the package routes replace it.
 # - "conditional_decisions": decisions a flagged payload of the adapter needs in their own owner message;
 #   "run_kinds": the ways it may run (RUN_KINDS); "independent_failures": a failure with a verified postcondition
 #   stops only the failed action's dependents, not the other actions of the plan.
@@ -455,7 +448,6 @@ ADAPTERS = MappingProxyType({
                                            irreversible=True, run_kinds=("terminal", "settings")),
     ADAPTER_DIAGNOSTIC_COLLECT: _facts("assessment", ("assessment",)),
     ADAPTER_FIXTURE_ASSESSMENT: _facts("assessment", ("assessment",)),
-    ADAPTER_SYSTEM_REVIEWED_EXTERNAL: _facts("update", ("update", "repair"), os_consent="always", transitional=True),
 })
 
 

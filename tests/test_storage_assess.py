@@ -54,9 +54,10 @@ class NativeStorageTests(NativeStorageFixture, unittest.TestCase):
         inventory = self.service.assess_storage(roots=[self.source], limits={"max_total_bytes": 1024})
         self.assertGreater(inventory["summary"]["logical_bytes"], 2 * 1024 * 1024)
         self.assertFalse(inventory["content_read"])
-        with self.assertRaisesRegex(StorageRefusal, "total read budget"):
-            self.service.plan_backup(inventory=inventory, selected=["r001/fictional-sparse.bin"],
-                                      destination=self.output / "fictional.zip", content_read_authorized=True)
+        # A backup streams every file, so the assessment's in-memory limits cap no backup content.
+        plan = self.service.plan_backup(inventory=inventory, selected=["r001/fictional-sparse.bin"],
+                                        destination=self.output / "fictional.zip", content_read_authorized=True)
+        self.assertEqual(plan["cost"]["source_logical_bytes"], 2 * 1024 * 1024)
         self.assertEqual(list(self.output.iterdir()), [])
 
     def test_browser_channels_and_explicit_profile_roots_are_pruned(self):

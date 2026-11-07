@@ -272,12 +272,11 @@ class SchemaTests(unittest.TestCase):
                  "patchcairn.diagnostic.adapter", "patchcairn.fixture.adapter", "patchcairn.quarantine.reservation",
                  "patchcairn.quarantine.recovery", "patchcairn.recovery.retention", "patchcairn.recovery.binding",
                  "patchcairn.assessment.access", "patchcairn.assessment.summary", "patchcairn.assessment.verification",
-                 "patchcairn.restart.pending", "patchcairn.restart.verification", "patchcairn.windows.boot.observation"}
+                 "patchcairn.boot.observation"}
         self.assertLessEqual(today, pc_records.SCHEMAS - pc_records.PLANNED_SCHEMAS)
-        self.assertEqual(pc_records.PLANNED_SCHEMAS, {"patchcairn.package", "patchcairn.schedule", "patchcairn.review",
-                                                      "patchcairn.deletion.attempt", "patchcairn.deletion.receipt",
-                                                      "patchcairn.handoff.receipt", "patchcairn.firmware.receipt",
-                                                      "patchcairn.boot.observation"})
+        self.assertEqual(pc_records.PLANNED_SCHEMAS, {"patchcairn.schedule", "patchcairn.deletion.attempt",
+                                                      "patchcairn.deletion.receipt", "patchcairn.handoff.receipt",
+                                                      "patchcairn.firmware.receipt"})
         self.assertEqual(pc_records.CONTAINERS, {"engine_marker", "session_state", "session_creation",
                                                  "response_envelope", "workflows_template", "tool_catalog", "toolkit_marker"})
         # One name per family: new storage records are kinds of patchcairn.storage, so no second name may
@@ -302,12 +301,12 @@ class SchemaTests(unittest.TestCase):
             self.assertIs(pc_records.register_reader("patchcairn.storage", reader), reader)
             self.assertIs(pc_records.READERS["patchcairn.storage"], reader)
             for name, candidate, code in (("patchcairn.storage", len, "reader-registered"),
-                                          ("patchcairn.package", len, "schema-planned"),
+                                          ("patchcairn.schedule", len, "schema-planned"),
                                           ("patchcairn.unknown", len, "schema-unregistered"),
                                           ("patchcairn.service", "not callable", "invalid-reader")):
                 with self.subTest(name=name):
                     self.refused(lambda: pc_records.register_reader(name, candidate), code)
-            self.assertNotIn("patchcairn.package", pc_records.READERS)
+            self.assertNotIn("patchcairn.schedule", pc_records.READERS)
 
 
 class TimeTests(unittest.TestCase):
@@ -447,12 +446,12 @@ TODAY_ADAPTER_KINDS = {
     "storage.backup_create": ("backup_create",), "storage.restore": ("backup_restore",),
     "storage.quarantine": ("cleanup_quarantine",), "storage.quarantine_restore": ("backup_restore",),
     "storage.purge": ("permanent_purge",), "fixture.assessment": ("assessment",),
-    "diagnostic.collect": ("assessment",), "system.reviewed_external": ("update", "repair"),
+    "diagnostic.collect": ("assessment",),
 }
 FACT_KEYS = {"family", "kinds", "acknowledgments", "conditional_acknowledgments", "backup_receipt",
-             "policy_coverable", "scheduled_policy_coverable", "os_consent", "irreversible", "transitional",
+             "policy_coverable", "scheduled_policy_coverable", "os_consent", "irreversible",
              "conditional_decisions", "run_kinds", "independent_failures"}
-BOOLEAN_FACTS = {"policy_coverable", "scheduled_policy_coverable", "irreversible", "transitional", "independent_failures"}
+BOOLEAN_FACTS = {"policy_coverable", "scheduled_policy_coverable", "irreversible", "independent_failures"}
 NEW_ADAPTERS = {"storage.delete_selected", "system.update_handoff", "system.firmware_update"}
 
 
@@ -465,9 +464,8 @@ class AdapterFactsTests(unittest.TestCase):
         ids = {"storage.backup_create", "storage.restore", "storage.quarantine", "storage.quarantine_restore",
                "storage.purge", "storage.remove_originals", "storage.retention_release", "storage.retention_forget",
                "storage.session_release", "package.upgrade", "package.reinstall", "system.repair", "diagnostic.collect",
-               "fixture.assessment", "system.reviewed_external"} | NEW_ADAPTERS
+               "fixture.assessment"} | NEW_ADAPTERS
         self.assertEqual(set(pc_records.ADAPTERS), ids)
-        self.assertEqual(with_fact("transitional"), {"system.reviewed_external"})
 
     def test_todays_adapters_keep_their_kinds(self):
         for adapter_id, kinds in TODAY_ADAPTER_KINDS.items():
@@ -480,8 +478,7 @@ class AdapterFactsTests(unittest.TestCase):
                     "storage.retention_release": "retention", "storage.retention_forget": "retention",
                     "storage.session_release": "retention", "package.upgrade": "update", "package.reinstall": "repair",
                     "system.repair": "repair", "diagnostic.collect": "assessment", "fixture.assessment": "assessment",
-                    "system.reviewed_external": "update", "storage.delete_selected": "cleanup", "system.update_handoff": "update",
-                    "system.firmware_update": "update"}
+                    "storage.delete_selected": "cleanup", "system.update_handoff": "update", "system.firmware_update": "update"}
         self.assertEqual({key: facts["family"] for key, facts in pc_records.ADAPTERS.items()}, families)
         self.assertLessEqual(set(families.values()), pc_records.FAMILIES)
         for adapter_id in pc_records.ADAPTERS:
@@ -556,7 +553,7 @@ class AdapterFactsTests(unittest.TestCase):
     def test_backup_receipts_and_os_consent(self):
         self.assertEqual(with_fact("backup_receipt", "required"), {"storage.restore", "storage.remove_originals"})
         self.assertEqual(with_fact("backup_receipt", "optional"), {"storage.quarantine", "storage.purge"})
-        self.assertEqual(with_fact("os_consent", "always"), {"system.repair", "system.reviewed_external"})
+        self.assertEqual(with_fact("os_consent", "always"), {"system.repair"})
         self.assertEqual(with_fact("os_consent", "per_route"), {"package.upgrade", "package.reinstall", "system.update_handoff",
                                                                 "system.firmware_update"})
 

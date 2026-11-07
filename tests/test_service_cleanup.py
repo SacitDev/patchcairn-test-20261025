@@ -157,6 +157,7 @@ class ServicePrivacyTests(ServiceFixtures):
         action = {"action_id": "quarantine-fixture", "adapter_id": payload["operation"], "adapter_payload_sha256": digest(payload)}
         operation = {"operation_id": "operation-fixture", "action_id": action["action_id"], "plan_sha256": "a" * 64}
         engine.read_session, engine.pending_items = mock.Mock(return_value=state), mock.Mock(return_value=False)
+        engine.admit_effect = mock.Mock()
         engine.begin_operation = mock.Mock(return_value={"data": operation})
         service._state, service._binding = mock.Mock(return_value=state), mock.Mock(return_value=(action, payload))
         native = mock.Mock()
