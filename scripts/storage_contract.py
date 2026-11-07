@@ -72,6 +72,19 @@ def read_storage(record):
 pc_records.register_reader(PLAN, read_storage)
 
 
+def read_payload(record):
+    """The registered reader of patchcairn.storage.adapter records: the schema check and exactly the payload fields;
+    validate_payload checks what they hold."""
+    pc_records.require_schema(record, PAYLOAD)
+    fields = {"schema", "schema_version"}
+    if set(record) - (PAYLOAD_REQUIRED | PAYLOAD_OPTIONAL | fields) or (PAYLOAD_REQUIRED | fields) - set(record):
+        _refuse("Unexpected or missing storage payload fields")
+    return record
+
+
+pc_records.register_reader(PAYLOAD, read_payload)
+
+
 def plan_kind(adapter_id):
     """The storage plan kind the storage adapter ``adapter_id`` binds."""
     kind = PLAN_KINDS.get(adapter_id) if isinstance(adapter_id, str) else None
@@ -118,10 +131,7 @@ def deletion_size(adapter_id, plan):
 def validate_payload(payload, *, adapter_id, mode, plan_sha256):
     """Return the storage ``payload`` of a reviewed action if it binds exactly ``adapter_id``, ``mode`` and the
     storage plan whose digest is ``plan_sha256``; raise pc_records.Refusal otherwise."""
-    pc_records.require_schema(payload, PAYLOAD)
-    fields = {"schema", "schema_version"}
-    if set(payload) - (PAYLOAD_REQUIRED | PAYLOAD_OPTIONAL | fields) or (PAYLOAD_REQUIRED | fields) - set(payload):
-        _refuse("Unexpected or missing storage payload fields")
+    read_payload(payload)
     kind = plan_kind(adapter_id)
     plan = payload["storage_plan"]
     if (payload["operation"] != adapter_id or payload["mode"] != mode or not isinstance(plan, dict)

@@ -565,6 +565,23 @@ class WorkflowTests(WorkflowFixture):
             self.assertEqual(self.engine.read_session(self.sid)["evidence"]["fictional-brackets-1"]["facts"], facts)
         self.assertEqual(len(self.engine.read_session(self.sid)["evidence"]), number)
 
+    def test_journal_longer_than_the_default_item_limit_reads_back(self):
+        # The journal is written under its byte cap alone, so it must read back with more events than one list may
+        # hold by default (about 33 MB here, under the 64 MB cap).
+        directory = self.engine.journal.directory(self.sid)
+        self.addCleanup((directory / "session.json").unlink, missing_ok=True)
+        bundle = engine_journal.decode_record((directory / "session.json").read_bytes(), max_bytes=engine_journal.JOURNAL_MAX_BYTES)
+        state, events = bundle["state"], bundle["events"]
+        while len(events) < pc_records.DEFAULT_MAX_ITEMS:
+            event = {"revision": len(events), "at": state["updated_utc"], "type": "fictional_event", "details": {}, "state_sha256": "0" * 64,
+                     "previous": events[-1]["sha256"]}
+            event["sha256"] = digest(event)
+            events.append(event)
+        state["revision"] = len(events)
+        self.engine.journal.commit(directory, state, events, "fictional_event", {})
+        self.assertEqual(self.engine.read_session(self.sid)["revision"], pc_records.DEFAULT_MAX_ITEMS)
+        self.assertGreater((directory / "session.json").stat().st_size, 30_000_000)
+
     def test_recovery_artifact_permission_drift_is_refused_before_any_content_read(self):
         output = self.root / "work" / "fictional-private-recovery"
         private_workspace.ensure_private_directory(output, create=True)
@@ -659,7 +676,8 @@ class WorkflowTests(WorkflowFixture):
 
 # Run in a child process: a facade method assigned onto its own module would recurse, and Python 3.15 on Windows does not
 # stop that recursion at the recursion limit, so the child first caps its own memory (a Job Object on Windows,
-# RLIMIT_AS on Linux) and the parent waits at most 60 seconds.
+# RLIMIT_AS on Linux) and the parent waits at most 60 seconds. macOS does not enforce RLIMIT_AS, so the test does not run
+# there: the guard it checks is the same Python code on every platform.
 SELF_ASSIGNED_CHILD = r"""
 import os, sys
 sys.path.insert(0, sys.argv[1])
@@ -705,8 +723,13 @@ class AdmissionMessageTests(unittest.TestCase):
                   "Native private engine storage admission held: private-path-invalid (" + reason + ")"),
                  (private_workspace.PrivateWorkspaceError("private-path-invalid"), WorkflowRefusal,
                   "Native private engine storage admission held: private-path-invalid"),
-                 (private_workspace.PrivateWorkspaceError("private-acl-unavailable", "the folder's access list cannot be read"), PrivacyCapabilityHold,
-                  "Native private storage is unavailable: private-acl-unavailable (the folder's access list cannot be read)"))
+                 (private_workspace.PrivateWorkspaceError("private-dacl-unavailable", "the folder's access list cannot be read"), PrivacyCapabilityHold,
+                  "Native private storage is unavailable: private-dacl-unavailable (the folder's access list cannot be read)"),
+                 # The Linux file-system check refused for a reason it does not name: still no owner-only storage here.
+                 (private_workspace.PrivateWorkspaceError("private-linux-filesystem-refused"), PrivacyCapabilityHold,
+                  "Native private storage is unavailable: private-linux-filesystem-refused"),
+                 (private_workspace.PrivateWorkspaceError("private-darwin-acl-not-empty"), WorkflowRefusal,
+                  "Native private engine storage admission held: private-darwin-acl-not-empty"))
         for error, kind, message in cases:
             with self.subTest(code=error.code, message=str(error)):
                 with mock.patch.object(private_workspace, "ensure_private_file", side_effect=error), self.assertRaises(WorkflowRefusal) as caught:
@@ -738,6 +761,7 @@ class FacadeTests(unittest.TestCase):
         self.assertIn("status", checked)
         self.assertIn("evidence_rows", checked)
 
+    @unittest.skipIf(sys.platform == "darwin", "only on windows, linux: the recursion child caps its own memory there before it runs")
     def test_facade_method_assigned_onto_its_module_calls_the_original(self):
         done = subprocess.run([sys.executable, "-I", "-S", "-B", "-c", SELF_ASSIGNED_CHILD, str(ROOT / "scripts")], capture_output=True,
                               text=True, encoding="utf-8", timeout=60)

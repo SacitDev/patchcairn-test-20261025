@@ -788,7 +788,14 @@ class InventoryEvidenceTests(WorkflowFixture):
         diagnostic_core.validate_request(request)
         self.assertEqual(self.register(sid, encoded(request))["data"]["kind"], "inventory")
 
-    def test_inventory_that_does_not_name_platform_is_not_decoded_again(self):
+    def test_inventory_with_observations_below_the_top_level_is_not_a_collector_result(self):
+        # It passes the byte check (both names are there), but only a top-level "platform" and "observations" make the
+        # collectors' shape, so this other-platform, practice-mode record is recorded as plain inventory.
+        sid = self.real_session()
+        nested = encoded({"platform": "macos", "collection_mode": "fixture", "details": {"observations": []}})
+        self.assertEqual(self.register(sid, nested)["data"]["kind"], "inventory")
+
+    def test_inventory_without_the_collector_shape_is_not_decoded_again(self):
         sid = self.real_session()
         storage = encoded({"fictional": True, "entries": [{"name": "fictional.data", "size": 1}]})
         named = encoded({"fictional": True, "entries": [{"name": "platform", "size": 1}]})

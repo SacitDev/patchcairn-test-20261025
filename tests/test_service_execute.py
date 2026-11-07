@@ -22,6 +22,7 @@ sys.dont_write_bytecode = True
 ROOT = Path(__file__).absolute().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 from workflow_core import WorkflowEngine, WorkflowRefusal, digest
+import diagnostic_core
 import pc_records
 from workflow_service import WorkflowService, ServiceRefusal, verify_storage_artifact
 from storage_ops import StorageRefusal, StorageService
@@ -259,6 +260,33 @@ class AdmissionTests(SessionFixtures):
             self.assertEqual(self.execute(action, sha)["outcome"], "succeeded")
         self.assertEqual(len(seen), 1)
         self.assertIsNotNone(seen[0])
+
+    def test_a_clock_step_back_after_begin_is_refused_as_a_clock_step(self):
+        # The computer's clock moves back just after the backup begins, so the outcome PatchCairn stamps is earlier than
+        # the start it stamped: the refusal names the clock step, and the step stays open to be checked.
+        action, _native = self.backup_action()
+        sha = self.approve(action)
+        clock, begin, readings = pc_records.utc_now, self.engine.begin_operation, []
+
+        def stepped_clock():
+            if not readings:
+                return clock()
+            readings.append(readings[-1] + timedelta(microseconds=1))
+            return readings[-1].isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+        def begin_then_step(*args, **kwargs):
+            begun = begin(*args, **kwargs)
+            # From here the clock reads 1 second before that start and moves on 1 microsecond a reading, however long the backup takes.
+            readings.append(pc_records.parse_utc(begun["data"]["started_utc"]) - timedelta(seconds=1))
+            return begun
+        with mock.patch("pc_records.utc_now", side_effect=stepped_clock), mock.patch.object(self.engine, "begin_operation", side_effect=begin_then_step):
+            with self.assertRaises(WorkflowRefusal) as caught:
+                self.execute(action, sha)
+        self.assertEqual((caught.exception.code, str(caught.exception)), ("clock-step", diagnostic_core.CLOCK_STEP_MESSAGE))
+        (operation,) = self.state()["operations"].values()
+        self.assertIsNone(operation["outcome"])
+        # Observing again, with the clock right, settles the step from what the backup actually wrote.
+        self.assertEqual(self.service.reconcile_operation(self.sid, operation_id=operation["operation_id"])["outcome"], "succeeded")
 
 
 class PrepareTests(ServiceFixtures):

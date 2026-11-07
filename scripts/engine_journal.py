@@ -8,15 +8,14 @@ from contextlib import ExitStack, contextmanager
 import hashlib
 import os
 from pathlib import Path, PurePosixPath
-import re
 import stat
 import sys
 import uuid
 
+import diagnostic_core
 import pc_records
 from pc_records import SCHEMA_VERSION, digest, encoded
 import private_workspace
-import storage_contract
 
 
 BACKEND = "patchcairn.workflow.python"
@@ -44,7 +43,6 @@ RECORD_FIELDS = {
                                                     "observed_utc"}, set()),
     FIXTURE_ADAPTER: ({"operation", "fixture_plan", "fixture_plan_sha256", "inventory_sha256"}, set()),
     DIAGNOSTIC_ADAPTER: ({"operation", "request", "request_sha256", "inventory_sha256"}, set()),
-    STORAGE_ADAPTER: (set(storage_contract.PAYLOAD_REQUIRED), set(storage_contract.PAYLOAD_OPTIONAL)),
     PACKAGE: (set(PACKAGE_COMMON), set(PACKAGE_RUN | PACKAGE_OPTIONAL)),
     RECOVERY_RETENTION: ({"session_id", "required", "artifacts"}, set()),
     RECOVERY_BINDING: ({"output_root", "backup_receipt", "restore_receipt", "retention_evidence_id"}, set()),
@@ -53,16 +51,18 @@ RECORD_FIELDS = {
     BOOT_OBSERVATION: ({"last_boot_utc", "boot_id", "observed_utc", "source"}, set()),
     "patchcairn.review": ({"plan_sha256", "role", "verdict", "reviewer_id", "attestation"}, set()),
 }
-# Caps (D-017, D-040) scale with the published entry bound. Every JSON value, and every bracket the strict
-# decoder counts (also inside strings), takes at least one byte, so node caps equal to the byte caps never
-# refuse a record that the byte cap admitted when it was written. Journal events keep digests of what
+# Caps scale with the published entry bound. Every JSON value, and every bracket the strict
+# decoder counts (also inside strings), takes at least one byte, so node and item caps equal to the byte caps
+# never refuse a record that the byte cap admitted when it was written. Journal events keep digests of what
 # changed, never per-file lists, so the journal grows with events and evidence rows, not with file counts.
 JOURNAL_MAX_BYTES = 64_000_000
-JOURNAL_MAX_NODES = JOURNAL_MAX_BYTES
+JOURNAL_MAX_NODES = JOURNAL_MAX_ITEMS = JOURNAL_MAX_BYTES
 # Evidence content may be a storage plan with three per-file lists (inventory, files, skipped). The cap allows
 # MAX_BACKUP_ENTRIES rows averaging 512 bytes, about 90-character ASCII paths; rows reach about 700 bytes at
-# 200-unit ASCII paths and more for escaped non-ASCII names, so such plans are refused at registration, before
-# any effect. Measuring the real bound is G18's (B-BAK, MEAS).
+# 200-unit ASCII paths and more for escaped non-ASCII names. Such a plan is refused when its payload is registered,
+# before its operation begins. The operation's intent (that payload and a quarantine's file mapping) is larger and is
+# registered after the operation begins, before its first effect: refused there, the operation is left open with no
+# effect, and checking it closes it as not run. The storage measurements confirm the real bound.
 EVIDENCE_MAX_BYTES = 3 * 512 * pc_records.MAX_BACKUP_ENTRIES
 EVIDENCE_MAX_NODES = EVIDENCE_MAX_BYTES
 CREATION_KEYS = ("session_id", "engine_id", "backend", "mode", "platform", "created_utc", "creation_scope_sha256", "owner_id", "job")
@@ -101,7 +101,15 @@ def utc_time(value):
 
 
 def fresh(value, *, after=None, seconds=900):
-    checked(pc_records.fresh, value, after=after, seconds=seconds)
+    """pc_records.fresh as a WorkflowRefusal. A time ``value`` no more than pc_records' tolerance for clock steps before
+    ``after`` is refused as a clock step (diagnostic_core.stepped_back), not as out of order: the engine and the service
+    stamp both times in one flow, and a time a caller gives cannot be told apart from them, so it is read the same way."""
+    try:
+        checked(pc_records.fresh, value, after=after, seconds=seconds)
+    except WorkflowRefusal as error:
+        if error.code == "evidence-order" and diagnostic_core.stepped_back(utc_time(value), utc_time(after)):
+            raise WorkflowRefusal(diagnostic_core.CLOCK_STEP_MESSAGE, code="clock-step") from error
+        raise
 
 
 def bounded_text(value, name="text", limit=4000):
@@ -162,10 +170,11 @@ def no_links(path):
 
 
 def _admission_refusal(error):
-    """The engine's refusal for a private_workspace one: a platform or filesystem that cannot provide owner-only storage is
-    a PrivacyCapabilityHold; any other refusal (unsafe existing permissions, an existing name) a WorkflowRefusal."""
+    """The engine's refusal for a private_workspace one: a platform or filesystem that cannot provide owner-only storage
+    (private_workspace.capability_missing) is a PrivacyCapabilityHold; any other refusal (unsafe existing permissions, an
+    existing name) a WorkflowRefusal."""
     reason = error.code if str(error) == error.code else error.code + " (" + str(error) + ")"
-    if re.search(r"unavailable|foreign-filesystem|unsupported", error.code):
+    if private_workspace.capability_missing(error):
         return PrivacyCapabilityHold("Native private storage is unavailable: " + reason, code=error.code)
     return WorkflowRefusal("Native private engine storage admission held: " + reason, code=error.code)
 
@@ -245,8 +254,8 @@ def _private_digest(path, max_bytes):
     return hasher.hexdigest(), size
 
 
-def decode_record(data, *, max_bytes=pc_records.DEFAULT_MAX_BYTES, max_nodes=pc_records.DEFAULT_MAX_NODES):
-    return checked(pc_records.decode_strict, data, max_bytes=max_bytes, max_nodes=max_nodes)
+def decode_record(data, *, max_bytes=pc_records.DEFAULT_MAX_BYTES, max_nodes=pc_records.DEFAULT_MAX_NODES, max_items=pc_records.DEFAULT_MAX_ITEMS):
+    return checked(pc_records.decode_strict, data, max_bytes=max_bytes, max_nodes=max_nodes, max_items=max_items)
 
 
 def container(value, kind):
@@ -379,7 +388,8 @@ class Journal:
         directory = self.directory(session_id)
         try:
             marker = decode_record(self.read_owned(directory / "creation.json"))
-            bundle = decode_record(self.read_owned(directory / "session.json", JOURNAL_MAX_BYTES), max_bytes=JOURNAL_MAX_BYTES, max_nodes=JOURNAL_MAX_NODES)
+            bundle = decode_record(self.read_owned(directory / "session.json", JOURNAL_MAX_BYTES), max_bytes=JOURNAL_MAX_BYTES, max_nodes=JOURNAL_MAX_NODES,
+                                   max_items=JOURNAL_MAX_ITEMS)
         except FileNotFoundError as error:
             raise WorkflowRefusal("Registered session state is missing; no silent reconstruction") from error
         exact_fields(bundle, {"state", "events"}, {"state", "events"})

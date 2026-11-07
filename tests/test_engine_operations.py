@@ -20,6 +20,7 @@ import uuid
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).absolute().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
+import diagnostic_core
 import engine_journal
 import engine_operations
 import engine_updates
@@ -135,6 +136,23 @@ class WorkflowTests(WorkflowFixture):
             self.begin()
         with self.assertRaises(WorkflowRefusal):
             self.engine.register_plan(self.sid, plan=self.plan)
+
+    def test_an_outcome_stamped_just_before_its_start_is_a_clock_step(self):
+        # The clock steps back between the start and the outcome the engine stamps. Within pc_records' tolerance for clock
+        # steps the refusal says so; a larger gap keeps the ordering refusal. Neither finishes the operation.
+        self.apply_ready()
+        operation_id = self.begin()
+        started = pc_records.parse_utc(self.state()["operations"][operation_id]["started_utc"])
+        for seconds, code in ((0.5, "clock-step"), (pc_records.FUTURE_SKEW_SECONDS, "clock-step"), (pc_records.FUTURE_SKEW_SECONDS + 1, "evidence-order")):
+            with self.subTest(seconds=seconds):
+                stepped = (started - timedelta(seconds=seconds)).isoformat(timespec="microseconds").replace("+00:00", "Z")
+                with mock.patch("pc_records.utc_now", return_value=stepped), self.assertRaises(WorkflowRefusal) as caught:
+                    self.finish(operation_id)
+                self.assertEqual(caught.exception.code, code)
+                self.assertEqual(str(caught.exception) == diagnostic_core.CLOCK_STEP_MESSAGE, code == "clock-step")
+                self.assertIsNone(self.state()["operations"][operation_id]["outcome"])
+        self.finish(operation_id)
+        self.assertEqual(self.state()["operations"][operation_id]["outcome"], "succeeded")
 
     def test_pause_active_prevents_new_actions_and_waits_for_safe_receipt(self):
         self.apply_ready()

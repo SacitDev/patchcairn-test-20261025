@@ -9,6 +9,7 @@ from contextlib import contextmanager
 import errno
 import os
 from pathlib import Path, PurePosixPath
+import re
 import shutil
 import stat
 import sys
@@ -579,6 +580,29 @@ class RefusalTypeTests(unittest.TestCase):
         refusal = win32_files.PrivacyRefusal("private-dacl-unprotected")
         self.assertIsInstance(refusal, pc_records.Refusal)
         self.assertEqual((refusal.code, str(refusal)), ("private-dacl-unprotected", "private-dacl-unprotected"))
+
+    def test_a_missing_capability_is_told_apart_from_a_refused_path(self):
+        missing = ("private-platform-unavailable", "private-persistent-acl-unavailable", "private-linux-foreign-filesystem",
+                   "private-darwin-fs-ownership-ignored", "private-linux-filesystem-refused", "private-darwin-fs-refused",
+                   "private-fixed-local-volume-required", "private-lock-unavailable")
+        refused = ("private-owner-or-mode-refused", "private-dacl-broad-or-unknown", "private-dacl-unsupported", "private-darwin-acl-not-empty",
+                   "private-darwin-acl-refused", "private-linux-path-changed", "private-directory-exists", "private-path-invalid", "private-lock-held",
+                   "private-unavailable-fictional")
+        for codes, expected in ((missing, True), (refused, False)):
+            for code in codes:
+                with self.subTest(code=code):
+                    self.assertIs(private.capability_missing(private.PrivateWorkspaceError(code, "fictional reason")), expected)
+        self.assertIs(private.capability_missing(ValueError("private-platform-unavailable")), False)
+
+    def test_capability_codes_are_codes_this_module_gives(self):
+        # private_workspace gives its own codes, the Windows checks' codes unchanged, and the Linux and macOS checks' codes
+        # renamed; a code renamed in any of them must leave no stale name in the set.
+        def given(module, pattern):
+            return set(re.findall(pattern, (ROOT / "scripts" / (module + ".py")).read_text(encoding="utf-8")))
+        codes = given("private_workspace", r'"(private-[a-z-]*[a-z])"') | given("win32_files", r'"(private-[a-z-]*[a-z])"')
+        codes |= {"private-" + code for code in given("darwin_privacy", r'"(darwin-(?:acl|fs)-[a-z-]*[a-z])"')}
+        codes |= {"private-linux-" + code for code in given("linux_privacy", r'"linux-private-([a-z-]*[a-z])"')}
+        self.assertLessEqual(private.CAPABILITY_CODES, codes)
 
 
 if __name__ == "__main__":

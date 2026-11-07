@@ -6,6 +6,7 @@ import copy
 from pathlib import Path
 import sys
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).absolute().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -95,6 +96,19 @@ class StorageContractTests(unittest.TestCase):
         self.assertIs(storage_contract.read_storage(record), record)
         self.refused(lambda: storage_contract.read_storage(dict(record, kind="fictional")), "storage-refusal")
         self.refused(lambda: storage_contract.read_storage(dict(record, schema_version=2)), "schema-version")
+
+    def test_payload_reader_is_registered_here_and_checks_exact_fields(self):
+        self.assertIs(pc_records.READERS[storage_contract.PAYLOAD], storage_contract.read_payload)
+        value = payload(pc_records.ADAPTER_STORAGE_PURGE)
+        self.assertIs(storage_contract.read_payload(value), value)
+        self.refused(lambda: storage_contract.read_payload(payload(unexpected=True)))
+        self.refused(lambda: storage_contract.read_payload({key: item for key, item in payload().items() if key != "mode"}))
+        self.refused(lambda: storage_contract.read_payload(dict(payload(), schema_version=2)), "schema-version")
+        self.refused(lambda: storage_contract.read_payload(dict(payload(), schema=storage_contract.PLAN)), "schema-name")
+        # validate_payload reads the payload through this one reader before anything else.
+        with mock.patch.object(storage_contract, "read_payload", side_effect=pc_records.Refusal("fictional-reader")) as read:
+            self.refused(lambda: self.check(payload()), "fictional-reader")
+        read.assert_called_once()
 
     def test_storage_record_kinds_cover_plan_kinds(self):
         # The record kinds come from the plan kinds, so a storage plan of every adapter reads back as a storage record.

@@ -31,6 +31,30 @@ def _hold(code, message=None):
     raise PrivateWorkspaceError(code, message)
 
 
+# The refusals that mean this computer, drive or file system cannot give owner-only storage at all: the checks, or the
+# system calls they need, are missing or fail; the drive is not a fixed local one; or the file system ignores owners or
+# is refused as a whole. Every other code refuses one path: unsafe permissions, a link, an existing or a missing name.
+CAPABILITY_CODES = frozenset({
+    "private-platform-unavailable", "private-windows-api-unavailable", "private-token-unavailable", "private-descriptor-unavailable",
+    "private-file-metadata-unavailable", "private-canonical-path-unavailable", "private-lock-unavailable", "private-fixed-local-volume-required",
+    "private-dacl-unavailable", "private-dacl-unavailable-or-null", "private-owner-or-acl-unavailable", "private-persistent-acl-unavailable",
+    "private-darwin-acl-capability-unavailable", "private-darwin-acl-api-unavailable", "private-darwin-acl-call-unavailable",
+    "private-darwin-acl-identity-unavailable", "private-darwin-acl-path-unavailable", "private-darwin-acl-platform-unavailable",
+    "private-darwin-acl-read-unavailable", "private-darwin-acl-release-unavailable", "private-darwin-acl-state-unavailable",
+    "private-darwin-fs-capability-unavailable", "private-darwin-fs-abi-unavailable", "private-darwin-fs-api-unavailable",
+    "private-darwin-fs-close-unavailable", "private-darwin-fs-descriptor-unavailable", "private-darwin-fs-path-unavailable",
+    "private-darwin-fs-query-unavailable", "private-darwin-fs-unsupported-filesystem", "private-darwin-fs-ownership-ignored", "private-darwin-fs-refused",
+    "private-linux-filesystem-capability-unavailable", "private-linux-abi-unavailable", "private-linux-close-unavailable",
+    "private-linux-descriptor-unavailable", "private-linux-filesystem-unavailable", "private-linux-foreign-filesystem",
+    "private-linux-identity-unavailable", "private-linux-libc-unavailable", "private-linux-path-unavailable", "private-linux-filesystem-refused",
+})
+
+
+def capability_missing(error):
+    """True when ``error`` is a PrivateWorkspaceError whose code is in CAPABILITY_CODES."""
+    return isinstance(error, PrivateWorkspaceError) and error.code in CAPABILITY_CODES
+
+
 def relative_parts(path, root):
     """The parts of ``path`` below ``root``: () for ``root`` itself and None when ``path`` is outside it.
 
