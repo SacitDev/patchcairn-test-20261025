@@ -31,14 +31,13 @@ import engine_restart
 import engine_schedule
 import engine_text
 import engine_updates
-from engine_journal import (BACKEND, DIAGNOSTIC_ADAPTER, EVIDENCE_MAX_BYTES, EVIDENCE_MAX_NODES, EXTERNAL_ADAPTER, EXTERNAL_PREFLIGHT,
-                            EXTERNAL_RECEIPT, INSTALLER_METADATA, JOURNAL_MAX_BYTES, PUBLISHER_SIGNATURE, QUARANTINE_RECOVERY, RECORD_FIELDS,
-                            RECOVERY_BINDING, RECOVERY_RETENTION, RESTART_PENDING, RESTART_VERIFICATION, SERVICE_RECORD, STORAGE_ADAPTER,
-                            WINDOWS_BOOT, Journal, PrivacyCapabilityHold, WorkflowRefusal, atomic_replace, decode_record, exact_fields, no_links,
-                            older_folder, older_format_message, read_record_bytes, record_identifier, typed_record, utc_time)
+from engine_journal import (BACKEND, DIAGNOSTIC_ADAPTER, EVIDENCE_MAX_BYTES, EVIDENCE_MAX_NODES, JOURNAL_MAX_BYTES, QUARANTINE_RECOVERY, RECORD_FIELDS,
+                            RECOVERY_BINDING, RECOVERY_RETENTION, SERVICE_RECORD, STORAGE_ADAPTER, Journal, PrivacyCapabilityHold, WorkflowRefusal,
+                            atomic_replace, decode_record, exact_fields, no_links, older_folder, older_format_message, read_record_bytes,
+                            record_identifier, restart_state, typed_record, utc_time)
 # The label tables sit next to JOBS and CHECKPOINTS so the service reads them here, never from an engine module.
 from engine_text import (ACTION_LABELS, CHECKPOINT_LABELS, CHECKPOINTS, COMMANDS, JOBS, STAGE_LABELS, initial_menu, parse_command,
-                         report_labels)
+                         report_labels, retained_text, run_ticket_text, update_findings)
 from pc_records import SCHEMA_VERSION, digest, encoded
 
 
@@ -110,8 +109,6 @@ class WorkflowEngine:
     def _registry_lock(self):
         return self.journal.registry_lock()
 
-    _outstanding_effects = _forward(engine_journal.outstanding_effects)
-
     # engine_text
     status = _forward(engine_text.status)
     cost = _forward(engine_text.cost)
@@ -133,6 +130,7 @@ class WorkflowEngine:
     approve_plan = _forward(engine_plans.approve_plan)
     record_irreversible_ack = _forward(engine_plans.record_irreversible_ack)
     issue_irreversible_warning = _forward(engine_plans.issue_irreversible_warning)
+    record_conditional_decision = _forward(engine_plans.record_conditional_decision)
     set_standing_policy = _forward(engine_plans.set_standing_policy)
     pending_items = _static(engine_plans.pending_items)
     advance_stage = _forward(engine_plans.advance_stage)
@@ -141,6 +139,7 @@ class WorkflowEngine:
 
     # engine_operations
     begin_operation = _forward(engine_operations.begin_operation)
+    admit_effect = _forward(engine_operations.admit_effect)
     outcome_rows = _forward(engine_operations.outcome_rows)
     finish_operation = _forward(engine_operations.finish_operation)
     pause = _forward(engine_operations.pause)
@@ -149,15 +148,10 @@ class WorkflowEngine:
 
     # engine_restart
     record_restart_pending = _forward(engine_restart.record_restart_pending)
-    decide_restart = _forward(engine_restart.decide_restart)
-    validate_restart_verification = _forward(engine_restart.validate_restart_verification)
-    record_restart_verification = _forward(engine_restart.record_restart_verification)
+    record_boot_observation = _forward(engine_restart.record_boot_observation)
 
     # engine_updates
     update_binding = _forward(engine_updates.update_binding)
-    validate_external_plan = _forward(engine_updates.validate_external_plan)
-    external_preflight = _external_preflight = _forward(engine_updates.external_preflight)
-    record_protected_consent = _forward(engine_updates.record_protected_consent)
 
     # engine_recovery
     reverify = _forward(engine_recovery.reverify)

@@ -4,7 +4,7 @@ owned by workflow_core.WorkflowEngine), the record names and size caps, and the 
 from __future__ import annotations
 
 import copy
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import hashlib
 import os
 from pathlib import Path, PurePosixPath
@@ -26,15 +26,14 @@ SHA = pc_records.SHA256
 SERVICE_RECORD = "patchcairn.service"
 ASSESSMENT_ACCESS, ASSESSMENT_SUMMARY, ASSESSMENT_VERIFICATION = ("patchcairn.assessment.access", "patchcairn.assessment.summary",
                                                                   "patchcairn.assessment.verification")
-FIXTURE_ADAPTER, DIAGNOSTIC_ADAPTER, EXTERNAL_ADAPTER, STORAGE_ADAPTER = ("patchcairn.fixture.adapter", "patchcairn.diagnostic.adapter",
-                                                                          "patchcairn.external.adapter", "patchcairn.storage.adapter")
-EXTERNAL_PLAN, EXTERNAL_RECOVERY, EXTERNAL_VERIFICATION = "patchcairn.external.plan", "patchcairn.external.recovery", "patchcairn.external.verification"
-EXTERNAL_PREFLIGHT, EXTERNAL_RECEIPT = "patchcairn.external.preflight", "patchcairn.external.receipt"
-PUBLISHER_SIGNATURE, INSTALLER_METADATA = "patchcairn.publisher.signature", "patchcairn.installer.metadata"
+FIXTURE_ADAPTER, DIAGNOSTIC_ADAPTER, STORAGE_ADAPTER = "patchcairn.fixture.adapter", "patchcairn.diagnostic.adapter", "patchcairn.storage.adapter"
 RECOVERY_RETENTION, RECOVERY_BINDING, QUARANTINE_RECOVERY = "patchcairn.recovery.retention", "patchcairn.recovery.binding", "patchcairn.quarantine.recovery"
-WINDOWS_BOOT, RESTART_PENDING, RESTART_VERIFICATION = "patchcairn.windows.boot.observation", "patchcairn.restart.pending", "patchcairn.restart.verification"
-_EXTERNAL_RECEIPT_FIELDS = {"operation_id", "action_id", "plan_sha256", "adapter_payload_sha256", "mode", "platform", "catalog_id", "observed_utc", "outcome",
-                            "tool_exit_code", "postcondition_state", "evidence_ids", "observed_effects", "limitations"}
+PACKAGE, BOOT_OBSERVATION = "patchcairn.package", "patchcairn.boot.observation"
+# The fields of a package payload (an update or repair step): those every payload has, those of a run PatchCairn starts
+# (a process or a terminal; never a Settings step), and those only some payloads carry. engine_updates reads it.
+PACKAGE_COMMON = frozenset({"manager", "operation", "id", "version", "source", "group", "flags", "preflight", "transaction_sha256", "run_kind"})
+PACKAGE_RUN = frozenset({"dependencies", "agreements", "recipe", "run_files", "executable", "environment_sha256"})
+PACKAGE_OPTIONAL = frozenset({"depends_on", "update", "device", "conditional", "settings_page"})
 _ASSESSMENT_COMMON = {"job", "mode", "scope_sha256", "settings_revision"}
 # Exact fields of each typed record family the engine reads, besides "schema" and "schema_version":
 # (required, optional).
@@ -45,28 +44,14 @@ RECORD_FIELDS = {
                                                     "observed_utc"}, set()),
     FIXTURE_ADAPTER: ({"operation", "fixture_plan", "fixture_plan_sha256", "inventory_sha256"}, set()),
     DIAGNOSTIC_ADAPTER: ({"operation", "request", "request_sha256", "inventory_sha256"}, set()),
-    EXTERNAL_ADAPTER: ({"operation", "external_plan", "external_plan_sha256", "inventory_sha256"}, set()),
     STORAGE_ADAPTER: (set(storage_contract.PAYLOAD_REQUIRED), set(storage_contract.PAYLOAD_OPTIONAL)),
-    EXTERNAL_PLAN: ({"kind", "platform", "mode", "catalog_id", "official_tool", "argv", "targets", "target_versions", "target_identities", "sources",
-                     "provenance_evidence_ids", "compatibility_evidence_ids", "recovery_plan", "recovery_plan_sha256", "verification_plan",
-                     "verification_plan_sha256", "scope"}, set()),
-    EXTERNAL_RECOVERY: ({"strategy", "evidence_ids", "limits"}, set()),
-    EXTERNAL_VERIFICATION: ({"original_success_condition", "checks"}, set()),
-    EXTERNAL_PREFLIGHT: ({"action_id", "plan_sha256", "external_plan_sha256", "mode", "platform", "observed_utc", "targets"}, set()),
-    EXTERNAL_RECEIPT: (_EXTERNAL_RECEIPT_FIELDS, set()),
-    PUBLISHER_SIGNATURE: ({"mode", "platform", "artifact_sha256", "publisher", "status", "source_id", "method", "observed_utc"}, set()),
-    INSTALLER_METADATA: ({"mode", "platform", "artifact_sha256", "target_id", "version", "channel", "architecture", "installation_scope", "publisher",
-                          "source_id", "observed_utc"}, set()),
+    PACKAGE: (set(PACKAGE_COMMON), set(PACKAGE_RUN | PACKAGE_OPTIONAL)),
     RECOVERY_RETENTION: ({"session_id", "required", "artifacts"}, set()),
     RECOVERY_BINDING: ({"output_root", "backup_receipt", "restore_receipt", "retention_evidence_id"}, set()),
     QUARANTINE_RECOVERY: ({"output_root", "quarantine_receipt", "restore_plan", "restore_plan_sha256", "retention_evidence_id"}, set()),
-    WINDOWS_BOOT: ({"mode", "platform", "observed_utc", "last_boot_utc", "source"}, set()),
-    RESTART_PENDING: ({"session_id", "operation_id", "action_id", "plan_sha256", "settings_revision", "scope_sha256", "adapter_payload_sha256",
-                       "external_plan_sha256", "mode", "platform", "catalog_id", "original_exit_code", "observed_utc", "native_receipt_relative_path",
-                       "native_receipt_sha256", "before_boot_evidence_id"}, set()),
-    RESTART_VERIFICATION: ({"session_id", "operation_id", "action_id", "plan_sha256", "settings_revision", "scope_sha256", "external_plan_sha256", "mode",
-                            "platform", "catalog_id", "original_exit_code", "pending_evidence_id", "restart_decision_message_id", "observed_utc",
-                            "before_boot_evidence_id", "after_boot_evidence_id", "targets", "checks"}, set()),
+    # When this computer last started; boot_id is None where the operating system has none.
+    BOOT_OBSERVATION: ({"last_boot_utc", "boot_id", "observed_utc", "source"}, set()),
+    "patchcairn.review": ({"plan_sha256", "role", "verdict", "reviewer_id", "attestation"}, set()),
 }
 # Caps (D-017, D-040) scale with the published entry bound. Every JSON value, and every bracket the strict
 # decoder counts (also inside strings), takes at least one byte, so node caps equal to the byte caps never
@@ -137,13 +122,15 @@ def _reader(name):
     return read
 
 
-# One registered reader per typed record family the engine owns (pc_records.READERS).
-_READERS = {name: pc_records.register_reader(name, _reader(name)) for name in RECORD_FIELDS}
+# One registered reader per typed record family the engine owns (pc_records.READERS); the package payload's reader,
+# which also checks how its fields combine, is engine_updates'.
+_OWN_READERS = (PACKAGE, "patchcairn.review")  # checked beyond their fields by engine_updates and engine_decisions
+_READERS = {name: pc_records.register_reader(name, _reader(name)) for name in RECORD_FIELDS if name not in _OWN_READERS}
 
 
 def typed_record(value, name):
     """Return ``value`` if it is a record of the engine family ``name`` with exactly its fields."""
-    return _READERS[name](value)
+    return (pc_records.READERS[name] if name in _OWN_READERS else _READERS[name])(value)
 
 
 def ids(value, name="identifiers", *, allow_empty=True):
@@ -174,15 +161,21 @@ def no_links(path):
     return path
 
 
+def _admission_refusal(error):
+    """The engine's refusal for a private_workspace one: a platform or filesystem that cannot provide owner-only storage is
+    a PrivacyCapabilityHold; any other refusal (unsafe existing permissions, an existing name) a WorkflowRefusal."""
+    reason = error.code if str(error) == error.code else error.code + " (" + str(error) + ")"
+    if re.search(r"unavailable|foreign-filesystem|unsupported", error.code):
+        return PrivacyCapabilityHold("Native private storage is unavailable: " + reason, code=error.code)
+    return WorkflowRefusal("Native private engine storage admission held: " + reason, code=error.code)
+
+
 def _admitted(admission, *args, **kwargs):
-    """Run a private_workspace admission. A platform or filesystem that cannot provide owner-only storage is a
-    PrivacyCapabilityHold; any other refusal (unsafe existing permissions, an existing name) a WorkflowRefusal."""
+    """Run a private_workspace admission, its refusal as the engine's own (_admission_refusal)."""
     try:
         return admission(*args, **kwargs)
     except private_workspace.PrivateWorkspaceError as error:
-        if re.search(r"unavailable|foreign-filesystem|unsupported", error.code):
-            raise PrivacyCapabilityHold("Native private storage is unavailable: " + error.code, code=error.code) from error
-        raise WorkflowRefusal("Native private engine storage admission held: " + error.code, code=error.code) from error
+        raise _admission_refusal(error) from error
 
 
 def private_directory(path, *, create=False, parents=False, exist_ok=False):
@@ -290,7 +283,8 @@ def atomic_replace(path, data):
         private_directory(path.parent)
         if path.exists():
             private_file(path)
-        os.replace(temp, path)
+        # On Windows it is refused while a reader has ``path`` open, which is short: private_workspace.retried.
+        private_workspace.retried(os.replace, temp, path)
         private_file(path)
     finally:
         if temp.exists():
@@ -361,35 +355,25 @@ class Journal:
         private_directory(path / "evidence")
         return path
 
+    @staticmethod
     @contextmanager
-    def lock(self, session_id):
-        path = self.directory(session_id) / ".lock"
-        try:
-            private_directory(path, create=True)
-        except WorkflowRefusal as error:
-            if error.code != "private-directory-exists":
-                raise
-            raise WorkflowRefusal("Session is locked by another writer or interrupted write; inspect it before recovery") from error
-        try:
+    def _held(path, busy):
+        """The operating system's lock on the private file ``path`` (private_workspace.held_lock) for the with block, which
+        a killed holder cannot leave behind. ``busy`` is the refusal while a live process holds it."""
+        with ExitStack() as held:
+            try:
+                held.enter_context(private_workspace.held_lock(no_links(path)))
+            except private_workspace.PrivateWorkspaceError as error:
+                raise (WorkflowRefusal(busy) if error.code == "private-lock-held" else _admission_refusal(error)) from error
             yield
-        finally:
-            path.rmdir()
 
-    @contextmanager
+    def lock(self, session_id):
+        return self._held(self.directory(session_id) / ".lock", "Session is locked by another writer; try again when it has finished")
+
     def registry_lock(self):
         private_directory(self.work)
         private_file(self.work / "engine.json")
-        path = self.work / ".registry-lock"
-        try:
-            private_directory(path, create=True)
-        except WorkflowRefusal as error:
-            if error.code != "private-directory-exists":
-                raise
-            raise WorkflowRefusal("Another registry action is being coordinated; no concurrent mutation ticket is issued") from error
-        try:
-            yield
-        finally:
-            path.rmdir()
+        return self._held(self.work / ".registry-lock", "Another registry action is being coordinated; no concurrent mutation ticket is issued")
 
     def load(self, session_id):
         directory = self.directory(session_id)
@@ -454,8 +438,22 @@ class Journal:
         return copy.deepcopy(self.load(session_id)["state"])
 
 
+def restart_state(operation):
+    """The one reading of an operation's restart marker: "boot_observed" once a later boot is recorded, "waiting" while a
+    recorded signal stands, otherwise "none" (no signal, or the signal "none", read again from the same place). Whether the
+    check after the restart has finished is a separate fact: the operation's outcome."""
+    pending = operation.get("restart_pending")
+    if not pending:
+        return "none"
+    if (operation.get("restart_verification") or {}).get("boot_observed") is True:
+        return "boot_observed"
+    return "none" if pending.get("signal") == "none" else "waiting"
+
+
 def outstanding_effects(engine):
-    """Mutating operations anywhere in this engine's registry that still need an actual receipt or reconciliation."""
+    """Mutating operations anywhere in this engine's registry that still need an actual receipt or reconciliation: open,
+    unknown, failed or partial without a resolution (a verified failure has one), or waiting for a restart. "restart" is
+    True for an open operation that only waits for its restart (the restart class); any other entry blocks every action."""
     private_directory(engine.work)
     private_file(engine.work / "engine.json")
     outstanding = []
@@ -463,10 +461,11 @@ def outstanding_effects(engine):
         if directory.is_dir() and directory.name.startswith("session-"):
             state = engine.read_session(directory.name)
             for operation in state["operations"].values():
-                restart_unresolved = operation.get("restart_pending") and operation.get("restart_verification", {}).get("boot_observed") is not True
-                if (operation["mutating"] and (restart_unresolved or operation["outcome"] in {None, "unknown"} or operation["outcome"] in {"partial", "failed"}
+                restart = restart_state(operation) == "waiting"
+                if (operation["mutating"] and (restart or operation["outcome"] in {None, "unknown"} or operation["outcome"] in {"partial", "failed"}
                                                and not operation["resolution"])):
-                    outstanding.append({"session_id": state["session_id"], "operation_id": operation["operation_id"], "outcome": operation["outcome"]})
+                    outstanding.append({"session_id": state["session_id"], "operation_id": operation["operation_id"], "outcome": operation["outcome"],
+                                        "restart": restart and operation["outcome"] is None})
     return outstanding
 
 

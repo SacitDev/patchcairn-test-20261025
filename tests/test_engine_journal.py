@@ -10,12 +10,14 @@ from __future__ import annotations
 import ast
 import copy
 from datetime import datetime, timedelta, timezone
+import errno
 import json
 import os
 from pathlib import Path
 import sys
 import stat
 import subprocess
+import threading
 import types
 import unittest
 from unittest import mock
@@ -167,9 +169,9 @@ class PosixPrivacyTests(unittest.TestCase):
                     self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
                     self.assertEqual(path.stat().st_uid, os.geteuid())
                 with engine._lock(sid):
-                    self.assertEqual(stat.S_IMODE((directory / ".lock").stat().st_mode), 0o700)
+                    self.assertEqual(stat.S_IMODE((directory / ".lock").stat().st_mode), 0o600)
                 with engine._registry_lock():
-                    self.assertEqual(stat.S_IMODE((engine.work / ".registry-lock").stat().st_mode), 0o700)
+                    self.assertEqual(stat.S_IMODE((engine.work / ".registry-lock").stat().st_mode), 0o600)
                 self.assertGreaterEqual(len(replacements), 3)
             finally:
                 os.umask(old_mask)
@@ -437,6 +439,51 @@ class StateLayoutTests(unittest.TestCase):
 
 
 class WorkflowTests(WorkflowFixture):
+    def test_atomic_replacement_waits_out_a_reader_for_a_bounded_time(self):
+        # Windows refuses os.replace while another reader has the destination open: that reader is short, a refusal that
+        # lasts stays a refusal, and neither case leaves a temporary file.
+        directory, destination = self.engine.work, self.engine.work / "fictional-state.json"
+        private_workspace.write_private_new(destination, b"Fictional original")
+        real, waits = os.replace, []
+        for refusals, expected in ((3, b"Fictional replacement"), (private_workspace.RENAME_TRIES - 1, b"Fictional second replacement")):
+            with self.subTest(refusals=refusals):
+                calls = []
+
+                def refused_for_a_while(source, target, calls=calls, refusals=refusals):
+                    calls.append(source)
+                    if len(calls) <= refusals:
+                        raise PermissionError(errno.EACCES, "Fictional reader has the file open")
+                    return real(source, target)
+                with mock.patch("engine_journal.os.replace", side_effect=refused_for_a_while), mock.patch("private_workspace.time.sleep", side_effect=waits.append):
+                    workflow_core.atomic_replace(destination, expected)
+                self.assertEqual((len(calls), destination.read_bytes()), (refusals + 1, expected))
+        self.assertEqual(set(waits), {private_workspace.RENAME_WAIT_SECONDS})
+        calls = []
+        with mock.patch("engine_journal.os.replace", side_effect=lambda *args: calls.append(args) or (_ for _ in ()).throw(PermissionError(errno.EACCES, "Fictional"))), \
+                mock.patch("private_workspace.time.sleep"), self.assertRaises(PermissionError):
+            workflow_core.atomic_replace(destination, b"Never written")
+        self.assertEqual(len(calls), private_workspace.RENAME_TRIES)
+        self.assertEqual(destination.read_bytes(), b"Fictional second replacement")
+        self.assertEqual(list(directory.glob(".write-*")), [])
+        # Any other failure is not a reader: no second try.
+        calls = []
+        with mock.patch("engine_journal.os.replace", side_effect=lambda *args: calls.append(args) or (_ for _ in ()).throw(OSError(errno.EIO, "Fictional"))), \
+                self.assertRaises(OSError):
+            workflow_core.atomic_replace(destination, b"Never written")
+        self.assertEqual(len(calls), 1)
+
+    def test_atomic_replacement_outlasts_a_real_reader_of_the_file(self):
+        # On Windows a plain open() refuses the replacement until it closes; elsewhere this replaces at once.
+        destination = self.engine.work / "fictional-state.json"
+        private_workspace.write_private_new(destination, b"Fictional original")
+        reader = open(destination, "rb")
+        self.addCleanup(reader.close)
+        closing = threading.Timer(0.2, reader.close)
+        closing.start()
+        self.addCleanup(closing.cancel)
+        workflow_core.atomic_replace(destination, b"Fictional replacement")
+        self.assertEqual(destination.read_bytes(), b"Fictional replacement")
+
     def test_new_sessions_start_with_the_typed_reply_keys_empty(self):
         state = self.state()
         self.assertEqual(set(state), engine_journal.STATE_KEYS)
@@ -488,11 +535,9 @@ class WorkflowTests(WorkflowFixture):
 
     def test_exclusive_lock_and_stale_revision_leave_state_unchanged(self):
         before = self.state()
-        lock = self.engine.work / self.sid / ".lock"
-        lock.mkdir()
-        with self.assertRaises(WorkflowRefusal):
-            self.engine.pause(self.sid)
-        lock.rmdir()
+        with self.engine.journal.lock(self.sid):
+            with self.assertRaises(WorkflowRefusal):
+                self.engine.pause(self.sid)
         with self.assertRaises(WorkflowRefusal):
             self.engine.pause(self.sid, expected_revision=9)
         self.assertEqual(self.state(), before)
@@ -648,6 +693,27 @@ engine.read_session = lambda session_id: session
 with mock.patch.object(engine_text, "status", facade.status):
     print("forward", engine.status("fictional-session")["code"] == "status")
 """
+
+
+class AdmissionMessageTests(unittest.TestCase):
+    """A refused private-storage admission keeps its code and says why when the refusal explains more than the code."""
+
+    def test_refusal_names_its_reason(self):
+        path = WORK / ("fictional-admission-" + uuid.uuid4().hex) / "record.json"  # never created: the admission is replaced
+        reason = "a folder name on this path is one PatchCairn does not accept"
+        cases = ((private_workspace.PrivateWorkspaceError("private-path-invalid", reason), WorkflowRefusal,
+                  "Native private engine storage admission held: private-path-invalid (" + reason + ")"),
+                 (private_workspace.PrivateWorkspaceError("private-path-invalid"), WorkflowRefusal,
+                  "Native private engine storage admission held: private-path-invalid"),
+                 (private_workspace.PrivateWorkspaceError("private-acl-unavailable", "the folder's access list cannot be read"), PrivacyCapabilityHold,
+                  "Native private storage is unavailable: private-acl-unavailable (the folder's access list cannot be read)"))
+        for error, kind, message in cases:
+            with self.subTest(code=error.code, message=str(error)):
+                with mock.patch.object(private_workspace, "ensure_private_file", side_effect=error), self.assertRaises(WorkflowRefusal) as caught:
+                    engine_journal.private_file(path)
+                self.assertIs(type(caught.exception), kind)
+                self.assertEqual((caught.exception.code, str(caught.exception)), (error.code, message))
+        self.assertFalse(path.parent.exists())
 
 
 class FacadeTests(unittest.TestCase):
