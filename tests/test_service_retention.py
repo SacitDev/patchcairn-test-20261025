@@ -1137,10 +1137,12 @@ class RetentionRegistryTests(RetentionFixtures):
         row = self.service._row(self.sid, "backup", location=str(folder), protection_root=str(folder), reason="Fictional",
                                 artifacts={str(folder / "backup.zip"): "a" * 64})
         self.assertIs(self.service._checked_row(row), row)
-        lookalike = self.output / "Kept-equal"
-        changed = {**row, "location": str(lookalike)}
-        with self.assertRaises(ServiceRefusal):
-            self.service._checked_row(changed)
+        outside = [self.output / "kept-equal-other"]
+        if sys.platform != "darwin":  # U+212A (KELVIN SIGN) for "k": another name on Windows and Linux, the same on macOS (private_workspace.relative_parts).
+            outside.append(self.output / "\u212aept-equal")
+        for path in outside:
+            with self.subTest(path.name.encode("unicode_escape").decode()), self.assertRaisesRegex(ServiceRefusal, "does not contain"):
+                self.service._checked_row({**row, "location": str(path)})
 
     def test_registry_lists_kept_rows_without_file_lists(self):
         _sid, names, _receipt = self.kept_backup(sid=self.sid)

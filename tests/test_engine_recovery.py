@@ -139,30 +139,37 @@ class WorkflowTests(WorkflowFixture):
 
 class ContainmentTests(WorkflowFixture):
     """engine_recovery compares parts through private_workspace.relative_parts: a look-alike part (U+212A, the Kelvin
-    sign) is another folder, equal paths stay inside, and the evidence bounds are read from engine_journal at call time."""
+    sign) is another folder on Windows and Linux (macOS's default APFS takes it for "k"), equal paths stay inside, and the
+    evidence bounds are read from engine_journal at call time."""
 
     def test_owned_output_and_work_artifact_refuse_look_alike_parts(self):
         work = self.engine.root / "work"
         self.assertEqual(engine_recovery._owned_output(self.engine, str(work)), work)  # inclusive, as before
         self.assertEqual(engine_recovery._owned_output(self.engine, str(work / "out")), work / "out")
-        look_alike = self.engine.root / "wor\u212a" / "out"
-        with self.assertRaisesRegex(WorkflowRefusal, "owned work output root"):
-            engine_recovery._owned_output(self.engine, str(look_alike))
-        output = work / "out"
+        roots = {"sibling": self.engine.root / "work-other" / "out"}
+        if sys.platform != "darwin":  # U+212A (KELVIN SIGN) for "k": another name on Windows and Linux, the same on macOS (private_workspace.relative_parts).
+            roots["look-alike"] = self.engine.root / "wor\u212a" / "out"
+        for label, root in roots.items():
+            with self.subTest(label), self.assertRaisesRegex(WorkflowRefusal, "owned work output root"):
+                engine_recovery._owned_output(self.engine, str(root))
         with self.assertRaisesRegex(WorkflowRefusal, "owned work root"):
-            engine_recovery.work_artifact(self.engine, str(work / "ou\u212a" / "x.json"), "0" * 64, output_root=str(output))
+            engine_recovery.work_artifact(self.engine, str(work / "out-other" / "x.json"), "0" * 64, output_root=str(work / "out"))
 
     def test_restore_probe_look_alike_escapes_the_output_root(self):
         self.plan_ready()
         binding = self.recovery_binding(self.verified_recovery())
         output = Path(binding["output_root"])
-        # The probe below work/ spelled with U+212A for its "k": not the output root, so the probe escapes it.
+        # A probe below a sibling of the output root, or of work/, is not below the output root, so it escapes it.
         self.assertEqual(output.parent.name, "work")
-        look_alike = output.parent.parent / "wor\u212a" / output.name / "restored-probe"
-        binding["restore_receipt"]["destination"] = str(look_alike)
-        forged = self.raw_evidence("recovery", binding)
-        with self.assertRaisesRegex(WorkflowRefusal, "escapes its owned work output root"):
-            self.engine.verify_recovery(self.engine.read_session(self.sid), [forged])
+        destinations = {"output sibling": output.parent / (output.name + "-other") / "restored-probe",
+                        "work sibling": output.parent.parent / "work-other" / output.name / "restored-probe"}
+        if sys.platform != "darwin":  # U+212A (KELVIN SIGN) for "k": another name on Windows and Linux, the same on macOS (private_workspace.relative_parts).
+            destinations["look-alike"] = output.parent.parent / "wor\u212a" / output.name / "restored-probe"
+        for label, destination in destinations.items():
+            receipt = dict(binding["restore_receipt"], destination=str(destination))
+            forged = self.raw_evidence("recovery", dict(binding, restore_receipt=receipt))
+            with self.subTest(label), self.assertRaisesRegex(WorkflowRefusal, "escapes its owned work output root"):
+                self.engine.verify_recovery(self.engine.read_session(self.sid), [forged])
 
     def test_evidence_bounds_are_read_when_used(self):
         self.plan_ready()

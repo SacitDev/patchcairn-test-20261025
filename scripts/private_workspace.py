@@ -63,9 +63,14 @@ def relative_parts(path, root):
     already refused. A relative path or a ".." part is None (outside). On Windows the root's parts are compared with the
     path's leading parts by the file system's own rule (win32_files.same_name), so a look-alike part such as one with
     U+212A (Kelvin sign) is not "k"; a part ending in a dot or a space, which Windows would trim, and a missing Windows
-    API are None too. On macOS, whose default APFS ignores case and NFC/NFD form, the parts are compared by
-    pc_paths.casefold_key; a case-sensitive volume then counts two different folders as one, so "apart" refuses too much.
-    Elsewhere pathlib compares the parts exactly.
+    API are None too. On macOS the parts are compared by pc_paths.casefold_key (full case folding, NFC/NFD form
+    ignored), as default APFS compares names, whatever the volume: the text does not say which volume a path is on. On
+    case-sensitive APFS, HFSX and HFS+ two folders can compare as one here: a check that refuses an overlap then refuses
+    too much, which is safe, and a check that admits a path below an owned folder can admit a sibling spelled like it.
+    PatchCairn spells the owned paths it writes from its own root, so only a changed record or a path typed in that other
+    spelling reaches such a check. HFS+ also ignores some invisible characters that casefold_key keeps, so there a folder
+    spelled with and without one compares as two: an admitting check refuses it, and a check that refuses an overlap can
+    miss it. Elsewhere pathlib compares the parts exactly.
     """
     path, root = Path(path), Path(root)
     if not (path.is_absolute() and root.is_absolute()) or ".." in path.parts or ".." in root.parts:

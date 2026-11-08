@@ -412,14 +412,15 @@ class ContainmentTests(ServiceFixtures):
         self.assertTrue(within(root, root))
         self.assertTrue(within(root / "kept" / "file.txt", root / "kept"))
         self.assertFalse(within(root / "kept-other", root / "kept"))
-        # U+212A (Kelvin sign) folds to "k" in Unicode, but the file system keeps it a different name.
-        self.assertFalse(within(root / "Kept" / "file.txt", root / "kept"))
-        self.assertFalse(within(root / "kept", root / "Kept"))
+        # U+212A (KELVIN SIGN) for "k": another name on Windows and Linux, the same on macOS (private_workspace.relative_parts).
+        folds = sys.platform == "darwin"
+        self.assertIs(within(root / "\u212aept" / "file.txt", root / "kept"), folds)
+        self.assertIs(within(root / "kept", root / "\u212aept"), folds)
         self.assertFalse(apart(root, root))
         self.assertFalse(apart(root / "kept", root / "kept" / "child"))
         self.assertFalse(apart(root / "kept" / "child", root / "kept"))
         self.assertTrue(apart(root / "kept", root / "kept-other"))
-        self.assertTrue(apart(root / "Kept", root / "kept"))
+        self.assertIs(apart(root / "\u212aept", root / "kept"), not folds)
         self.assertFalse(apart("relative-name", root))
 
     def test_a_comparison_that_cannot_be_decided_is_never_apart(self):
@@ -440,8 +441,9 @@ class ContainmentTests(ServiceFixtures):
         service = object.__new__(WorkflowService)
         service.root = root
         self.assertEqual(service._owned(str(root / "work" / "kept")), root / "work" / "kept")
-        # "worK" folds to "work" in Unicode, but it is another folder to the file system.
-        for value in (str(root / "work"), str(root / "elsewhere"), str(root / "worK" / "kept")):
+        # U+212A (KELVIN SIGN) for "k": another name on Windows and Linux, the same on macOS (private_workspace.relative_parts).
+        look_alike = [] if sys.platform == "darwin" else [str(root / "wor\u212a" / "kept")]
+        for value in [str(root / "work"), str(root / "elsewhere"), str(root / "work-other" / "kept")] + look_alike:
             with self.subTest(value=value), self.assertRaises(ServiceRefusal):
                 service._owned(value)
 

@@ -948,9 +948,11 @@ class PosixRootTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "post-move-verification-unresolved")
 
     def test_admission_holds_where_no_replace_rename_fails(self):
-        # macOS msdos and exFAT may refuse RENAME_EXCL: a destination proves the rename before anything is written.
+        # A no-replace rename refused with an error nothing stands in for (EINVAL) holds a destination before anything is
+        # written; where macOS refuses the flag with ENOTSUP (expected on exFAT and FAT), PatchCairn takes the name first
+        # (ReservedNameOnRealFoldersTests).
         (self.base / "usb").mkdir()
-        refusing = refusing_rename(errno.ENOTSUP)
+        refusing = refusing_rename(errno.EINVAL)
         with mock.patch.object(fs, "_rename_function", return_value=refusing):
             with self.assertRaises(fs.CapabilityHold) as caught:
                 fs.admit_destination(str(self.base / "usb"), non_private_destination=True,
@@ -1142,7 +1144,7 @@ class ReservedNameOnRealFoldersTests(unittest.TestCase):
 
 
 class ExfatImageTests(unittest.TestCase):
-    """A real exFAT volume. This test first runs on the macos-latest CI legs: nothing here has been observed on a Mac yet."""
+    """Real exFAT and MS-DOS (FAT) volumes, on the macos-latest CI legs."""
 
     def attach(self, filesystem):
         """A small ``filesystem`` image under this test's own work folder, attached with no Finder window; its mount point."""

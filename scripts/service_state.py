@@ -89,9 +89,9 @@ def native_platform():
 
 def within(path, root):
     """True when ``path`` is ``root`` or lies below it, compared part by part through private_workspace.relative_parts
-    (on Windows by the file system's own name rule, so a look-alike name is a different name). False when it lies
-    outside and also when that cannot be decided, so a check that requires containment refuses; a check that refuses an
-    overlap uses ``apart``."""
+    (on Windows by the file system's own name rule, so U+212A is not "k"; on macOS without case or NFC/NFD form). False
+    when it lies outside and also when that cannot be decided, so a check that requires containment refuses; a check that
+    refuses an overlap uses ``apart``."""
     return relative_parts(path, root) is not None
 
 

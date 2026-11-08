@@ -184,7 +184,7 @@ class ExecuteMixin:
                 raise ServiceRefusal(RESTORE_TOO_LARGE, code="restore-size-unavailable")
             try:
                 # Refused before the backup is written, not when the probe is planned after it.
-                restorable(probe.relative_to(output).as_posix(), plan["files"])
+                restorable("/".join(relative_parts(probe, output)), plan["files"])  # the parts the check above compared
             except StorageRefusal as error:
                 raise ServiceRefusal(str(error), code=error.code) from error
         if destination is not None:

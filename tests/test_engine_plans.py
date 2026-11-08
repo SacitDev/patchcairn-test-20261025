@@ -1625,9 +1625,14 @@ class PlanRuleTests(RuleHelpers, WorkflowFixture):
             return self.engine.action_binding(self.state(), changed)
         work = self.root / "work"
         self.assertEqual(bind(str(work))["output_root"], str(work))  # a path equal to the work tree passes, as before
-        lookalike = self.root / "worK" / "fictional-output"  # KELVIN SIGN, not the letter k
-        self.refused("workflow-refusal", lambda: bind(str(lookalike)))
-        self.refused("workflow-refusal", lambda: bind(str(work / "out"), restore_probe_destination=str(work / "ouK" / "probe")))
+        outside = [self.root / "work-other" / "fictional-output"]
+        if sys.platform != "darwin":  # U+212A (KELVIN SIGN) for "k": another name on Windows and Linux, the same on macOS (private_workspace.relative_parts).
+            outside.append(self.root / "wor\u212a" / "fictional-output")
+        for path in outside:
+            with self.subTest(path.parent.name.encode("unicode_escape").decode()), self.assertRaisesRegex(WorkflowRefusal, "owned work tree"):
+                bind(str(path))
+        with self.assertRaisesRegex(WorkflowRefusal, "Restore probe must stay"):
+            bind(str(work / "out"), restore_probe_destination=str(work / "out-other" / "probe"))
         self.assertEqual(bind(str(work / "out"), restore_probe_destination=str(work / "out"))["restore_probe_destination"], str(work / "out"))
 
     def test_evidence_caps_are_read_from_the_journal_when_used(self):

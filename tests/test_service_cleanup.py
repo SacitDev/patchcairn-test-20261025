@@ -139,7 +139,7 @@ class ServicePrivacyTests(ServiceFixtures):
         engine = self.fake_engine(root)
         engine.work = root / "work" / "engine"
         try:
-            service = WorkflowService(engine)
+            service = WorkflowService(engine, elevation_probe=lambda: False)  # CI runners may be elevated
         except PrivateWorkspaceError as exc:
             if os.name == "posix" and exc.code in PRIVATE_CAPABILITY_HOLDS:
                 self.skipTest("only on posix: actual private namespace unavailable; pure reservation boundaries run separately")

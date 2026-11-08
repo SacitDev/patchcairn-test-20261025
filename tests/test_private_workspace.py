@@ -410,9 +410,10 @@ class PathRuleTests(unittest.TestCase):
                             (Path("child"), Path("child")), (root / "child", Path("containment-root"))):
             with self.subTest(refused=str(path)):
                 self.assertIsNone(private.relative_parts(path, limit))
-        # pathlib folds U+212A KELVIN SIGN to "k" on Windows; the file system keeps the two names apart.
+        # pathlib folds U+212A KELVIN SIGN to "k" on Windows; the rule keeps it another name there and on Linux, and takes it
+        # for "k" on macOS (test_darwin_privacy.CaseInsensitivePathTests).
         anchor = Path("C:\\fictional") if os.name == "nt" else Path("/fictional")
-        self.assertIsNone(private.relative_parts(anchor / "wor\u212a" / "run", anchor / "work"))
+        self.assertEqual(private.relative_parts(anchor / "wor\u212a" / "run", anchor / "work"), ("run",) if sys.platform == "darwin" else None)
         if os.name == "nt":
             self.assertEqual(private.relative_parts(Path("C:\\FICTIONAL\\WORK\\run"), anchor / "work"), ("run",))
 

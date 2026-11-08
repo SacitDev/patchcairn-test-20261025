@@ -126,8 +126,8 @@ def checked_absolute(value):
 
 def within(path, parent):
     """True when ``path`` is ``parent`` or below it, compared part by part by private_workspace.relative_parts (on
-    Windows by the file system's own rule, so a look-alike such as U+212A is not "k"). A pair it cannot decide (a part
-    Windows would trim, no Windows API) is refused, never read as "outside"."""
+    Windows by the file system's own rule, so a look-alike such as U+212A is not "k"; on macOS without case or NFC/NFD
+    form). A pair it cannot decide (a part Windows would trim, no Windows API) is refused, never read as "outside"."""
     if relative_parts(path, parent) is not None:
         return True
     if relative_parts(path, path) is None or relative_parts(parent, parent) is None:

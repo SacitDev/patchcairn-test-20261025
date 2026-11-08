@@ -672,13 +672,14 @@ class StorageRecordTests(unittest.TestCase):
 
 class ContainmentTests(unittest.TestCase):
     """storage_policy.within compares part by part through private_workspace.relative_parts: inclusive, a look-alike
-    part (U+212A, the Kelvin sign) is not "k", and a pair it cannot decide is refused."""
+    part (U+212A, the Kelvin sign) is not "k" on Windows and Linux (macOS's default APFS takes it for "k"), and a pair
+    it cannot decide is refused."""
 
     def test_within_is_inclusive_and_refuses_look_alikes(self):
         base = Path("C:\\fictional\\work") if os.name == "nt" else Path("/fictional/work")
         self.assertTrue(storage_policy.within(base, base))
         self.assertTrue(storage_policy.within(base / "a" / "b", base))
-        self.assertFalse(storage_policy.within(base.parent / "wor\u212a" / "a", base))
+        self.assertIs(storage_policy.within(base.parent / "wor\u212a" / "a", base), sys.platform == "darwin")
         self.assertFalse(storage_policy.within(base.parent, base))
         with self.assertRaises(StorageRefusal) as caught:
             storage_policy.within(base / "a", Path("relative"))
@@ -693,7 +694,9 @@ class ContainmentTests(unittest.TestCase):
         service = StorageService(output_root=output, quiet_workspace=True, protected_roots=[source])
         self.assertTrue(service._protected_root(source))  # equal to a protected root
         self.assertTrue(service._protected_entry(base, "source/x.txt"))
-        self.assertFalse(service._protected_entry(base, "sour\u212ae/x.txt"))  # a look-alike is another folder
+        # U+212A (KELVIN SIGN) for "k": another name on Windows and Linux, the same on macOS (private_workspace.relative_parts).
+        guarded = StorageService(output_root=output, quiet_workspace=True, protected_roots=[private_child(base, "kept")])
+        self.assertIs(guarded._protected_entry(base, "\u212aept/x.txt"), sys.platform == "darwin")
 
     def test_protected_entry_rules_out_only_what_no_entry_can_reach(self):
         base = fixture_directory(self)

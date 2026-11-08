@@ -582,7 +582,11 @@ class CaseInsensitivePathTests(unittest.TestCase):
             self.assertIsNone(private.relative_parts("relative/docs", "/Volumes/Fictional/shared/docs"))
             self.assertIsNone(private.relative_parts("/Volumes/Fictional/shared/docs/../secret", "/Volumes/Fictional/shared/docs"))
             self.assertTrue(storage_policy.within(Path("/Volumes/Fictional/shared/Docs/backups"), Path("/Volumes/Fictional/shared/docs")))
-        self.assertIsNone(private.relative_parts("/Volumes/Fictional/shared/Docs/backups", "/Volumes/Fictional/shared/docs"))  # Linux stays exact
+            # U+212A KELVIN SIGN is "K" in NFC and NFD, so default APFS takes it for "k": the same folder.
+            self.assertEqual(private.relative_parts("/Volumes/Fictional/shared/wor\u212a/x", "/Volumes/Fictional/shared/work"), ("x",))
+        with mock.patch.object(private.sys, "platform", "linux"):  # Linux stays exact
+            self.assertIsNone(private.relative_parts("/Volumes/Fictional/shared/Docs/backups", "/Volumes/Fictional/shared/docs"))
+            self.assertIsNone(private.relative_parts("/Volumes/Fictional/shared/wor\u212a/x", "/Volumes/Fictional/shared/work"))
 
     def test_cloud_storage_is_recognised_in_any_case(self):
         with self.darwin():
@@ -594,9 +598,9 @@ class CaseInsensitivePathTests(unittest.TestCase):
         self.assertEqual(private.relative_parts("/Volumes/Fictional/shared/Docs", "/VOLUMES/FICTIONAL/shared/docs"), ())
 
 
-@unittest.skipUnless(sys.platform == "darwin", "only on macos: real volume and system calls; these first run on the macos-latest CI legs")
+@unittest.skipUnless(sys.platform == "darwin", "only on macos: real volume and system calls")
 class NativeMacTests(unittest.TestCase):
-    """The native lines every fake skips. Nothing here has been observed on a Mac yet: CI is its first run."""
+    """The native lines every fake skips, on the macos-latest CI legs."""
 
     def test_macos_volume_identity_is_the_uuid_diskutil_reports(self):
         folder = ROOT / "work" / "test-fixtures" / ("volume-" + uuid.uuid4().hex)
@@ -604,8 +608,27 @@ class NativeMacTests(unittest.TestCase):
         self.addCleanup(remove_tree, folder)
         identity = scoped_fs.volume_identity(str(folder))
         self.assertRegex(identity, r"\Amacos-volume:[0-9a-f-]{36}\Z")
-        listing = subprocess.run(["/usr/sbin/diskutil", "info", "-plist", str(folder)], check=True, capture_output=True, timeout=120)
+        # diskutil names a disk or a mount point, not a folder: ask it about the device that holds the folder.
+        device = subprocess.run(["/usr/bin/stat", "-f", "%Sd", str(folder)], check=True, capture_output=True, text=True, timeout=60).stdout.strip()
+        self.assertRegex(device, r"\Adisk\d+(s\d+)*\Z")  # stat prints "???" when the device has no /dev name
+        listing = subprocess.run(["/usr/sbin/diskutil", "info", "-plist", device], check=True, capture_output=True, timeout=120)
         self.assertEqual(identity, "macos-volume:" + plistlib.loads(listing.stdout)["VolumeUUID"].lower())
+
+    def test_default_apfs_takes_case_nfd_and_u212a_spellings_for_one_folder(self):
+        # Needs a case-insensitive APFS volume, as on these legs; relative_parts must agree with it both ways.
+        base = ROOT / "work" / "test-fixtures" / ("names-" + uuid.uuid4().hex)
+        base.mkdir(parents=True)
+        self.addCleanup(remove_tree, base)
+        for name in ("work", "caf\u00e9", "stra\u00dfe"):
+            (base / name).mkdir()
+        for spelling, folder in (("WORK", "work"), ("wor\u212a", "work"), ("cafe\u0301", "caf\u00e9")):
+            with self.subTest(spelling.encode("unicode_escape").decode()):
+                self.assertTrue(os.path.samefile(base / spelling, base / folder))
+                self.assertEqual(private.relative_parts(base / spelling / "x", base / folder), ("x",))
+        # A sibling is another folder for both; a full case fold (U+00DF and "ss") is one folder for both or for neither.
+        for spelling, folder in (("work-other", "work"), ("strasse", "stra\u00dfe")):
+            with self.subTest(spelling):
+                self.assertEqual(os.path.exists(base / spelling), private.relative_parts(base / spelling / "x", base / folder) is not None)
 
     def test_macos_collection_runs_for_real(self):
         facts = collect_macos.collect()

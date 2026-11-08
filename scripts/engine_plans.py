@@ -458,7 +458,7 @@ def action_binding(engine, state, action, *, operation_id=None):
         if not output_value.is_absolute():
             raise WorkflowRefusal("Storage output root must be an exact absolute owned work path")
         output = no_links(output_value)
-        # Parts are compared by the file system's own rule; a path equal to the work tree passes, as before.
+        # Parts are compared by private_workspace.relative_parts; a path equal to the work tree passes.
         if private_workspace.relative_parts(output, engine.root / "work") is None:
             raise WorkflowRefusal("Adapter outputs must stay inside this repository's owned work tree")
         if "backup_destination" in payload and (action["adapter_id"] != pc_records.ADAPTER_STORAGE_BACKUP_CREATE
