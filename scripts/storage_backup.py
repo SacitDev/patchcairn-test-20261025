@@ -52,8 +52,9 @@ _PARTIAL_RECORD_BYTES = 1024
 _OTHER_DRIVE = ("The drive at {} is not the one this backup was written to. Nothing was changed. Connect the right drive, then ask "
                 "me to check again.")
 _POSIX_CHECK_NOTE = "Checking this drive writes one empty temporary file in the chosen folder and removes it again."
-MEMORY_NOTE = ("Files are streamed in 1 MiB pieces; memory grows only with the number of files (their list and the "
-               "archive's directory), not with their size.")
+MEMORY_NOTE = ("Files are streamed in 1 MiB pieces, so the memory held for file contents stays within a few MiB whatever "
+               "their size (a file that compresses well can need up to about 2 MiB more than one that does not while it is "
+               "checked); other memory grows only with the number of files (their list and the archive's directory).")
 README_TEXT = """PatchCairn backup
 =================
 

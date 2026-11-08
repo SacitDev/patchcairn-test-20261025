@@ -37,12 +37,13 @@ SCRIPTS = ROOT / "scripts"
 FOLDER = re.compile(r"[0-9]{8}T[0-9]{6}Z-[a-z0-9-]{1,32}\Z")
 
 
-def pattern(size, seed=0):
-    """Incompressible-looking deterministic bytes (DEFLATE cannot shrink them much)."""
+def pattern(size, seed=0, repeat=1):
+    """Deterministic bytes from a SHA-256 chain, which DEFLATE cannot shrink; ``repeat=32`` repeats each block 32 times,
+    which DEFLATE shrinks about 27:1."""
     out, block = bytearray(), seed.to_bytes(8, "little")
     while len(out) < size:
         block = hashlib.sha256(block).digest()
-        out += block * 32
+        out += block * repeat
     return bytes(out[:size])
 
 
@@ -144,19 +145,26 @@ class StreamingBackupTests(BackupFixture, unittest.TestCase):
         self.assertEqual(calls, [])
 
     def test_peak_memory_independent_of_file_size(self):
-        peaks = {}
-        for name, size in (("peak-small.bin", 2 * scoped_base.CHUNK_BYTES + 3), ("peak-large.bin", 8 * scoped_base.CHUNK_BYTES + 3)):
-            write_private_new(self.source / name, pattern(size, seed=size))
-            plan = self.plan([f"r001/{name}"], label=name.split(".")[0])
+        chunk, peaks = scoped_base.CHUNK_BYTES, {}
+        # Bytes DEFLATE cannot shrink at 2 and 64 chunks, and bytes it shrinks about 27:1 at 32 and 64 chunks. While it
+        # inflates a member, zipfile keeps the unread rest of one compressed read, so shrinking bytes need up to about two
+        # chunks more as they grow, until their compressed size reaches a chunk (near 28 chunks here), then level off
+        # (6 to 6.5 chunks measured).
+        for name, chunks, repeat in (("flat-2", 2, 1), ("flat-64", 64, 1), ("shrunk-32", 32, 32), ("shrunk-64", 64, 32)):
+            size = chunks * chunk + 3
+            write_private_new(self.source / (name + ".bin"), pattern(size, seed=size, repeat=repeat))
+            plan = self.plan([f"r001/{name}.bin"], label=name)
             tracemalloc.start()
             try:
                 self.create(plan)
                 peaks[name] = tracemalloc.get_traced_memory()[1]
             finally:
                 tracemalloc.stop()
-        # Four times the bytes, the same memory: a few chunks in flight, never the file or the archive.
-        self.assertLess(abs(peaks["peak-large.bin"] - peaks["peak-small.bin"]), scoped_base.CHUNK_BYTES // 2, peaks)
-        self.assertLess(peaks["peak-large.bin"], 6 * scoped_base.CHUNK_BYTES, peaks)
+        # Thirty-two times the bytes, the same memory: a few chunks in flight, never the file or the archive.
+        self.assertLess(abs(peaks["flat-64"] - peaks["flat-2"]), chunk // 2, peaks)
+        self.assertLess(abs(peaks["shrunk-64"] - peaks["shrunk-32"]), chunk // 2, peaks)
+        self.assertLess(max(peaks["flat-2"], peaks["flat-64"]), 6 * chunk, peaks)
+        self.assertLess(max(peaks["shrunk-32"], peaks["shrunk-64"]), 8 * chunk, peaks)
 
     def test_zip64_forced_and_more_than_65535_entries(self):
         count = 65_536 + 3
